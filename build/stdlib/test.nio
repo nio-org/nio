@@ -55,15 +55,17 @@ bool selected(String title) {
 }
 
 // Each result prints when it is known. A run that never reaches `run` still
-// shows what it checked.
+// shows what it checked. Output to a pipe is buffered, so each line is flushed:
+// when a test stops the run, the last line names the test before it.
 void note(String title, bool ok, String message) {
     if (ok) {
         passed++;
         print("ok   " + title);
-        return;
+    } else {
+        failed++;
+        print("FAIL " + title + " - " + message);
     }
-    failed++;
-    print("FAIL " + title + " - " + message);
+    process.stdout.flush();
 }
 
 // Runs body now and reports it. The parameter is fallible, which lets the body

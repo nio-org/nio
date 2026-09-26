@@ -4524,9 +4524,10 @@ things follow from it, and they are the module's semantics:
   parameter is expected (§3.4), so a test that only prints compiles like any
   other.
 
-Results stream out as they are known: `start` prints its line before
-returning. So a run that never reaches `run` still shows what it managed to
-check. `run` waits for the async tests, prints the tally, and gives the run
+Results stream out as they are known: `start` prints its line and flushes
+standard output before returning, also when the output goes to a pipe. So a
+run that never reaches `run` still shows what it managed to check, and a run
+that stops inside a test shows the result of the test before it. `run` waits for the async tests, prints the tally, and gives the run
 its exit status. That status is 1 when anything failed; otherwise `run` sets
 none at all, so a successful run simply returns and the program goes on.
 `run` may be called more than once; it forgets the tasks it has collected and
@@ -5143,6 +5144,12 @@ every route stream would cost every inline handler its shape, for a body
 `maxBody` already bounds. What a streaming handler leaves unread is drained,
 up to 256 KB, after it answers. Past that the connection is given up instead,
 since the next message begins where this body ends.
+
+A connection given up with part of a body unread (a 413, or a streaming
+handler's body past 256 KB) is not closed at once. For up to 500 ms, the
+server reads and discards what the peer still sends, and closes when the peer
+closes. A socket closed with unread input sends a reset, and on some systems a
+reset destroys the response that the peer has not read yet.
 
 #### Making a request
 

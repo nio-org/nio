@@ -16,6 +16,7 @@ import 'net';
 import 'tls';
 import 'async';
 import 'regexp';
+import 'time';
 
 // ---------------------------------------------------------------------------
 // Methods and error codes
@@ -65,6 +66,12 @@ int const BODY_ASK = 65464;
 // where this body ends, so the server reads and discards the rest. Past this
 // limit it closes the connection.
 int const DRAIN_LIMIT = 262144;
+
+// How long the server reads and discards before it closes a connection on
+// which a request body is unread. A close with unread input sends a reset, and
+// on some systems a reset destroys the response that the peer has not read
+// yet. Most peers close first, after they read the response.
+Duration const LINGER = 500;
 
 String const HEX = "0123456789abcdef";
 String const HEXUP = "0123456789ABCDEF";
@@ -775,6 +782,8 @@ export Conn tlsConn(tls.Conn t, String peer) {
 type Reader {
     Conn conn;
     String buf;
+    // True when the server stops reading a request body before its end.
+    bool unread;
 
     // Reads up to the blank line and answers the text before it. `buf` then
     // starts at the body. A close between messages raises END_OF_FILE, which
@@ -1418,12 +1427,24 @@ int lastIndexOf(String s, String sub) {
 // the connection is idle. In the frame of `serveOne` it becomes garbage when
 // the response is written.
 void async serveConn(Server s, Conn c) {
-    Reader rd = { conn: c, buf: "" };
+    Reader rd = { conn: c, buf: "", unread: false };
     while (true) {
         bool keep = await serveOne(s, c, rd);
         if (!keep) { break; }
     }
+    if (rd.unread) {
+        await async.race(discardAll(c), time.sleep(LINGER));
+    }
     c.close();
+}
+
+// Reads until the peer closes. The close in serveConn ends a read that is still
+// waiting, and the error is dropped here because no one awaits this future.
+void async discardAll(Conn c) {
+    while (true) {
+        byte[] b = await c.read(BODY_ASK) catch e { return; };
+        if (b.length == 0) { return; }
+    }
 }
 
 // Serves one request. Answers true if the connection can take another request.
@@ -1468,10 +1489,12 @@ bool async serveOne(Server s, Conn c, Reader rd) {
         // read. A chunked body declares no length, so the limit is checked
         // while it is read.
         if (!f.chunked && f.length > s.maxBody) {
+            rd.unread = true;
             await writeStatus(c, 413, `body over ${s.maxBody} bytes`) catch e2 { };
             return false;
         }
         held = await drainAll(Future<byte[]!> () -> wire.next(), s.maxBody) catch e {
+            rd.unread = true;
             await writeStatus(c, statusForError(e), e.message) catch e2 { };
             return false;
         };
@@ -1514,7 +1537,10 @@ bool async serveOne(Server s, Conn c, Reader rd) {
     // DRAIN_LIMIT and closes the connection if more remains.
     if (streaming && !source.done) {
         bool drained = await source.drain(DRAIN_LIMIT);
-        if (!drained) { keep = false; }
+        if (!drained) {
+            keep = false;
+            rd.unread = true;
+        }
     }
 
     bool headOnly = rl.method == Method.HEAD;
@@ -1753,7 +1779,7 @@ ClientResponse async once(Method m, Url u, ClientOptions? o) {
     Conn c = await dial(u, o);
     await c.write(string.toByteArray(string.join(out, "")));
 
-    Reader rd = { conn: c, buf: "" };
+    Reader rd = { conn: c, buf: "", unread: false };
     String block = await rd.headerBlock();
     String[] lines = string.split(block, CRLF);
     StatusLine sl = parseStatusLine(lines[0]);

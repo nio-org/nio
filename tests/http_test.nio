@@ -1023,9 +1023,10 @@ void async drive() {
     async.run(background(s), void () -> { });
 
     // Under DRAIN_LIMIT the server reads what the handler left and keeps the
-    // connection; over it, the connection is what it gives up instead.
-    await ask(port, 3);
-    await ask(port, 15);
+    // connection; over it, the connection is what it gives up instead. A
+    // failed request must not skip the close, or the program never exits.
+    await ask(port, 3) catch e { print("failed: " + e.message); };
+    await ask(port, 15) catch e { print("failed: " + e.message); };
     s.close();
 }
 await drive() catch e { print("failed: " + e.message); };

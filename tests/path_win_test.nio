@@ -1,0 +1,113 @@
+// Runs the Windows logic of lib/path.c on a POSIX host. The file compiles for a
+// fake Windows target and runs against a frozen table of Windows joins.
+//
+// path is the only runtime library whose Windows code can run here. Its per-OS
+// parts are small, and the only Windows header it needs is <direct.h>, for
+// _getcwd. lib/os.c uses the registry through <windows.h>, so it cannot run.
+//
+// The C sources come from src/embed/runtime.nio, the bake that the compiler
+// links. Thus the test never uses a stale copy.
+import 'test';
+import '../src/embed/runtime' as rtsrc;
+import '../src/lib/quote' as quote;
+import './harness' as h;
+import '../src/driver' as driver;
+import './repo' as repo;
+import 'string';
+import 'array';
+import 'path';
+import 'fs';
+import 'process';
+
+// The elements to join, and the reference result on Windows.
+type JoinCase {
+    String[] elems;
+    String want;
+}
+
+// The case Join(`\`, `??\a`) == `\.\??\a` is not included. It needs the
+// device-namespace prefixes (`\\?\`, `\\.\`, `\??\`) read as volumes.
+// path.c reads them as UNC paths.
+JoinCase[] cases = [
+    { elems: ["directory", "file"], want: "directory\\file" },
+    { elems: ["C:\\Windows\\", "System32"], want: "C:\\Windows\\System32" },
+    { elems: ["C:\\Windows\\", ""], want: "C:\\Windows" },
+    { elems: ["C:\\", "Windows"], want: "C:\\Windows" },
+    { elems: ["C:", "a"], want: "C:a" },
+    { elems: ["C:", "a\\b"], want: "C:a\\b" },
+    { elems: ["C:", "a", "b"], want: "C:a\\b" },
+    { elems: ["C:", "", "b"], want: "C:b" },
+    { elems: ["C:", "", "", "b"], want: "C:b" },
+    { elems: ["C:", ""], want: "C:." },
+    { elems: ["C:", "", ""], want: "C:." },
+    { elems: ["C:", "\\a"], want: "C:\\a" },
+    { elems: ["C:", "", "\\a"], want: "C:\\a" },
+    { elems: ["C:.", "a"], want: "C:a" },
+    { elems: ["C:a", "b"], want: "C:a\\b" },
+    { elems: ["C:a", "b", "d"], want: "C:a\\b\\d" },
+    { elems: ["\\\\host\\share", "foo"], want: "\\\\host\\share\\foo" },
+    { elems: ["\\\\host\\share\\foo"], want: "\\\\host\\share\\foo" },
+    { elems: ["//host/share", "foo/bar"], want: "\\\\host\\share\\foo\\bar" },
+    { elems: ["\\"], want: "\\" },
+    { elems: ["\\", ""], want: "\\" },
+    { elems: ["\\", "a"], want: "\\a" },
+    { elems: ["\\\\", "a"], want: "\\\\a" },
+    { elems: ["\\", "a", "b"], want: "\\a\\b" },
+    { elems: ["\\\\", "a", "b"], want: "\\\\a\\b" },
+    { elems: ["\\", "\\\\a\\b", "c"], want: "\\a\\b\\c" },
+    { elems: ["\\\\a", "b", "c"], want: "\\\\a\\b\\c" },
+    { elems: ["\\\\a\\", "b", "c"], want: "\\\\a\\b\\c" },
+    { elems: ["//", "a"], want: "\\\\a" },
+    { elems: ["a:\\b\\c", "x\\..\\y:\\..\\..\\z"], want: "a:\\b\\z" },
+
+    // Cases added to the table: ".." must not go out of a volume, and a drive or
+    // share root is its own parent, as "/" is on POSIX.
+    { elems: ["C:\\a", "..", "b"], want: "C:\\b" },
+    { elems: ["C:\\a", "..", ".."], want: "C:\\" },
+    { elems: ["\\\\host\\share\\a", "..", "b"], want: "\\\\host\\share\\b" },
+    { elems: ["\\\\host\\share\\a", "..", ".."], want: "\\\\host\\share\\" },
+    { elems: ["C:a", ".."], want: "C:." },
+];
+
+// The stub <direct.h>, the only Windows header that lib/path.c includes.
+String const DIRECT_H = "#pragma once\n#include <stddef.h>\nchar *_getcwd(char *buf, size_t n);\n";
+
+test.start("lib/path.c's Windows logic agrees with the reference table", void () -> {
+    String dir = h.scratch();
+    forEach(["runtime.h", "lib/path.c"], name) {
+        String? text = rtsrc.file(name);
+        if (text == null) {
+            return Error("missing embedded runtime file " + name);
+        }
+        h.writeTo(dir, name, text);
+    }
+    h.writeTo(dir, "direct.h", DIRECT_H);
+
+    // The calls, one per case, go into the template at its marker.
+    // quote.quote escapes this ASCII as C does.
+    String[] calls = [];
+    forEach(cases, c) {
+        String[] quoted = [];
+        forEach(c.elems, e) {
+            array.push(quoted, quote.quote(e));
+        }
+        array.push(calls, "    jt(" + quote.quote(c.want) + ", "
+            + string.from(c.elems.length) + ", " + string.join(quoted, ", ") + ");");
+    }
+    String template = repo.readText("tests/cdata/win_harness.c");
+    String harness = h.writeTo(dir, "win_harness.c",
+        string.replace(template, "/*<cases>*/", string.join(calls, "\n")));
+
+    String bin = driver.exeName(path.join(dir, "win_harness"));
+    process.ChildRunResult build = await process.child.run("clang",
+        ["-O1", "-Wall", "-Wextra", "-Werror", "-I", dir, "-o", bin, harness]);
+    if (build.code != 0) {
+        return Error("compiling lib/path.c for Windows failed:\n"
+            + string.fromByteArray(build.stdout) + string.fromByteArray(build.stderr));
+    }
+
+    h.Run r = h.runBinary(bin, []);
+    if (r.code != 0 || string.length(r.out) > 0) {
+        return Error("Windows path logic disagrees with the reference table:\n" + r.out + r.err);
+    }
+});

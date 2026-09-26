@@ -1,0 +1,537 @@
+// `nio get`, `nio update` and `nio vendor`: the commands that change what a
+// project depends on.
+//
+// These are the only commands that touch a network: `nio update` to ask which
+// versions exist, and all three to fetch a package the cache does not already
+// hold. Resolving, verifying and building are local, so an offline build and a
+// CI build need no network.
+import './deps' as deps;
+import './fetch' as fetch;
+import './lib/str' as str;
+import 'fs';
+import 'path';
+import 'string';
+import 'array';
+import 'process';
+import 'map';
+
+int const OK = 0;
+int const FAILED = 1;
+int const NOT_RUN = 2;
+
+void writeOut(String s) {
+    process.stdout.write(s);
+}
+
+void writeErr(String s) {
+    process.stderr.write(s);
+}
+
+export int async getCmd(String[] args) {
+    if (args.length == 1 && (args[0] == "--help" || args[0] == "-h")) {
+        writeOut("usage: nio get [<package> <version>]\n\n"
+            + "  With no arguments, fetches every package nio.deps requires and\n"
+            + "  checks each against the hash nio.deps recorded for it.\n\n"
+            + "  With a package and a version, requires that version: a package\n"
+            + "  nio.deps already requires moves to it and keeps its alias, and a\n"
+            + "  new one is added. Then it fetches and records hashes the same way.\n\n"
+            + "  nio get\n"
+            + "  nio get 'github.com/nio-lang/nio-log' v0.2.0\n");
+        return OK;
+    }
+    if (args.length == 0) {
+        return await getAll();
+    }
+    if (args.length != 2) {
+        writeErr("usage: nio get [<package> <version>]\n");
+        return NOT_RUN;
+    }
+    String pkg = args[0];
+    String version = args[1];
+    if (!deps.validVersion(version)) {
+        writeErr("not a version: " + version
+            + "\n  a requirement is exact, as in v1.2.3, because nothing in a manifest is a range\n");
+        return NOT_RUN;
+    }
+
+    String dir = path.getCwd();
+    String file = deps.manifestPath(dir);
+    String root = dir;
+    String text = "package " + baseOf(dir) + "\n";
+    if (file != "") {
+        root = dirOf(file);
+        text = readText(file);
+    } else {
+        file = path.join(dir, deps.MANIFEST);
+    }
+
+    deps.Manifest m = deps.parse(text, file);
+    forEach(m.errs, e) {
+        writeErr(e + "\n");
+    }
+    if (m.errs.length > 0) {
+        return FAILED;
+    }
+
+    // A package already required moves, and keeps the alias its line names:
+    // every import in the project is written against that alias.
+    deps.Require[] same = array.filter(m.requires, bool (deps.Require r) -> r.pkg == pkg);
+    String next = text;
+    String said = "";
+    if (same.length == 0) {
+        String alias = deps.aliasFor(pkg);
+        forEach(m.requires, r) {
+            if (r.alias == alias) {
+                writeErr("the alias `" + alias + "` is already " + r.pkg + "'s in " + file
+                    + "\n  write the requirement with another alias, then run `nio get`:\n"
+                    + "  require '" + pkg + "' " + version + " as <alias>;\n");
+                return NOT_RUN;
+            }
+        }
+        next = deps.withRequire(text, pkg, version, alias);
+        said = "added to " + deps.MANIFEST + " as `" + alias + "`";
+    } else {
+        // Two lines may require two bands of one package. Move the line in the
+        // band of the new version. With no such line, the target is not known.
+        deps.Require? target = null;
+        if (same.length == 1) {
+            target = same[0];
+        } else {
+            forEach(same, r) {
+                if (deps.band(r.version) == deps.band(version)) {
+                    target = r;
+                }
+            }
+        }
+        if (target == null) {
+            writeErr(pkg + " is required on more than one line of " + file
+                + ", and none is in band " + deps.band(version)
+                + "\n  change the line you mean to " + version + ", then run `nio get`\n");
+            return NOT_RUN;
+        }
+        deps.Require t = target;
+        next = deps.withVersionAt(text, t, version);
+        said = "`" + t.alias + "` is at " + version;
+        if (t.version != version) {
+            said = "moved `" + t.alias + "` from " + t.version + " to " + version;
+        }
+    }
+    deps.Resolution? settled = await settle(root, file, next);
+    if (settled == null) {
+        return FAILED;
+    }
+    deps.Resolution res = settled;
+    writeOut(said + "\n");
+    forEach(res.selected, p) {
+        writeOut(selectedLine(p));
+    }
+    return OK;
+}
+
+// One package of a resolution, as the commands list it.
+String selectedLine(deps.Package p) {
+    if (p.band == deps.LOCAL) {
+        return "  " + p.pkg + "  replaced by " + p.dir + "\n";
+    }
+    return "  " + p.pkg + " " + p.version + "  band " + p.band + "\n";
+}
+
+// `nio get` with no arguments: every package the manifest requires, fetched
+// where the cache does not hold it and checked against its recorded hash.
+// A fresh clone runs this.
+int async getAll() {
+    String file = deps.manifestPath(path.getCwd());
+    if (file == "") {
+        writeErr("no " + deps.MANIFEST + " here or above; `nio get <package> <version>` starts one\n");
+        return NOT_RUN;
+    }
+    deps.Resolution? settled = await settle(dirOf(file), file, readText(file));
+    if (settled == null) {
+        return FAILED;
+    }
+    deps.Resolution res = settled;
+    forEach(res.selected, p) {
+        writeOut(selectedLine(p));
+    }
+    writeOut("every package " + deps.MANIFEST + " requires is here and matches its hash\n");
+    return OK;
+}
+
+// `nio update` moves each of the project's requirements to the newest version
+// of its own band. It never crosses a band, because a new band is a different
+// package whose API may differ. Use `nio get` to move to a new band. Only this
+// manifest's requirements move: a dependency's belong to its author, and the
+// newest version of a band wins resolution whoever asked for it.
+export int async updateCmd(String[] args) {
+    if (args.length == 1 && (args[0] == "--help" || args[0] == "-h")) {
+        writeOut("usage: nio update [package]...\n\n"
+            + "  Moves each requirement in nio.deps to the newest version of its\n"
+            + "  band: v1.2.3 to the newest v1, v0.2.4 to the newest v0.2. A new band\n"
+            + "  is a different package, so moving to one is `nio get`. With no\n"
+            + "  arguments every requirement is updated; a package is named by its\n"
+            + "  path or its alias.\n");
+        return OK;
+    }
+    String dir = path.getCwd();
+    String file = deps.manifestPath(dir);
+    if (file == "") {
+        writeErr("no " + deps.MANIFEST + " here or above; nothing to update\n");
+        return NOT_RUN;
+    }
+    String root = dirOf(file);
+    String text = readText(file);
+    deps.Manifest m = deps.parse(text, file);
+    forEach(m.errs, e) {
+        writeErr(e + "\n");
+    }
+    if (m.errs.length > 0) {
+        return FAILED;
+    }
+    deps.Require[] chosen = [];
+    forEach(args, a) {
+        bool named = false;
+        forEach(m.requires, r) {
+            if (r.pkg != a && r.alias != a) {
+                continue;
+            }
+            named = true;
+            if (!array.some(chosen, bool (deps.Require c) -> c.line == r.line)) {
+                array.push(chosen, r);
+            }
+        }
+        if (!named) {
+            writeErr(a + " is not a requirement of " + file + "\n");
+            return NOT_RUN;
+        }
+    }
+    if (args.length == 0) {
+        chosen = m.requires;
+    }
+    if (chosen.length == 0) {
+        writeOut(file + " requires no packages; nothing to update\n");
+        return OK;
+    }
+
+    // Every version is asked for before anything is written, so an update is
+    // applied whole or not at all.
+    String next = text;
+    int moved = 0;
+    int failures = 0;
+    forEach(chosen, r) {
+        String[] vs = await fetch.versions(r.pkg) catch e {
+            writeErr("  " + r.pkg + ": " + e.message + "\n");
+            failures++;
+            continue;
+        };
+        String newest = deps.newestInBand(r.version, vs);
+        String b = deps.band(r.version);
+        if (newest == r.version) {
+            writeOut("  " + r.pkg + "  " + r.version + "  (newest in band " + b + ")\n");
+        } else {
+            writeOut("  " + r.pkg + "  " + r.version + " -> " + newest + "  (band " + b + ")\n");
+            next = deps.withVersionAt(next, r, newest);
+            moved++;
+        }
+        String later = deps.newestInLaterBand(r.version, vs);
+        if (later != "") {
+            writeOut("    " + later + " is available in a new band (" + deps.band(later) + "); `nio get '"
+                + r.pkg + "' " + later + "` moves to it\n");
+        }
+    }
+    if (failures > 0) {
+        writeErr("nothing was written, because not every version could be asked for\n");
+        return FAILED;
+    }
+    if (moved == 0) {
+        return OK;
+    }
+    deps.Resolution? settled = await settle(root, file, next);
+    if (settled == null) {
+        return FAILED;
+    }
+    writeOut("updated " + deps.MANIFEST + "\n");
+    return OK;
+}
+
+// Fetches what a rewritten manifest needs, resolves it, and writes it back with
+// its resolved block. Nothing is written unless every step succeeds. Errors are
+// reported here, and the result is null when there were some.
+//
+// Each package is checked against its recorded hash before a new block is
+// written. Otherwise an edited tree in the cache, or a moved tag, would get its
+// new hash recorded, and the build could no longer detect the change.
+deps.Resolution? async settle(String root, String file, String text) {
+    deps.Manifest m = deps.parse(text, file);
+    forEach(m.errs, e) {
+        writeErr(e + "\n");
+    }
+    if (m.errs.length > 0) {
+        return null;
+    }
+    // Fetch what the graph needs, then resolve again with everything in place.
+    int failures = await fetchAll(root, m);
+    if (failures > 0) {
+        return null;
+    }
+    deps.Resolution res = deps.resolve(root, m);
+    forEach(res.errs, e) {
+        writeErr(e + "\n");
+    }
+    if (res.errs.length > 0) {
+        return null;
+    }
+    String[] changed = deps.verify(m, res.selected);
+    forEach(changed, e) {
+        writeErr(e + "\n");
+    }
+    if (changed.length > 0) {
+        return null;
+    }
+    // A package replaced by a directory is being edited, so no hash is
+    // recorded for it.
+    deps.Resolved[] rs = [];
+    forEach(res.selected, p) {
+        if (p.band == deps.LOCAL) {
+            continue;
+        }
+        deps.Resolved r = { pkg: p.pkg, version: p.version, hash: deps.treeHash(p.dir), line: 0 };
+        array.push(rs, r);
+    }
+    String written = deps.withResolved(text, rs);
+    if (written != readText(file)) {
+        fs.writeFile(file, string.toByteArray(written)) catch e {
+            writeErr(e.message + "\n");
+            return null;
+        };
+    }
+    forEach(bandNotes(res), note) {
+        writeOut(note);
+    }
+    return res;
+}
+
+// A package the build holds at more than one band, with who asked for each.
+// This is not an error: the bands are two packages. It matters only when a
+// value of one band's type is passed where the other's is wanted. The compiler
+// reports that case with the same names.
+String[] bandNotes(deps.Resolution res) {
+    Map<String, deps.Package[]> byPkg = {};
+    String[] order = [];
+    forEach(res.selected, p) {
+        if (p.band == deps.LOCAL) {
+            continue;
+        }
+        deps.Package[]? had = byPkg[p.pkg];
+        if (had == null) {
+            deps.Package[] first = [p];
+            byPkg[p.pkg] = first;
+            array.push(order, p.pkg);
+        } else {
+            array.push(had, p);
+        }
+    }
+    String[] out = [];
+    forEach(order, pkg) {
+        deps.Package[]? found = byPkg[pkg];
+        if (found == null || found.length < 2) {
+            continue;
+        }
+        String[] parts = [];
+        forEach(found, p) {
+            array.push(parts, p.version + " (required by " + string.join(p.by, ", ") + ")");
+        }
+        array.push(out, "note: " + pkg + " is in this build at " + string.from(found.length) + " bands: "
+            + string.join(parts, ", ") + "\n  a value of one band's type is not a value of the other's; `unify '"
+            + pkg + "' <version>;` in " + deps.MANIFEST + " makes them one\n");
+    }
+    return out;
+}
+
+// `nio vendor` copies the resolved closure into a project-local `modules/`,
+// which a build prefers over the shared cache. It protects against a deleted
+// tag: the cache and the recorded hashes detect tampering, but they cannot
+// restore a repository that is gone.
+export int async vendorCmd(String[] args) {
+    if (args.length == 1 && (args[0] == "--help" || args[0] == "-h")) {
+        writeOut("usage: nio vendor\n\n"
+            + "  Copies every resolved package into ./" + deps.VENDOR + ", which a\n"
+            + "  build prefers over the shared cache. A vendored tree needs no\n"
+            + "  network and survives a deleted upstream tag.\n");
+        return OK;
+    }
+    if (args.length != 0) {
+        writeErr("usage: nio vendor\n");
+        return NOT_RUN;
+    }
+    String dir = path.getCwd();
+    String file = deps.manifestPath(dir);
+    if (file == "") {
+        writeErr("no " + deps.MANIFEST + " here or above; nothing to vendor\n");
+        return NOT_RUN;
+    }
+    String root = dirOf(file);
+    deps.Manifest m = deps.parse(readText(file), file);
+    forEach(m.errs, e) {
+        writeErr(e + "\n");
+    }
+    if (m.errs.length > 0) {
+        return FAILED;
+    }
+    int failures = await fetchAll(root, m);
+    deps.Resolution res = deps.resolve(root, m);
+    forEach(res.errs, e) {
+        writeErr(e + "\n");
+    }
+    if (res.errs.length > 0 || failures > 0) {
+        return FAILED;
+    }
+    forEach(res.selected, p) {
+        if (p.band == deps.LOCAL) {
+            writeOut("  " + p.pkg + "  replaced by " + p.dir + ", not vendored\n");
+            continue;
+        }
+        String dest = path.join(root, path.localize(deps.VENDOR + "/" + p.pkg + "@" + p.version));
+        if (p.dir == dest) {
+            writeOut("  " + p.pkg + " " + p.version + "  already vendored\n");
+            continue;
+        }
+        fetch.createDirAll(dirOf(dest));
+        String? bad = copyTree(p.dir, dest);
+        if (bad != null) {
+            writeErr("  " + p.pkg + " " + p.version + ": " + bad + "\n");
+            failures++;
+            continue;
+        }
+        writeOut("  " + p.pkg + " " + p.version + "  vendored\n");
+    }
+    if (failures > 0) {
+        return FAILED;
+    }
+    return OK;
+}
+
+// fs.copy takes one file, so this function walks the tree. It has no special
+// case for links: fs.stat reports a link's target, and a package is source
+// that holds no build output.
+String? copyTree(String from, String to) {
+    fetch.createDirAll(to);
+    String[] names = fs.readDir(from) catch e {
+        return e.message;
+    };
+    forEach(names, n) {
+        String src = path.join(from, n);
+        String dst = path.join(to, n);
+        fs.Stat st = fs.stat(src) catch e {
+            return e.message;
+        };
+        if (st.isDirectory) {
+            String? bad = copyTree(src, dst);
+            if (bad != null) {
+                return bad;
+            }
+            continue;
+        }
+        fs.copy(src, dst) catch e {
+            return e.message;
+        };
+    }
+    return null;
+}
+
+// Fetches every package the graph names and the cache does not hold. It runs
+// to a fixpoint, because a package's manifest can name more packages, and
+// that manifest is readable only after the package is fetched.
+int async fetchAll(String root, deps.Manifest m) {
+    int failures = 0;
+    Map<String, bool> done = {};
+    bool again = true;
+    while (again) {
+        again = false;
+        deps.Resolution res = deps.resolve(root, m);
+        forEach(res.errs, e) {
+            String? want = missingFrom(e);
+            if (want == null) {
+                continue;
+            }
+            String key = want;
+            if (done[key] != null) {
+                continue;
+            }
+            done[key] = true;
+            again = true;
+            int cut = string.find(key, "@");
+            String pkg = string.substring(key, 0, cut);
+            String version = string.substring(key, cut + 1, string.length(key));
+            writeOut("fetching " + pkg + " " + version + " ... ");
+            fetch.Fetched f = await fetch.get(pkg, version);
+            if (f.error != "") {
+                writeOut("failed\n");
+                writeErr("  " + f.error + "\n");
+                failures++;
+                continue;
+            }
+            writeOut("done\n");
+        }
+    }
+    return failures;
+}
+
+// Reads the package and version out of a "not in modules/ or in the cache"
+// error. It is the only resolution error that fetching can fix.
+String? missingFrom(String e) {
+    if (!str.hasPrefix(e, "package ")) {
+        return null;
+    }
+    if (!string.contains(e, "is not in ")) {
+        return null;
+    }
+    String rest = string.substring(e, 8, string.length(e));
+    int cut = string.find(rest, " is not in ");
+    if (cut < 0) {
+        return null;
+    }
+    String head = string.substring(rest, 0, cut);
+    int sp = string.find(head, " ");
+    if (sp < 0) {
+        return null;
+    }
+    return string.substring(head, 0, sp) + "@" + string.substring(head, sp + 1, string.length(head));
+}
+
+String readText(String file) {
+    byte[] data = fs.readFile(file) catch e {
+        return "";
+    };
+    return string.fromByteArray(data);
+}
+
+String baseOf(String p) {
+    int cut = -1;
+    int n = string.length(p);
+    for (int i = 0; i < n; i++) {
+        if (p[i] == 47 || p[i] == 92) {
+            cut = i;
+        }
+    }
+    if (cut < 0) {
+        return p;
+    }
+    return string.substring(p, cut + 1, n);
+}
+
+String dirOf(String p) {
+    int cut = -1;
+    int n = string.length(p);
+    for (int i = 0; i < n; i++) {
+        if (p[i] == 47 || p[i] == 92) {
+            cut = i;
+        }
+    }
+    if (cut < 0) {
+        return ".";
+    }
+    if (cut == 0) {
+        return string.substring(p, 0, 1);
+    }
+    return string.substring(p, 0, cut);
+}

@@ -1,0 +1,88 @@
+// JSON-RPC framing on the standard streams: a `Content-Length` header, a blank
+// line, then that many bytes. The length is in bytes, as `string.length`
+// counts (§6.6). A body has no terminator, so it is read by count.
+import 'process';
+import 'string';
+import 'array';
+
+String const CRLF = "\r\n";
+
+// Returns the length a header line declares, or -1 for any other header. The
+// field name test ignores case, as HTTP does.
+export int contentLength(String line) {
+    int colon = string.find(line, ":");
+    if (colon < 0) {
+        return -1;
+    }
+    String name = string.toLowerCaseAscii(string.trim(string.substring(line, 0, colon)));
+    if (name != "content-length") {
+        return -1;
+    }
+    String value = string.trim(string.substring(line, colon + 1, string.length(line)));
+    int n = string.toInt(value) catch -1;
+    if (n < 0) {
+        return -1;
+    }
+    return n;
+}
+
+// Returns the body of the next message, or null when the conversation stops for
+// any reason: a closed pipe, an unreadable stream, or a truncated message.
+export String? read() {
+    int n = -1;
+    while (true) {
+        String? lineOpt = process.stdin.readLine() catch null;
+        if (lineOpt == null) {
+            return null;
+        }
+        String line = lineOpt;
+        if (line == "") {
+            break;    // the blank line ends the header
+        }
+        int len = contentLength(line);
+        if (len >= 0) {
+            n = len;
+        }
+    }
+    if (n < 0) {
+        return null;    // no length: nothing says what follows
+    }
+    if (n == 0) {
+        return "";
+    }
+    // A short read means the pipe gave less than the body. An empty read means
+    // the stream ended inside the message (§6.12).
+    byte[] first = process.stdin.readBytes(n) catch [];
+    if (first.length == n) {
+        return string.fromByteArray(first);
+    }
+    if (first.length == 0) {
+        return null;
+    }
+    byte[] body = first;
+    while (body.length < n) {
+        byte[] chunk = process.stdin.readBytes(n - body.length) catch [];
+        if (chunk.length == 0) {
+            return null;
+        }
+        forEach(chunk, b) {
+            array.push(body, b);
+        }
+    }
+    return string.fromByteArray(body);
+}
+
+// Frames body and flushes it. A reply left in the pipe buffer never reaches the
+// editor, which then waits.
+export void write(String body) {
+    process.stdout.write("Content-Length: " + string.from(string.length(body))
+        + CRLF + CRLF + body);
+    process.stdout.flush();
+}
+
+// Writes a line to standard error, which a server may write freely.
+// Standard output carries the protocol.
+export void log(String message) {
+    process.stderr.write("[nio lsp] " + message + "\n");
+    process.stderr.flush();
+}

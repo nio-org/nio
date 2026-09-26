@@ -1,0 +1,6 @@
+# Every file here is compared byte for byte somewhere: the checked-in IR
+# against what the compiler emits, the bake against the runtime on disk, the
+# golden corpora against what the parsers answer. Git rewrites line endings on
+# checkout under its Windows default, which would fail all three, so nothing in
+# this repository is treated as text.
+* -text

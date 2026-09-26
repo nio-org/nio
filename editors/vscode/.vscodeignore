@@ -1,0 +1,12 @@
+.vscode/**
+.gitignore
+**/*.map
+
+# The extension ships as one bundled out/extension.js (esbuild.mjs), so none of
+# what produced it belongs in the .vsix -- and node_modules above all, which is
+# several megabytes of vscode-languageclient and its dependencies already folded
+# into that one file.
+src/**
+node_modules/**
+esbuild.mjs
+tsconfig.json

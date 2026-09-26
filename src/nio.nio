@@ -1,0 +1,10 @@
+// The compiler as a program. Top-level code cannot await (§4.6), so async.run
+// (§6.8) takes the exit status out of cli.run. Its callback runs at the drain
+// at the end of the program (§5.2).
+import './cli' as cli;
+import 'async';
+import 'process';
+
+async.run(cli.run(process.getArgs()), void (int code) -> {
+    process.exit(code);
+});

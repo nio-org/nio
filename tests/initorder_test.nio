@@ -1,0 +1,113 @@
+// Initialization order (§5.1). A top-level statement cannot reach a variable
+// declared below it, since statements run in order and such a variable holds
+// no value yet. Naming one directly is ordinary scoping, which reports
+// "undefined". The rule is for reaching one through a call, where every step of
+// the chain can be in order and the read still happens too early.
+import 'test';
+import './checkerlib' as lib;
+
+test.start("checker: initialization order accepts what it should", void () -> {
+    lib.accepts([
+        lib.ok("declared first", `
+String[] rows = ["x"];
+int b() { return rows.length; }
+print(b());
+`),
+        // A body may name a function declared below it, so the rule must be
+        // transitive rather than textual.
+        lib.ok("mutual recursion", `
+int a(int n) { if (n < 1) { return 0; } return b(n - 1); }
+int b(int n) { return a(n); }
+print(a(3));
+`),
+        lib.ok("the function may come after the call", `
+int[] rows = [1];
+print(a());
+int a() { return b(); }
+int b() { return rows.length; }
+`),
+        // A write is a use: an assignment needs the global to exist too.
+        lib.ok("a write, in order", `
+int hits = 0;
+void bump() { hits = hits + 1; }
+bump();
+print(hits);
+`),
+        lib.ok("a closure, in order", `
+int[] rows = [1];
+Function()<int> f = int () -> peek();
+print(f());
+int peek() { return rows.length; }
+`),
+    ]);
+    // The rule stops at the module boundary (§5.4). checker.check resolves
+    // no imports, so tests/modules_test.nio covers that.
+});
+
+test.start("checker: initialization order refuses what it should", void () -> {
+    lib.rejects([
+        lib.bad("through one call", `
+print(a());
+String[] rows = ["x"];
+int a() { return rows.length; }
+`, "a() reads \"rows\", which is declared later on line 3"),
+
+        // rows sits above the function that reads it and below the statement
+        // that reaches it, so ordinary scoping does not catch this.
+        lib.bad("through a chain of calls", `
+print(a());
+int a() { return b(); }
+String[] rows = ["x"];
+int b() { return c(); }
+int c() { return rows.length; }
+`, "a() reads \"rows\", which is declared later on line 4"),
+
+        // The main case: `a` names `b`, declared below the call. Mutual
+        // recursion makes this legal. Without the rule, the read is a
+        // segmentation fault.
+        lib.bad("a forward function reference does not launder it", `
+int a() { return b(); }
+print(a());
+String[] rows = ["x"];
+int b() { return rows.length; }
+`, "a() reads \"rows\", which is declared later on line 4"),
+        lib.bad("a write counts as a use", `
+bump();
+int hits = 0;
+void bump() { hits = hits + 1; }
+`, "bump() reads \"hits\", which is declared later on line 3"),
+
+        // A function value reaches what its body reaches at the point it is
+        // created, not at the point it is called.
+        lib.bad("a closure created too early", `
+Function()<int> f = int () -> peek();
+print(f());
+String[] rows = ["x"];
+int peek() { return rows.length; }
+`, "peek() reads \"rows\", which is declared later on line 4"),
+
+        // The diagnostic names the direct callee, which is what the statement
+        // wrote.
+        lib.bad("through a method", `
+print(call());
+String[] rows = ["x"];
+type T { int n; int len() { return rows.length; } }
+int call() { T t = { n: 1 }; return t.len(); }
+`, "call() reads \"rows\", which is declared later on line 3"),
+
+        // A declaration's initializer runs before the global is assigned, so
+        // there is no earlier line to move to.
+        lib.bad("an initializer reaching its own global", `
+int[] a = seed();
+int[] seed() { return a; }
+`, "seed() reads \"a\", the global this statement is declaring"),
+
+        // A scalar global read this way gives 0 and does not crash. It is the
+        // same defect.
+        lib.bad("and a scalar, which used to read as 0", `
+print(f());
+int g = 1;
+int f() { return g; }
+`, "f() reads \"g\", which is declared later on line 3"),
+    ]);
+});

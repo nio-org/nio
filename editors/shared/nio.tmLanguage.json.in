@@ -1,0 +1,466 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "comment": "GENERATED FILE -- edit editors/shared/nio.tmLanguage.json.in and run `nio run tools/grammar.nio`. Each placeholder in the template is filled from the compiler's own tables (src/token.nio, src/checker.nio), so a keyword, built-in type or built-in module cannot be added to the language without appearing here.",
+  "name": "Nio",
+  "scopeName": "source.nio",
+  "fileTypes": ["nio"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#language-constants" },
+    { "include": "#type-declaration" },
+    { "include": "#union-declaration" },
+    { "include": "#native-declaration" },
+    { "include": "#re-export" },
+    { "include": "#enum-declaration" },
+    { "include": "#type-switch-case" },
+    { "include": "#downcast" },
+    { "include": "#function-literal" },
+    { "include": "#union-constructor" },
+    { "include": "#parameter" },
+    { "include": "#removed-keywords" },
+    { "include": "#import" },
+    { "include": "#keywords" },
+    { "include": "#builtin-modules" },
+    { "include": "#modifiers" },
+    { "include": "#builtin-types" },
+    { "include": "#builtin-functions" },
+    { "include": "#self" },
+    { "include": "#function-call" },
+    { "include": "#screaming-constants" },
+    { "include": "#type-names" },
+    { "include": "#operators" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.nio",
+          "begin": "//",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.comment.nio" }
+          },
+          "end": "$"
+        },
+        {
+          "comment": "Block comments do not nest: the first */ closes the outermost /*.",
+          "name": "comment.block.nio",
+          "begin": "/\\*",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.comment.begin.nio" }
+          },
+          "end": "\\*/",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.comment.end.nio" }
+          }
+        }
+      ]
+    },
+
+    "strings": {
+      "patterns": [
+        { "include": "#string-double" },
+        { "include": "#string-single" },
+        { "include": "#string-backtick" }
+      ]
+    },
+
+    "string-double": {
+      "comment": "A \" string may not span lines; it ends at the newline.",
+      "name": "string.quoted.double.nio",
+      "begin": "\"",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.string.begin.nio" }
+      },
+      "end": "\"|$",
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.string.end.nio" }
+      },
+      "patterns": [{ "include": "#string-escapes" }]
+    },
+
+    "string-single": {
+      "comment": "A ' string may not span lines. Import paths and json* field tags use this form.",
+      "name": "string.quoted.single.nio",
+      "begin": "'",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.string.begin.nio" }
+      },
+      "end": "'|$",
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.string.end.nio" }
+      },
+      "patterns": [{ "include": "#string-escapes" }]
+    },
+
+    "string-backtick": {
+      "comment": "Only a backtick string may span lines.",
+      "name": "string.quoted.other.backtick.nio",
+      "begin": "`",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.string.begin.nio" }
+      },
+      "end": "`",
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.string.end.nio" }
+      },
+      "patterns": [
+        { "include": "#string-interpolation" },
+        { "include": "#string-escapes" }
+      ]
+    },
+
+    "string-interpolation": {
+      "comment": "NOT GENERATED: `${` opens a hole in a backtick string and in no other form (§1.6). What is inside is code and is highlighted as code. A `}` inside a record literal in the hole is taken by the literal's own brace pair where the grammar has one, and otherwise ends the hole early, which the lexer does not do.",
+      "name": "meta.interpolation.nio",
+      "begin": "\\$\\{",
+      "beginCaptures": {
+        "0": { "name": "punctuation.section.interpolation.begin.nio" }
+      },
+      "end": "\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.section.interpolation.end.nio" }
+      },
+      "patterns": [{ "include": "$self" }]
+    },
+
+    "string-escapes": {
+      "comment": "NOT GENERATED: the escape set is a switch in readString (src/lexer.nio), not a table, so it is mirrored here by hand. It is closed: \\\" \\' \\` \\\\ \\$ \\n \\r \\t \\0 and \\xNN with exactly two hex digits; there is no \\u.",
+      "patterns": [
+        {
+          "name": "constant.character.escape.nio",
+          "match": "\\\\([\"'`\\\\$nrt0]|x[0-9a-fA-F]{2})"
+        },
+        {
+          "name": "invalid.illegal.unknown-escape.nio",
+          "match": "\\\\."
+        }
+      ]
+    },
+
+    "numbers": {
+      "comment": "A number is digits, optionally followed by . and more digits, or 0x/0X and hex digits. There is no binary, exponent, digit separator or hexadecimal float. Hex comes first: [0-9]+ would otherwise claim the leading 0 of 0xFF and leave xFF to highlight as an identifier.",
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.nio",
+          "match": "\\b0[xX][0-9a-fA-F]+\\b"
+        },
+        {
+          "name": "constant.numeric.float.nio",
+          "match": "\\b[0-9]+\\.[0-9]+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.nio",
+          "match": "\\b[0-9]+\\b"
+        }
+      ]
+    },
+
+    "language-constants": {
+      "name": "constant.language.nio",
+      "match": "\\b(@@CONSTANTS@@)\\b"
+    },
+
+    "self": {
+      "comment": "The receiver a method body is checked against, synthesized by the parser.",
+      "name": "variable.language.self.nio",
+      "match": "\\bself\\b"
+    },
+
+    "type-declaration": {
+      "match": "\\b(?:(sealed)\\s+)?(type)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+(extends)\\s+([A-Za-z_][A-Za-z0-9_]*))?",
+      "captures": {
+        "1": { "name": "storage.modifier.sealed.nio" },
+        "2": { "name": "keyword.declaration.type.nio" },
+        "3": { "name": "entity.name.type.nio" },
+        "4": { "name": "keyword.other.extends.nio" },
+        "5": { "name": "entity.other.inherited-class.nio" }
+      }
+    },
+
+    "union-declaration": {
+      "comment": "union Name { T Tag, ... }: a sum type (§2.11). Like `sealed`, `union` is contextual rather than a keyword, so it is matched here by position and not generated from token.keywords. The body is a block of its own because a member is `Type Tag`, which #parameter reads as a parameter whenever a comma follows -- so every member but the last one came out a different colour from its neighbour, which is a rule firing by accident rather than a decision about unions.",
+      "begin": "\\b(union)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(\\{)",
+      "beginCaptures": {
+        "1": { "name": "keyword.declaration.union.nio" },
+        "2": { "name": "entity.name.type.nio" },
+        "3": { "name": "punctuation.section.block.begin.nio" }
+      },
+      "end": "\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.section.block.end.nio" }
+      },
+      "patterns": [
+        { "include": "#comments" },
+        {
+          "comment": "A member whose type ends in a bracket -- a function type, a generic, an array -- which the pair below cannot match because the brackets break it. Anchored on the tag instead, which is the last name before the comma or the brace.",
+          "match": "(?<=[>)\\]])\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=,|\\}|$)",
+          "captures": {
+            "1": { "name": "variable.other.enummember.nio" }
+          }
+        },
+        {
+          "comment": "The ordinary member, `Type Tag`. Capture 1 re-runs the type rules; capture 2 is the tag, scoped as an enum member because that is what it is -- `Distance.Meters` names one of a closed set, and it is neither a type a program may write nor a variable.",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*(?:<[^<>]*>)?(?:\\[\\])?\\??)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=,|\\}|$)",
+          "captures": {
+            "1": {
+              "patterns": [
+                { "include": "#builtin-types" },
+                { "include": "#type-names" },
+                { "include": "#operators" },
+                { "include": "#punctuation" }
+              ]
+            },
+            "2": { "name": "variable.other.enummember.nio" }
+          }
+        },
+        { "include": "#keywords" },
+        { "include": "#builtin-types" },
+        { "include": "#type-names" },
+        { "include": "#operators" },
+        { "include": "#punctuation" }
+      ]
+    },
+
+    "native-declaration": {
+      "comment": "`native source '...'` and `native flags [os] '...'` (§5.8): the build inputs for the C a module binds with `extern`. Like `union`, `native` is contextual rather than a keyword, so it is matched here by position -- the word standing before `source` or `flags` -- and not generated from token.keywords; `native` alone stays an ordinary name. `extern` needs no rule of its own: it rides the generated modifiers alternation the way `sealed` does.",
+      "match": "\\b(native)\\s+(source|flags)\\b(?:\\s+(darwin|linux|windows)\\b)?",
+      "captures": {
+        "1": { "name": "keyword.declaration.native.nio" },
+        "2": { "name": "keyword.other.native.nio" },
+        "3": { "name": "constant.language.platform.nio" }
+      }
+    },
+
+    "function-literal": {
+      "comment": "A function value is `[type] (params) -> body`, so its return type stands immediately before a parenthesized list -- which is exactly the shape #function-call reads as a call, and did: `http.Response (http.Request r) -> ...` coloured the type as the function being called. What tells the two apart is the `->` after the closing paren, and nothing else does: a declaration is `Type name(params)`, with a name in between. Matched before #union-constructor because `Text.Bytes (int x) -> ...` is a literal returning a union's member and `Text.Bytes(v)` is that member's constructor, and only the arrow separates them. The parameter list is allowed one level of nesting, which covers a function-typed parameter (`Function(int)<bool> cmp`); a list wrapped over more than one line is missed, exactly as #parameter's is, and falls back to reading as a call. A return type ending in a bracket or a suffix -- `Future<T>`, `Car[]`, `Car?` -- needs no rule here, since the character before the paren is not a name and #function-call never claimed it. Capture 1 is the whole dotted name, handed to #qualified-member to say what each segment of it is.",
+      "match": "\\b((?:[A-Za-z_][A-Za-z0-9_]*\\.)*[A-Z][A-Za-z0-9_]*)(?=\\s*\\((?:[^()]|\\([^()]*\\))*\\)\\s*->)",
+      "captures": {
+        "1": { "patterns": [ { "include": "#qualified-member" } ] }
+      }
+    },
+
+    "union-constructor": {
+      "comment": "`Union.Tag(v)` puts a value into a union (§2.11), and is the fourth and last place a tag appears -- the others being the declaration, a `case` label and an `as`. It is matched before #builtin-types and #function-call, which would otherwise claim the tag: `Text.String(...)` reads as the built-in type and `Text.Bytes(...)` as a function, so two members of one union came out two different colours. A capitalized name before the dot is what tells this from a method call, whose receiver is a value and lower case by convention.",
+      "match": "\\b([A-Z][A-Za-z0-9_]*)(\\.)([A-Za-z_][A-Za-z0-9_]*)\\b(?=\\s*\\()",
+      "captures": {
+        "1": { "name": "entity.name.type.nio" },
+        "2": { "name": "punctuation.accessor.nio" },
+        "3": { "name": "variable.other.enummember.nio" }
+      }
+    },
+
+    "qualified-member": {
+      "comment": "A dotted name in type position: `Type`, `alias.Type`, `Union.Tag`, `alias.Union.Tag`. What tells the last two from the first two is the capital before the dot -- an import alias is lower case by convention, a union is not -- which is the same convention #type-names already rests on. #builtin-modules leads, so a type reached through one of them (`http.Response`) keeps the colour the alias has everywhere else in the file; a user alias cannot be recognized at all, since a grammar has no way to know what a file imported.",
+      "patterns": [
+        { "include": "#builtin-modules" },
+        {
+          "match": "\\b([A-Z][A-Za-z0-9_]*)(\\.)([A-Za-z_][A-Za-z0-9_]*)\\b",
+          "captures": {
+            "1": { "name": "entity.name.type.nio" },
+            "2": { "name": "punctuation.accessor.nio" },
+            "3": { "name": "variable.other.enummember.nio" }
+          }
+        },
+        { "include": "#builtin-types" },
+        { "include": "#type-names" },
+        { "include": "#punctuation" }
+      ]
+    },
+
+    "enum-declaration": {
+      "comment": "An enum body holds only `MEMBER: value,` pairs, so matching to the closing brace is safe.",
+      "begin": "\\b(enum)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(\\{)",
+      "beginCaptures": {
+        "1": { "name": "keyword.declaration.enum.nio" },
+        "2": { "name": "entity.name.type.enum.nio" },
+        "3": { "name": "punctuation.section.block.begin.nio" }
+      },
+      "end": "\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.section.block.end.nio" }
+      },
+      "patterns": [
+        { "include": "#comments" },
+        {
+          "name": "constant.other.enum.nio",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b(?=\\s*:)"
+        },
+        { "include": "#numbers" },
+        { "include": "#operators" },
+        { "include": "#punctuation" }
+      ]
+    },
+
+    "type-switch-case": {
+      "comment": "case T n: narrows a sealed type (§4.9). The label may carry up to three segments, since a union's member is reached through its union and an imported one through its alias as well (§2.11) -- so the whole dotted name is one capture and #qualified-member decides what each segment of it is.",
+      "match": "\\b(case)\\s+([A-Za-z_][A-Za-z0-9_.]*)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=:)",
+      "captures": {
+        "1": { "name": "keyword.control.case.nio" },
+        "2": { "patterns": [ { "include": "#qualified-member" } ] },
+        "3": { "name": "variable.other.nio" }
+      }
+    },
+
+    "downcast": {
+      "comment": "x as T yields T? (§3.6), and the target may be a union's member with two or three segments (§2.11). Distinguished from an import alias by what follows: a capital, or any name with a dot after it. `import './x' as foo;` is neither.",
+      "match": "\\b(as)\\s+((?:[A-Za-z_][A-Za-z0-9_]*\\.)+[A-Za-z_][A-Za-z0-9_]*|[A-Z][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.operator.cast.nio" },
+        "2": { "patterns": [ { "include": "#qualified-member" } ] }
+      }
+    },
+
+    "parameter": {
+      "comment": "A parameter is `Type name` followed by , or ) -- which is what tells it from a call's argument (a bare expression, with no type before it), from a local declaration (followed by = or ;) and from a record field (followed by ;). The terminator is deliberately NOT end-of-line: that would catch the last parameter of a signature wrapped over several lines, but §2.4 lets a record body's final field omit its `;`, so `int? full` before a closing brace would read as a parameter too -- and across the whole corpus that trade is 3 wrong for 0 right, since nothing here wraps a parameter list. If wrapped signatures ever become common, the fix is a begin/end block anchored on the signature rather than a wider lookahead. Capture 1 re-runs the type rules so `int`, `Foo` and `Map<String, int>` still read as types; capture 2 is the name. A parameter whose type is itself a function type (`Function(T, T)<bool> cmp`) is missed, since the parens in the type break the pair.",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*(?:<[^<>]*>)?(?:\\[\\])?\\??)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=[,)])",
+      "captures": {
+        "1": {
+          "patterns": [
+            { "include": "#builtin-types" },
+            { "include": "#type-names" },
+            { "include": "#operators" },
+            { "include": "#punctuation" }
+          ]
+        },
+        "2": { "name": "variable.parameter.nio" }
+      }
+    },
+
+    "removed-keywords": {
+      "comment": "Keywords the language no longer has, kept in the token table only so the parser can report their removal. Flagging them in the editor is faithful, not a guess.",
+      "name": "invalid.deprecated.nio",
+      "match": "\\b(@@REMOVED@@)\\b"
+    },
+
+    "re-export": {
+      "comment": "`export alias;`, `export alias show A, B;` and `export alias hide A, B;` (\u00a75.4): the module republishes an imported module's surface as its own. Like `union` and `native`, `show` and `hide` are contextual rather than keywords, so they are matched here by position -- the word standing after `export` and a module alias -- and not generated from token.keywords; either one alone stays an ordinary name. Matched before #modifiers so that the alias reads as the module it names rather than as a bare identifier. The bare form needs its own alternative, since what follows the alias is a `;` rather than a word.",
+      "patterns": [
+        {
+          "match": "\\b(export)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+(show|hide)\\b",
+          "captures": {
+            "1": { "name": "storage.modifier.nio" },
+            "2": { "name": "entity.name.namespace.nio" },
+            "3": { "name": "keyword.other.reexport.nio" }
+          }
+        },
+        {
+          "match": "\\b(export)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=;)",
+          "captures": {
+            "1": { "name": "storage.modifier.nio" },
+            "2": { "name": "entity.name.namespace.nio" }
+          }
+        }
+      ]
+    },
+
+    "import": {
+      "match": "\\b(import)\\b",
+      "captures": {
+        "1": { "name": "keyword.control.import.nio" }
+      }
+    },
+
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.nio",
+          "match": "\\b(@@KEYWORDS_CONTROL@@)\\b"
+        },
+        {
+          "name": "keyword.other.nio",
+          "match": "\\b(@@KEYWORDS_OTHER@@)\\b"
+        }
+      ]
+    },
+
+    "modifiers": {
+      "comment": "Includes the contextual keywords, which the lexer emits as IDENT and the parser matches by spelling (src/parser.nio).",
+      "name": "storage.modifier.nio",
+      "match": "\\b(@@MODIFIERS@@)\\b"
+    },
+
+    "builtin-types": {
+      "patterns": [
+        {
+          "comment": "int, uint and float are types of their own, as wide as the machine, not spellings of the 64-bit forms.",
+          "name": "support.type.primitive.nio",
+          "match": "\\b(@@TYPES_PRIMITIVE@@)\\b"
+        },
+        {
+          "comment": "The capitalized built-in types are exactly those whose modules are spelled lower case, so a type and a library never contend for a name.",
+          "name": "support.type.nio",
+          "match": "\\b(@@TYPES_CAPITALIZED@@)\\b"
+        }
+      ]
+    },
+
+    "builtin-functions": {
+      "comment": "The names the checker reserves that are not types: those always in scope.",
+      "name": "support.function.builtin.nio",
+      "match": "\\b(@@BUILTIN_FUNCTIONS@@)\\b(?=\\s*\\()"
+    },
+
+    "builtin-modules": {
+      "comment": "Recognized only before a dot. A file that imports none of these may legally use the name for a variable, which a grammar cannot know.",
+      "name": "support.module.nio",
+      "match": "\\b(@@BUILTIN_MODULES@@)\\b(?=\\s*\\.)"
+    },
+
+    "function-call": {
+      "comment": "Covers calls and declarations alike: with no `function` keyword, a declaration is `Type name(params)`.",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\b(?=\\s*\\()",
+      "captures": {
+        "1": { "name": "entity.name.function.nio" }
+      }
+    },
+
+    "screaming-constants": {
+      "comment": "Listed before #type-names so enum members read as constants rather than types.",
+      "name": "constant.other.nio",
+      "match": "\\b[A-Z][A-Z0-9_]*\\b"
+    },
+
+    "type-names": {
+      "comment": "By convention a type is capitalized; this covers user records, enums and imported types.",
+      "name": "entity.name.type.nio",
+      "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+    },
+
+    "operators": {
+      "comment": "Longest match first: ... before ., ?. before ?, == before =, -> before -, ++ before +, && before &, << before <. There is deliberately no `>>` rule, for the reason the lexer has no SHR token (src/token.nio): the closing `>>` of `Map<String, Future<int>>` is spelled the same as a shift, and a grammar has even less context than the lexer to tell them apart. A shift's `>>` therefore reads as two comparison operators -- the same operator colour in every theme, and the alternative would mis-colour every nested generic type.",
+      "patterns": [
+        { "name": "keyword.operator.spread.nio", "match": "\\.\\.\\." },
+        { "name": "keyword.operator.arrow.nio", "match": "->" },
+        { "name": "keyword.operator.comparison.nio", "match": "==|!=|<=|>=" },
+        { "name": "keyword.operator.logical.nio", "match": "&&|\\|\\|" },
+        { "name": "keyword.operator.bitwise.nio", "match": "<<" },
+        { "name": "keyword.operator.increment.nio", "match": "\\+\\+|--" },
+        { "name": "keyword.operator.optional.nio", "match": "\\?\\." },
+        { "name": "keyword.operator.arithmetic.nio", "match": "[+\\-*/%]" },
+        { "name": "keyword.operator.comparison.nio", "match": "[<>]" },
+        { "name": "keyword.operator.logical.nio", "match": "!" },
+        { "name": "keyword.operator.bitwise.nio", "match": "[&|\\^~]" },
+        { "name": "keyword.operator.assignment.nio", "match": "=" },
+        { "name": "keyword.operator.optional.nio", "match": "\\?" }
+      ]
+    },
+
+    "punctuation": {
+      "patterns": [
+        { "name": "punctuation.accessor.nio", "match": "\\." },
+        { "name": "punctuation.separator.comma.nio", "match": "," },
+        { "name": "punctuation.terminator.nio", "match": ";" },
+        { "name": "punctuation.separator.colon.nio", "match": ":" },
+        { "name": "punctuation.section.parens.begin.nio", "match": "\\(" },
+        { "name": "punctuation.section.parens.end.nio", "match": "\\)" },
+        { "name": "punctuation.section.block.begin.nio", "match": "\\{" },
+        { "name": "punctuation.section.block.end.nio", "match": "\\}" },
+        { "name": "punctuation.section.brackets.begin.nio", "match": "\\[" },
+        { "name": "punctuation.section.brackets.end.nio", "match": "\\]" }
+      ]
+    }
+  }
+}

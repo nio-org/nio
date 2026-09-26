@@ -1,0 +1,34 @@
+name: Walk-forward
+
+# Builds each recent commit with the compiler of the commit before it, so a
+# commit that uses a new language feature in the same commit that adds it is
+# found (CONTRIBUTING.md, rule 2). Run it locally with
+# `sh tools/walkforward.sh 20`.
+
+on:
+  schedule:
+    # Mondays, 05:00 UTC.
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      depth:
+        description: "How many commits to walk"
+        required: false
+        default: "20"
+
+jobs:
+  walkforward:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # More history than the walk, so the oldest commit in it has a parent.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 40
+
+      - name: clang version
+        run: clang --version
+
+      - name: Walk the last commits forward
+        run: sh tools/walkforward.sh "${{ github.event.inputs.depth || '20' }}"

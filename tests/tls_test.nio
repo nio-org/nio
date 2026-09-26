@@ -1,0 +1,1371 @@
+// Tests the tls module (§6.18) against the published handshake of RFC 8448:
+// its key schedule and its protected records
+// (tests/golden/rfc8448_records.txt). The rejection tables give the reader
+// input that no writer produces: padding, a protected change_cipher_spec, a
+// replay at a wrong sequence. RFC 8446 §5.4 makes the receiver refuse each one.
+import 'test';
+import 'tls';
+import 'crypto';
+import 'string';
+import 'array';
+import 'x509';
+import './bytes' as bytes;
+import './harness' as harness;
+import './repo' as repo;
+
+byte[] unhexB(String h) {
+    return string.toByteArray(bytes.unhex(h));
+}
+
+byte[] toB(String s) {
+    return string.toByteArray(s);
+}
+
+String hex(byte[] b) {
+    return crypto.hexEncode(b);
+}
+
+byte[] catB(byte[] a, byte[] b) {
+    return string.toByteArray(string.fromByteArray(a) + string.fromByteArray(b));
+}
+
+String repeated(String s, int n) {
+    String[] parts = [];
+    int i = 0;
+    while (i < n) {
+        array.push(parts, s);
+        i++;
+    }
+    return string.join(parts, "");
+}
+
+// RFC 8448 §3: the two ephemeral key pairs and the six handshake messages.
+
+String const CLIENT_PRIVATE = "49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7ea5005";
+String const SERVER_PUBLIC = "c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f";
+
+String const CLIENT_HELLO = "010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef"
+    + "6283024dece7000006130113031302010000910000000b000900000673657276"
+    + "6572ff01000100000a00140012001d0017001800190100010101020103010400"
+    + "230000003300260024001d002099381de560e4bd43d23d8e435a7dbafeb3c06e"
+    + "51c13cae4d5413691e529aaf2c002b0003020304000d0020001e040305030603"
+    + "020308040805080604010501060102010402050206020202002d00020101001c"
+    + "00024001";
+
+String const SERVER_HELLO = "020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155"
+    + "772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdb"
+    + "f7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304";
+
+String const ENCRYPTED_EXTENSIONS = "080000240022000a00140012001d00170018001901000101010201030104001c"
+    + "0002400100000000";
+
+String const CERTIFICATE = "0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a"
+    + "864886f70d01010b0500300e310c300a06035504031303727361301e170d3136"
+    + "303733303031323335395a170d3236303733303031323335395a300e310c300a"
+    + "0603550403130372736130819f300d06092a864886f70d010101050003818d00"
+    + "30818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826"
+    + "d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced4312"
+    + "0998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda4308467480"
+    + "30530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a"
+    + "8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b060355"
+    + "1d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5"
+    + "b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a5"
+    + "8c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102"
+    + "702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0"
+    + "a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de10000";
+
+String const CERT_VERIFY = "0f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145a"
+    + "b3ff52f1fda8477b0b7abc90db78e2d33a5c141a078653fa6bef780c5ea248ee"
+    + "aaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac027671459e46445c"
+    + "9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea2"
+    + "0d53dfacd42f74f3";
+
+String const SERVER_FINISHED = "140000209b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454"
+    + "b78f0718";
+
+String const CLIENT_FINISHED = "14000020a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2"
+    + "edd5ce61";
+
+// The only plaintext record in the trace whose header this module writes the
+// same way. The ClientHello record carries the 0x0301 compatibility version.
+String const SH_RECORD = "160303005a020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb"
+    + "1434dac155772ed3e2692800130100002e00330024001d0020c9828876112095"
+    + "fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304";
+
+test.start("tls key schedule replays RFC 8448 §3", void () -> {
+    tls.Transcript t = tls.transcript();
+    t.push(unhexB(CLIENT_HELLO));
+    t.push(unhexB(SERVER_HELLO));
+    test.expectString(hex(t.hash()),
+        "860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
+
+    byte[] early = tls.earlySecret(null);
+    test.expectString(hex(early),
+        "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a");
+
+    // The trace prints this expansion in full, so it checks the HkdfLabel
+    // encoding directly.
+    byte[] derived = tls.deriveSecret(early, "derived", crypto.sha256(toB("")));
+    test.expectString(hex(derived),
+        "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba");
+
+    byte[] shared = crypto.x25519SharedSecret(unhexB(CLIENT_PRIVATE), unhexB(SERVER_PUBLIC));
+    test.expectString(hex(shared),
+        "8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
+
+    byte[] handshake = tls.handshakeSecret(early, shared);
+    test.expectString(hex(handshake),
+        "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac");
+
+    byte[] clientHs = tls.deriveSecret(handshake, "c hs traffic", t.hash());
+    test.expectString(hex(clientHs),
+        "b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21");
+    byte[] serverHs = tls.deriveSecret(handshake, "s hs traffic", t.hash());
+    test.expectString(hex(serverHs),
+        "b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38");
+
+    byte[] master = tls.masterSecret(handshake);
+    test.expectString(hex(master),
+        "18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919");
+
+    // The key and iv expansion depends only on the length, here the trace's
+    // 16-byte AES-128-GCM one.
+    tls.TrafficKeys serverKeys = tls.trafficKeys(serverHs, 16);
+    test.expectString(hex(serverKeys.key), "3fce516009c21727d0f2e4e86ee403bc");
+    test.expectString(hex(serverKeys.iv), "5d313eb2671276ee13000b30");
+    tls.TrafficKeys clientKeys = tls.trafficKeys(clientHs, 16);
+    test.expectString(hex(clientKeys.key), "dbfaa693d1762c5b666af5d950258d01");
+    test.expectString(hex(clientKeys.iv), "5bd3c71b836e0b76bb73265f");
+
+    t.push(unhexB(ENCRYPTED_EXTENSIONS));
+    t.push(unhexB(CERTIFICATE));
+    t.push(unhexB(CERT_VERIFY));
+    byte[] serverVerify = tls.finishedVerifyData(serverHs, t.hash());
+    test.expectString(hex(serverVerify),
+        "9b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718");
+    t.push(unhexB(SERVER_FINISHED));
+    test.expectString(hex(t.hash()),
+        "9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13");
+
+    byte[] clientAp = tls.deriveSecret(master, "c ap traffic", t.hash());
+    test.expectString(hex(clientAp),
+        "9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5");
+    byte[] serverAp = tls.deriveSecret(master, "s ap traffic", t.hash());
+    test.expectString(hex(serverAp),
+        "a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643");
+    byte[] exporter = tls.deriveSecret(master, "exp master", t.hash());
+    test.expectString(hex(exporter),
+        "fe22f881176eda18eb8f44529e6792c50c9a3f89452f68d8ae311b4309d3cf50");
+
+    tls.TrafficKeys serverApKeys = tls.trafficKeys(serverAp, 16);
+    test.expectString(hex(serverApKeys.key), "9f02283b6c9c07efc26bb9f2ac92e356");
+    test.expectString(hex(serverApKeys.iv), "cf782b88dd83549aadf1e984");
+    tls.TrafficKeys clientApKeys = tls.trafficKeys(clientAp, 16);
+    test.expectString(hex(clientApKeys.key), "17422dda596ed5d9acd890e3c63f5051");
+    test.expectString(hex(clientApKeys.iv), "5b78923dee08579033e523d9");
+
+    byte[] clientVerify = tls.finishedVerifyData(clientHs, t.hash());
+    test.expectString(hex(clientVerify),
+        "a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61");
+    t.push(unhexB(CLIENT_FINISHED));
+    test.expectString(hex(t.hash()),
+        "209145a96ee8e2a122ff810047cc952684658d6049e86429426db87c54ad143d");
+
+    // The ticket nonce is the only context in the trace that is not empty and
+    // not a hash. It checks that a short, odd-sized context encodes correctly.
+    byte[] resumptionMaster = tls.deriveSecret(master, "res master", t.hash());
+    test.expectString(hex(resumptionMaster),
+        "7df235f2031d2a051287d02b0241b0bfdaf86cc856231f2d5aba46c434ec196c");
+    byte[] resumption = tls.hkdfExpandLabel(resumptionMaster, "resumption", unhexB("0000"), 32);
+    test.expectString(hex(resumption),
+        "4ecd0eb6ec3b4d87f5d6028f922ca4c5851a277fd41311c9e62d2c9492e1c4f3");
+});
+
+// A round trip passes for any seal and open that agree with each other. These
+// rows come from outside this repository, so a record layer that is only
+// self-consistent fails them. They cover both directions and three sequence
+// numbers, so they check the sequence-XOR-IV nonce (RFC 8446 §5.3) after seq 0.
+// The test derives the secrets by replaying the trace. They are not copied.
+test.start("tls record layer replays RFC 8448 §3's protected records", void () -> {
+    if (!crypto.aesGcmAvailable()) {
+        return;
+    }
+
+    tls.Transcript t = tls.transcript();
+    t.push(unhexB(CLIENT_HELLO));
+    t.push(unhexB(SERVER_HELLO));
+    byte[] early = tls.earlySecret(null);
+    byte[] shared = crypto.x25519SharedSecret(unhexB(CLIENT_PRIVATE), unhexB(SERVER_PUBLIC));
+    byte[] handshake = tls.handshakeSecret(early, shared);
+    byte[] clientHs = tls.deriveSecret(handshake, "c hs traffic", t.hash());
+    byte[] serverHs = tls.deriveSecret(handshake, "s hs traffic", t.hash());
+    byte[] master = tls.masterSecret(handshake);
+    t.push(unhexB(ENCRYPTED_EXTENSIONS));
+    t.push(unhexB(CERTIFICATE));
+    t.push(unhexB(CERT_VERIFY));
+    t.push(unhexB(SERVER_FINISHED));
+    byte[] clientAp = tls.deriveSecret(master, "c ap traffic", t.hash());
+    byte[] serverAp = tls.deriveSecret(master, "s ap traffic", t.hash());
+
+    Map<String, byte[]> secrets = {
+        "c-hs-traffic": clientHs,
+        "s-hs-traffic": serverHs,
+        "c-ap-traffic": clientAp,
+        "s-ap-traffic": serverAp,
+    };
+
+    int rows = 0;
+    forEach(string.split(repo.readText("tests/golden/rfc8448_records.txt"), "\n"), line) {
+        if (string.length(line) == 0 || line[0] == 35) {    // '#'
+            continue;
+        }
+        String[] f = string.split(line, " ");
+        if (f.length != 6) {
+            return Error("malformed record line: " + string.substring(line, 0, 40));
+        }
+        byte[]? secret = secrets[f[1]];
+        if (secret == null) {
+            return Error("the corpus names a secret this test does not derive: " + f[1]);
+        }
+        int seq = string.toInt(f[2]);
+        int contentType = string.toInt(f[3]);
+        byte[] payload = unhexB(f[4]);
+        byte[] record = unhexB(f[5]);
+
+        tls.RecordProtection reader = tls.protectionKeys(secret, tls.TLS_AES_128_GCM_SHA256);
+        reader.seq = seq;
+        tls.InnerPlaintext got = reader.open(record) catch e {
+            return Error(f[0] + ": opening the trace's record failed: " + e.message);
+        };
+        test.assert(got.contentType == contentType,
+            f[0] + ": opened content type " + string.from(got.contentType)
+            + ", the trace says " + string.from(contentType));
+        test.assert(hex(got.data) == hex(payload),
+            f[0] + ": opened to different bytes than the trace's payload");
+
+        tls.RecordProtection writer = tls.protectionKeys(secret, tls.TLS_AES_128_GCM_SHA256);
+        writer.seq = seq;
+        byte[] again = writer.seal(contentType, payload);
+        test.assert(hex(again) == hex(record),
+            f[0] + ": sealed to different bytes than the trace's record");
+        rows = rows + 1;
+    }
+    test.expectInt(rows, 7);
+});
+
+test.start("tls.hkdfExpandLabel rejects what its encoding cannot carry", void () -> {
+    byte[] secret = tls.earlySecret(null);
+
+    byte[]? longLabel = tls.hkdfExpandLabel(secret, repeated("a", 250), toB(""), 32) catch e {
+        test.expectInt(e.code, tls.ErrorCode.ILLEGAL_PARAMETER);
+    };
+    test.assert(longLabel == null, "a 250-byte label must be refused");
+
+    byte[]? emptyLabel = tls.hkdfExpandLabel(secret, "", toB(""), 32) catch e {
+        test.expectInt(e.code, tls.ErrorCode.ILLEGAL_PARAMETER);
+    };
+    test.assert(emptyLabel == null, "an empty label must be refused");
+
+    byte[]? longContext = tls.hkdfExpandLabel(secret, "key", unhexB(CERTIFICATE), 32) catch e {
+        test.expectInt(e.code, tls.ErrorCode.ILLEGAL_PARAMETER);
+    };
+    test.assert(longContext == null, "a 445-byte context must be refused");
+
+    byte[]? zeroLength = tls.hkdfExpandLabel(secret, "key", toB(""), 0) catch e {
+        test.expectInt(e.code, tls.ErrorCode.ILLEGAL_PARAMETER);
+    };
+    test.assert(zeroLength == null, "a zero output length must be refused");
+});
+
+test.start("tls plaintext records frame and parse", void () -> {
+    byte[] rec = tls.plaintextRecord(tls.ContentType.HANDSHAKE, unhexB(SERVER_HELLO));
+    test.expectString(hex(rec), SH_RECORD);
+
+    tls.RecordHeader h = tls.parseRecordHeader(rec);
+    test.expectInt(h.contentType, 22);
+    test.expectInt(h.length, 90);
+
+    // The header is read from the front. Trailing bytes belong to the next
+    // record.
+    tls.RecordHeader h2 = tls.parseRecordHeader(unhexB("170303001affff"));
+    test.expectInt(h2.contentType, 23);
+    test.expectInt(h2.length, 26);
+
+    tls.RecordHeader? short_ = tls.parseRecordHeader(unhexB("16030300")) catch e {
+        test.expectInt(e.code, tls.ErrorCode.DECODE_ERROR);
+    };
+    test.assert(short_ == null, "four bytes are not a record header");
+
+    tls.RecordHeader? unknown = tls.parseRecordHeader(unhexB("1a03030005")) catch e {
+        test.expectInt(e.code, tls.ErrorCode.UNEXPECTED_MESSAGE);
+    };
+    test.assert(unknown == null, "content type 26 must be refused");
+
+    // 16641 = MAX_CIPHERTEXT + 1, written as 0x4101.
+    tls.RecordHeader? huge = tls.parseRecordHeader(unhexB("1703034101")) catch e {
+        test.expectInt(e.code, tls.ErrorCode.RECORD_OVERFLOW);
+    };
+    test.assert(huge == null, "a length above 2^14 + 256 must be refused");
+
+    byte[] big = string.toByteArray(repeated("a", 16385));
+    byte[]? over = tls.plaintextRecord(tls.ContentType.APPLICATION_DATA, big) catch e {
+        test.expectInt(e.code, tls.ErrorCode.RECORD_OVERFLOW);
+    };
+    test.assert(over == null, "a 16385-byte payload must not be framed");
+});
+
+test.start("tls record protection round-trips, both directions counting", void () -> {
+    byte[] secret = unhexB("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38");
+    tls.RecordProtection writer = tls.protectionKeys(secret, tls.TLS_CHACHA20_POLY1305_SHA256);
+    tls.RecordProtection reader = tls.protectionKeys(secret, tls.TLS_CHACHA20_POLY1305_SHA256);
+
+    // The reader opens them in order, because its own count gives each nonce.
+    byte[] r1 = writer.seal(tls.ContentType.HANDSHAKE, toB("first flight"));
+    byte[] r2 = writer.seal(tls.ContentType.APPLICATION_DATA, toB("payload"));
+    byte[] r3 = writer.seal(tls.ContentType.ALERT, unhexB("0100"));
+    test.expectInt(writer.seq, 3);
+
+    tls.InnerPlaintext p1 = reader.open(r1);
+    test.expectInt(p1.contentType, 22);
+    test.expectString(string.fromByteArray(p1.data), "first flight");
+    tls.InnerPlaintext p2 = reader.open(r2);
+    test.expectInt(p2.contentType, 23);
+    test.expectString(string.fromByteArray(p2.data), "payload");
+    tls.InnerPlaintext p3 = reader.open(r3);
+    test.expectInt(p3.contentType, 21);
+    test.expectString(hex(p3.data), "0100");
+    test.expectInt(reader.seq, 3);
+
+    // The header always says application_data (RFC 8446 §5.2). The length
+    // covers the inner plaintext plus the tag.
+    test.expectInt(r1[0], 23);
+    tls.RecordHeader h = tls.parseRecordHeader(r1);
+    test.expectInt(h.length, 12 + 1 + 16);
+
+    // An empty payload still round-trips: one type byte under the AEAD.
+    byte[] r4 = writer.seal(tls.ContentType.APPLICATION_DATA, toB(""));
+    tls.InnerPlaintext p4 = reader.open(r4);
+    test.expectInt(p4.contentType, 23);
+    test.expectInt(p4.data.length, 0);
+});
+
+test.start("tls record protection refuses what §5 says to refuse", void () -> {
+    byte[] secret = unhexB("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21");
+    tls.RecordProtection writer = tls.protectionKeys(secret, tls.TLS_CHACHA20_POLY1305_SHA256);
+    byte[] rec = writer.seal(tls.ContentType.APPLICATION_DATA, toB("attack at dawn"));
+
+    // A wrong sequence number changes the nonce, so replay and reordering
+    // fail the tag.
+    tls.RecordProtection skipped = tls.protectionKeys(secret, tls.TLS_CHACHA20_POLY1305_SHA256);
+    skipped.seq = 1;
+    tls.InnerPlaintext? wrongSeq = skipped.open(rec) catch e {
+        test.expectInt(e.code, crypto.ErrorCode.AUTHENTICATION);
+    };
+    test.assert(wrongSeq == null, "a record at the wrong sequence must not open");
+    // A failed open must not move the count past the record it refused.
+    test.expectInt(skipped.seq, 1);
+
+    // A flipped bit fails authentication, not decoding.
+    byte[] bent = writer.seal(tls.ContentType.APPLICATION_DATA, toB("attack at dawn"));
+    bent[7] = (bent[7] ^ 1) as byte;
+    tls.RecordProtection reader = tls.protectionKeys(secret, tls.TLS_CHACHA20_POLY1305_SHA256);
+    reader.seq = 1;
+    tls.InnerPlaintext? tampered = reader.open(bent) catch e {
+        test.expectInt(e.code, crypto.ErrorCode.AUTHENTICATION);
+    };
+    test.assert(tampered == null, "a tampered record must not open");
+
+    // A header changed to a plaintext type is refused before any crypto.
+    byte[] retyped = writer.seal(tls.ContentType.APPLICATION_DATA, toB("x"));
+    retyped[0] = 22;
+    tls.RecordProtection reader2 = tls.protectionKeys(secret, tls.TLS_CHACHA20_POLY1305_SHA256);
+    reader2.seq = 2;
+    tls.InnerPlaintext? wrongType = reader2.open(retyped) catch e {
+        test.expectInt(e.code, tls.ErrorCode.UNEXPECTED_MESSAGE);
+    };
+    test.assert(wrongType == null, "a protected record must claim application_data");
+
+    // A length that does not match the bytes present is a framing error. Its
+    // code is different from the code for a forgery.
+    byte[] truncated = array.slice(writer.seal(tls.ContentType.APPLICATION_DATA, toB("xyz")), 0, 20);
+    tls.RecordProtection reader3 = tls.protectionKeys(secret, tls.TLS_CHACHA20_POLY1305_SHA256);
+    reader3.seq = 3;
+    tls.InnerPlaintext? cut = reader3.open(truncated) catch e {
+        test.expectInt(e.code, tls.ErrorCode.DECODE_ERROR);
+    };
+    test.assert(cut == null, "a truncated record must not open");
+});
+
+test.start("tls record reader strips padding it never writes", void () -> {
+    byte[] secret = unhexB("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5");
+    tls.TrafficKeys tk = tls.trafficKeys(secret, 32);
+
+    // The layout of RFC 8446 §5.4: content, the true type, then zeros. At
+    // sequence zero the nonce is the IV, so the record seals directly through
+    // the AEAD.
+    byte[] inner = catB(toB("data"), unhexB("16000000"));
+    byte[] header = unhexB("1703030018");    // 4 + 4 + 16 = 24 bytes follow
+    byte[] sealed = crypto.chacha20Poly1305Seal(tk.key, tk.iv, inner, header);
+    tls.RecordProtection reader = tls.protectionKeys(secret, tls.TLS_CHACHA20_POLY1305_SHA256);
+    tls.InnerPlaintext p = reader.open(catB(header, sealed));
+    test.expectInt(p.contentType, 22);
+    test.expectString(string.fromByteArray(p.data), "data");
+
+    // A record of only padding names no type. RFC 8446 §5.4 makes that a
+    // decode error, found after verification, so the code is not
+    // AUTHENTICATION.
+    byte[] allPad = unhexB("00000000");
+    byte[] padHeader = unhexB("1703030014");    // 4 + 16
+    byte[] padSealed = crypto.chacha20Poly1305Seal(tk.key, tk.iv, allPad, padHeader);
+    tls.RecordProtection reader2 = tls.protectionKeys(secret, tls.TLS_CHACHA20_POLY1305_SHA256);
+    tls.InnerPlaintext? empty = reader2.open(catB(padHeader, padSealed)) catch e {
+        test.expectInt(e.code, tls.ErrorCode.DECODE_ERROR);
+    };
+    test.assert(empty == null, "a record of only padding must not open");
+
+    // CHANGE_CIPHER_SPEC exists only as plaintext for compatibility, so a
+    // protected one is refused by its type.
+    byte[] ccsInner = unhexB("0114");
+    byte[] ccsHeader = unhexB("1703030012");    // 2 + 16
+    byte[] ccsSealed = crypto.chacha20Poly1305Seal(tk.key, tk.iv, ccsInner, ccsHeader);
+    tls.RecordProtection reader3 = tls.protectionKeys(secret, tls.TLS_CHACHA20_POLY1305_SHA256);
+    tls.InnerPlaintext? ccs = reader3.open(catB(ccsHeader, ccsSealed)) catch e {
+        test.expectInt(e.code, tls.ErrorCode.UNEXPECTED_MESSAGE);
+    };
+    test.assert(ccs == null, "a protected change_cipher_spec must be refused");
+});
+
+// ===========================================================================
+// The handshake
+// ===========================================================================
+//
+// A TLS parser reads bytes from an attacker, so every malformed message must
+// give a DECODE_ERROR. An out-of-range index stops the program (§5.5). Over a
+// network, that is a denial of service. The handshake and its failure paths
+// run over loopback against the module's test peer, which misbehaves in one
+// way per case.
+
+test.start("tls parses RFC 8448's ClientHello", void () -> {
+    tls.ClientHello ch = tls.parseClientHello(tls.messageBody(unhexB(CLIENT_HELLO)));
+    test.expectString(hex(ch.random),
+        "cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef6283024dece7");
+    test.expectInt(ch.sessionId.length, 0);
+    // The trace offers three suites. ChaCha20-Poly1305 is 0x1303.
+    test.expectInt(ch.cipherSuites.length, 3);
+    test.expectInt(ch.cipherSuites[0], 4865);
+    test.expectInt(ch.cipherSuites[1], 4867);
+    test.expectString(hex(ch.keyShare),
+        "99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c");
+    test.expectString(ch.serverName, "server");
+});
+
+test.start("tls parses RFC 8448's ServerHello", void () -> {
+    tls.ServerHello sh = tls.parseServerHello(tls.messageBody(unhexB(SERVER_HELLO)));
+    test.expectBool(sh.helloRetryRequest, false);
+    test.expectInt(sh.cipherSuite, 4865);    // the trace uses AES-128-GCM
+    test.expectString(hex(sh.keyShare),
+        "c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f");
+});
+
+test.start("tls builds a ClientHello it can read back", void () -> {
+    byte[] pub = crypto.x25519PublicKey(crypto.randomBytes(32));
+    byte[] random = crypto.randomBytes(32);
+    byte[] sessionId = crypto.randomBytes(32);
+    byte[] msg = tls.buildClientHello(random, sessionId, pub, "example.com",
+        ["h2", "http/1.1"]);
+    test.expectInt(msg[0], 1);
+
+    tls.ClientHello ch = tls.parseClientHello(tls.messageBody(msg));
+    test.expectString(hex(ch.random), hex(random));
+    test.expectString(hex(ch.sessionId), hex(sessionId));
+    test.expectString(hex(ch.keyShare), hex(pub));
+    test.expectString(ch.serverName, "example.com");
+    // The offered list holds what this host can do in constant time (§6.17).
+    // ChaCha20-Poly1305 needs no hardware, so it leads on every host.
+    test.expectInt(ch.cipherSuites.length, tls.offeredSuites().length);
+    test.expectInt(ch.cipherSuites[0], 4867);
+    if (crypto.aesGcmAvailable()) {
+        test.expectInt(ch.cipherSuites.length, 2);
+        test.expectInt(ch.cipherSuites[1], 4865);
+    } else {
+        test.expectInt(ch.cipherSuites.length, 1);
+    }
+    test.expectInt(ch.alpn.length, 2);
+    test.expectString(ch.alpn[0], "h2");
+    test.expectString(ch.alpn[1], "http/1.1");
+
+    // An address literal is not a valid SNI value, so the hello omits it.
+    String[] noAlpn = [];
+    tls.ClientHello byIp = tls.parseClientHello(tls.messageBody(
+        tls.buildClientHello(random, sessionId, pub, "127.0.0.1", noAlpn)));
+    test.expectString(byIp.serverName, "");
+    tls.ClientHello byIp6 = tls.parseClientHello(tls.messageBody(
+        tls.buildClientHello(random, sessionId, pub, "::1", noAlpn)));
+    test.expectString(byIp6.serverName, "");
+});
+
+// Every prefix must be refused, and none of them may stop the program.
+test.start("tls refuses every truncation of a ClientHello", void () -> {
+    byte[] full = tls.messageBody(unhexB(CLIENT_HELLO));
+    int refused = 0;
+    int i = 0;
+    while (i < full.length) {
+        tls.ClientHello? ch = tls.parseClientHello(array.slice(full, 0, i)) catch e {
+            test.assert(e.code == tls.ErrorCode.DECODE_ERROR
+                || e.code == tls.ErrorCode.ILLEGAL_PARAMETER,
+                "truncation at " + string.from(i) + " gave code " + string.from(e.code));
+            refused = refused + 1;
+        };
+        test.assert(ch == null, "a ClientHello cut at " + string.from(i) + " must not parse");
+        i = i + 1;
+    }
+    test.expectInt(refused, full.length);
+});
+
+test.start("tls refuses every truncation of a ServerHello", void () -> {
+    byte[] full = tls.messageBody(unhexB(SERVER_HELLO));
+    int i = 0;
+    while (i < full.length) {
+        tls.ServerHello? sh = tls.parseServerHello(array.slice(full, 0, i)) catch e {
+            test.assert(e.code == tls.ErrorCode.DECODE_ERROR
+                || e.code == tls.ErrorCode.ILLEGAL_PARAMETER,
+                "truncation at " + string.from(i) + " gave code " + string.from(e.code));
+        };
+        test.assert(sh == null, "a ServerHello cut at " + string.from(i) + " must not parse");
+        i = i + 1;
+    }
+});
+
+test.start("tls refuses a ServerHello that answers something else", void () -> {
+    // HelloRetryRequest: a ServerHello whose random is the fixed value of
+    // RFC 8446 §4.1.3. The parser identifies it, so the client does not read a
+    // key share.
+    byte[] hrr = unhexB("0303"
+        + "cf21ad74e59a6111be1d8c021e65b891c2a21167abb8c5e079e09e2c8a8339c2"
+        + "00" + "1301" + "00"
+        + "0006" + "002b0002" + "0304");
+    tls.ServerHello sh = tls.parseServerHello(hrr);
+    test.expectBool(sh.helloRetryRequest, true);
+
+    // No supported_versions: a TLS 1.2 server answers a 1.3 hello. The client
+    // supports no lower version, so it refuses the reply.
+    byte[] noVersions = unhexB("0303" + "0000000000000000000000000000000000000000000000000000000000000000"
+        + "00" + "1303" + "00" + "0000");
+    tls.ServerHello? old = tls.parseServerHello(noVersions) catch e {
+        test.expectInt(e.code, tls.ErrorCode.ILLEGAL_PARAMETER);
+    };
+    test.assert(old == null, "a ServerHello without supported_versions must be refused");
+
+    // A group that was never offered.
+    byte[] wrongGroup = unhexB("0303" + "0000000000000000000000000000000000000000000000000000000000000000"
+        + "00" + "1303" + "00"
+        + "0010" + "002b00020304" + "00330006" + "0017" + "0002" + "0000");
+    tls.ServerHello? bad = tls.parseServerHello(wrongGroup) catch e {
+        test.expectInt(e.code, tls.ErrorCode.ILLEGAL_PARAMETER);
+    };
+    test.assert(bad == null, "a ServerHello choosing secp256r1 must be refused");
+});
+
+test.start("tls refuses a repeated extension", void () -> {
+    // supported_versions twice. If a receiver accepts one copy, two
+    // implementations can read the message differently. The defect is in the
+    // framing of the block and not in a field, so the code is DECODE_ERROR.
+    byte[] twice = unhexB("002b0002" + "0304" + "002b0002" + "0304");
+    Map<int, byte[]>? exts = tls.parseExtensions(twice) catch e {
+        test.expectInt(e.code, tls.ErrorCode.DECODE_ERROR);
+    };
+    test.assert(exts == null, "a repeated extension must be refused");
+});
+
+// Regression cases from BoGo, the protocol suite of BoringSSL.
+// `sh tools/bogo.sh` needs a network fetch and is not part of
+// `nio run tests/all.nio`, so these cases repeat its checks here.
+
+test.start("tls refuses a ServerHello extension it did not ask for", void () -> {
+    // RFC 8446 §4.2: a server must not answer an extension that the client did
+    // not send, and §4.1.3 lets a ServerHello carry only two. Here the server
+    // sends `ec_point_formats` (11), which is valid in TLS 1.2 only.
+    byte[] extra = unhexB("0303"
+        + "0000000000000000000000000000000000000000000000000000000000000000"
+        + "00" + "1301" + "00"
+        + "0034" + "002b00020304"
+        + "00330024001d0020" + "0000000000000000000000000000000000000000000000000000000000000000"
+        + "000b0002" + "0100");
+    tls.ServerHello? bad = tls.parseServerHello(extra) catch e {
+        test.expectInt(e.code, tls.ErrorCode.UNSUPPORTED_EXTENSION);
+    };
+    test.assert(bad == null, "an unsolicited ServerHello extension must be refused");
+    test.expectInt(tls.alertFor(tls.ErrorCode.UNSUPPORTED_EXTENSION), 110);
+});
+
+test.start("tls refuses trailing bytes after a handshake message", void () -> {
+    // The extension block has a length prefix, so a byte after it cannot be a
+    // field from a later version. Without this check, the transcript hash fails
+    // three messages later.
+    byte[] trailing = unhexB("0303"
+        + "0000000000000000000000000000000000000000000000000000000000000000"
+        + "00" + "1301" + "00"
+        + "002e" + "002b00020304"
+        + "00330024001d0020" + "0000000000000000000000000000000000000000000000000000000000000000"
+        + "ff");
+    tls.ServerHello? bad = tls.parseServerHello(trailing) catch e {
+        test.expectInt(e.code, tls.ErrorCode.DECODE_ERROR);
+    };
+    test.assert(bad == null, "trailing bytes after a ServerHello must be refused");
+
+    // The same rule for a Certificate entry. This client asks for no OCSP and
+    // no SCT, so a server that sends one sends unsolicited data.
+    byte[] withExt = unhexB("00" + "00000d" + "000004" + "30820000" + "0004" + "00050000");
+    byte[][]? chain = tls.parseCertificate(withExt) catch e {
+        test.expectInt(e.code, tls.ErrorCode.UNSUPPORTED_EXTENSION);
+    };
+    test.assert(chain == null, "an unsolicited certificate-entry extension must be refused");
+});
+
+// A transport for the cases that do not read or write. `alert` and its
+// counters are only state, and a real socket can make the test hang.
+tls.Transport deadTransport() {
+    return {
+        read: Future<byte[]!> (int n) -> failedRead(),
+        write: Future<void!> (byte[] b) -> okWrite(),
+        close: void () -> { },
+    };
+}
+
+byte[] async failedRead() {
+    return Error("no transport", tls.ErrorCode.DECODE_ERROR);
+}
+
+void async okWrite() {
+    // This body can fail because `Transport.write` is declared fallible, and
+    // §2.9 gives that contract only to a body that can fail.
+    if (false) { return Error("unreachable", tls.ErrorCode.DECODE_ERROR); }
+}
+
+// Protects an inner plaintext that this file builds, with padding, which `seal`
+// refuses to do. The nonce construction of RFC 8446 §5.3 is written again here,
+// so that an error in the module is not copied into the test.
+byte[] sealRaw(tls.RecordProtection p, byte[] inner) {
+    byte[] nonce = array.copy(p.iv);
+    int i = 0;
+    while (i < 8) {
+        nonce[4 + i] = (nonce[4 + i] ^ ((p.seq >> (8 * (7 - i))) & 255)) as byte;
+        i++;
+    }
+    int total = inner.length + 16;
+    byte[] header = [23, 3, 3, ((total >> 8) & 255) as byte, (total & 255) as byte];
+    byte[] body = crypto.chacha20Poly1305Seal(p.key, nonce, inner, header);
+    byte[] out = array.copy(header);
+    forEach(body, b) { array.push(out, b); }
+    return out;
+}
+
+test.start("tls refuses a warning alert and an undefined alert level", void () -> {
+    // TLS 1.3 removed warning alerts (RFC 8446 §6) except user_canceled. Any
+    // other alert at warning level is a malformed record.
+    byte[] secret = crypto.sha256(toB("bogo alerts"));
+
+    tls.Framer warned = tls.framer(deadTransport());
+    warned.rp = tls.protectionKeys(secret, tls.TLS_CHACHA20_POLY1305_SHA256);
+    bool sawWarning = false;
+    warned.alert([1, 10]) catch e {
+        test.expectInt(e.code, tls.ErrorCode.DECODE_ERROR);
+        sawWarning = true;
+    };
+    test.assert(sawWarning, "a warning alert must be refused at TLS 1.3");
+
+    // user_canceled is ignored and counted. Without a limit, a peer could make
+    // this end read forever.
+    tls.Framer cancels = tls.framer(deadTransport());
+    int n = 0;
+    bool tooMany = false;
+    while (n < 6 && !tooMany) {
+        cancels.alert([1, 90]) catch e {
+            test.expectInt(e.code, tls.ErrorCode.TOO_MANY_MESSAGES);
+            tooMany = true;
+        };
+        n++;
+    }
+    test.assert(tooMany, "an unbounded run of user_canceled must be refused");
+    // Four are ignored. The fifth is refused.
+    test.expectInt(n, 5);
+
+    // A level byte with no defined value breaks the record format, so the
+    // description after it must not be read.
+    tls.Framer bogus = tls.framer(deadTransport());
+    bool sawBogus = false;
+    bogus.alert([66, 10]) catch e {
+        test.expectInt(e.code, tls.ErrorCode.ILLEGAL_PARAMETER);
+        sawBogus = true;
+    };
+    test.assert(sawBogus, "an undefined alert level must be refused");
+
+    // A close_notify is the end of the stream. It is not an error.
+    tls.Framer bye = tls.framer(deadTransport());
+    bye.alert([1, 0]);
+    test.expectBool(bye.closed, true);
+});
+
+test.start("tls bounds a padded record by the whole inner plaintext", void () -> {
+    // RFC 8446 §5.2 limits content, type byte and padding together to
+    // 2^14 + 1. That limit is different from the limit on the content alone. A
+    // check of only the content lets a peer send 8 KB of data and 8 KB of
+    // padding.
+    byte[] secret = crypto.sha256(toB("bogo padding"));
+
+    // At the limit. It must open. Otherwise the limit is off by one.
+    tls.RecordProtection w1 = tls.protectionKeys(secret, tls.TLS_CHACHA20_POLY1305_SHA256);
+    byte[] ok = string.toByteArray(repeated("a", 16383));
+    array.push(ok, 23);
+    array.push(ok, 0);
+    tls.RecordProtection r1 = tls.protectionKeys(secret, tls.TLS_CHACHA20_POLY1305_SHA256);
+    tls.InnerPlaintext fine = r1.open(sealRaw(w1, ok));
+    test.expectInt(fine.data.length, 16383);
+
+    // One byte over the limit, with the content inside its own limit. The two
+    // limits apply to different things.
+    tls.RecordProtection w2 = tls.protectionKeys(secret, tls.TLS_CHACHA20_POLY1305_SHA256);
+    byte[] over = string.toByteArray(repeated("a", 8193));
+    array.push(over, 23);
+    int p = 0;
+    while (p < 8192) {
+        array.push(over, 0);
+        p++;
+    }
+    test.expectInt(over.length, 16386);
+    tls.RecordProtection r2 = tls.protectionKeys(secret, tls.TLS_CHACHA20_POLY1305_SHA256);
+    tls.InnerPlaintext? refused = r2.open(sealRaw(w2, over)) catch e {
+        test.expectInt(e.code, tls.ErrorCode.RECORD_OVERFLOW);
+    };
+    test.assert(refused == null, "an over-padded record must be refused");
+});
+
+test.start("tls maps its error codes onto the alerts they are named for", void () -> {
+    test.expectInt(tls.alertFor(tls.ErrorCode.ILLEGAL_PARAMETER), 47);
+    test.expectInt(tls.alertFor(tls.ErrorCode.DECODE_ERROR), 50);
+    test.expectInt(tls.alertFor(tls.ErrorCode.RECORD_OVERFLOW), 22);
+    test.expectInt(tls.alertFor(tls.ErrorCode.UNEXPECTED_MESSAGE), 10);
+    test.expectInt(tls.alertFor(tls.ErrorCode.HANDSHAKE_FAILURE), 40);
+    test.expectInt(tls.alertFor(tls.ErrorCode.DECRYPT_ERROR), 51);
+    test.expectInt(tls.alertFor(tls.ErrorCode.UNSUPPORTED_CERTIFICATE), 43);
+    // A forged record is bad_record_mac, and it carries the AEAD's own code.
+    test.expectInt(tls.alertFor(crypto.ErrorCode.AUTHENTICATION), 20);
+    // `connect` returns x509's codes unchanged, so a caller sees the problem
+    // with the certificate. The alert comes from the same code.
+    test.expectInt(tls.alertFor(x509.ErrorCode.EXPIRED), 45);
+    test.expectInt(tls.alertFor(x509.ErrorCode.NOT_YET_VALID), 45);
+    test.expectInt(tls.alertFor(x509.ErrorCode.UNTRUSTED_ROOT), 48);
+    test.expectInt(tls.alertFor(x509.ErrorCode.HOSTNAME_MISMATCH), 42);
+    test.expectInt(tls.alertFor(x509.ErrorCode.BAD_CERTIFICATE), 42);
+    test.expectInt(tls.alertFor(x509.ErrorCode.CONSTRAINT_VIOLATION), 42);
+    test.expectInt(tls.alertFor(x509.ErrorCode.BAD_SIGNATURE), 51);
+    test.expectInt(tls.alertFor(x509.ErrorCode.UNSUPPORTED_ALGORITHM), 43);
+    test.expectInt(tls.alertFor(999), 80);
+});
+
+test.start("tls signs the CertificateVerify content RFC 8446 §4.4.3 describes", void () -> {
+    byte[] content = tls.certificateVerifyContent(
+        "TLS 1.3, server CertificateVerify", crypto.sha256(toB("")));
+    // 64 spaces, the context, a zero byte, then the hash.
+    test.expectInt(content.length, 64 + 33 + 1 + 32);
+    test.expectInt(content[0], 32);
+    test.expectInt(content[63], 32);
+    test.expectInt(content[64], 84);    // 'T'
+    test.expectInt(content[97], 0);
+    test.expectString(hex(array.slice(content, 98)),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+});
+
+// ---------------------------------------------------------------------------
+// End to end over loopback
+// ---------------------------------------------------------------------------
+
+// The certificate from RFC 8448, as real DER, for the verification cases
+// below.
+String const TEST_CERT_DER = "308201ac30820115a003020102020102300d06092a864886f70d01010b050030"
+    + "0e310c300a06035504031303727361301e170d3136303733303031323335395a"
+    + "170d3236303733303031323335395a300e310c300a0603550403130372736130"
+    + "819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f"
+    + "8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91"
+    + "d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b"
+    + "1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbf"
+    + "ae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f02030100"
+    + "01a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06"
+    + "092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a726717"
+    + "0618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6"
+    + "c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a4"
+    + "2a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d"
+    + "402dcc0cc8f8961229ac9187b42b4de1";
+
+String const TLS_PRELUDE = `
+import 'tls';
+import 'net';
+import 'async';
+import 'string';
+import 'crypto';
+import 'x509';
+
+String const CERT = "` + TEST_CERT_DER + `";
+
+byte[] der() {
+    return crypto.hexDecode(CERT) catch e { return string.toByteArray(""); };
+}
+
+// The test peer, wrapped so async.run will take it: §6.8 refuses a fallible
+// future, and every handshake is one.
+void async serveOne(Listener l) {
+    Socket c = await net.accept(l) catch e { print("accept: " + e.message); return; };
+    tls.Transport io = tls.socketTransport(c, 5000);
+    tls.Conn conn = await tls.testAccept(io, {
+        certificates: [der()], alpn: ["http/1.1"],
+    }) catch e {
+        print("server: " + e.message);
+        net.close(c);
+        return;
+    };
+    byte[] got = await conn.read(4096) catch e { print("server read: " + e.message); return; };
+    print("server got " + string.fromByteArray(got));
+    await conn.write(string.toByteArray("pong")) catch e { return; };
+    // Read again: an empty answer is the client's close_notify.
+    byte[] end = await conn.read(4096) catch e { return; };
+    print("server sees close " + string.from(end.length == 0));
+    await conn.close();
+}
+`;
+
+test.start("tls: a client and the test peer complete a handshake", void () -> {
+    harness.expectOutput(TLS_PRELUDE + `
+void async drive() {
+    Listener l = net.tcp.listen("127.0.0.1:0");
+    String addr = net.address(l);
+    async.run(serveOne(l), void () -> { });
+
+    tls.Conn c = await tls.connect(addr, "localhost",
+        { alpn: ["h2", "http/1.1"], insecureSkipVerify: true });
+    print("alpn " + c.alpn);
+    print("chain " + string.from(c.peerCertificates.length)
+        + " " + string.from(c.peerCertificates[0].length));
+    await c.write(string.toByteArray("ping"));
+    byte[] reply = await c.read(4096);
+    print("client got " + string.fromByteArray(reply));
+    await c.close();
+    net.close(l);
+}
+await drive() catch e { print("failed: " + e.message); };
+`, [
+        "alpn http/1.1", "chain 1 432", "server got ping", "client got pong",
+        "server sees close true",
+    ]);
+});
+
+test.start("tls: a large write crosses record boundaries intact", void () -> {
+    harness.expectOutput(`
+import 'tls';
+import 'net';
+import 'async';
+import 'string';
+import 'array';
+import 'crypto';
+
+void async serveOne(Listener l) {
+    Socket c = await net.accept(l) catch e { return; };
+    tls.Conn conn = await tls.testAccept(tls.socketTransport(c, 5000), {
+        certificates: [string.toByteArray("x")], alpn: [],
+    }) catch e { print("server: " + e.message); return; };
+    // 40000 bytes is three records at the 16384-byte plaintext limit, so
+    // this is the reassembly path rather than a single record.
+    String[] parts = [];
+    int total = 0;
+    while (total < 40000) {
+        byte[] b = await conn.read(65536) catch e { break; };
+        if (b.length == 0) { break; }
+        array.push(parts, string.fromByteArray(b));
+        total = total + b.length;
+    }
+    String all = string.join(parts, "");
+    print("bytes " + string.from(string.length(all)));
+    print("digest " + crypto.hexEncode(crypto.sha256(string.toByteArray(all))));
+    await conn.close();
+}
+
+void async drive() {
+    Listener l = net.tcp.listen("127.0.0.1:0");
+    String addr = net.address(l);
+    async.run(serveOne(l), void () -> { });
+
+    tls.Conn c = await tls.connect(addr, "localhost", { insecureSkipVerify: true });
+    String[] chunk = [];
+    int i = 0;
+    while (i < 1000) { array.push(chunk, "0123456789012345678901234567890123456789"); i++; }
+    byte[] payload = string.toByteArray(string.join(chunk, ""));
+    print("digest " + crypto.hexEncode(crypto.sha256(payload)));
+    await c.write(payload);
+    await c.close();
+    net.close(l);
+}
+await drive() catch e { print("failed: " + e.message); };
+`, [
+        "digest f37c352ca0c2e4568e2c6932e831f74157d5fab2f3a3f3a6bbbed70ed1f888b6",
+        "bytes 40000",
+        "digest f37c352ca0c2e4568e2c6932e831f74157d5fab2f3a3f3a6bbbed70ed1f888b6",
+    ]);
+});
+
+test.start("tls: a tampered handshake record fails to authenticate", void () -> {
+    harness.expectOutput(TLS_PRELUDE + `
+// A transport that flips one bit of the nth record it writes. The third
+// record the peer sends is the first protected one (ServerHello and the
+// compatibility change_cipher_spec are the first two), so this is a
+// forgery in the EncryptedExtensions.
+Future<void!> flipped(tls.Transport inner, int[] count, int n, byte[] b) {
+    count[0] = count[0] + 1;
+    if (count[0] == n) {
+        b[b.length - 1] = (b[b.length - 1] ^ 1) as byte;
+    }
+    return inner.write(b);
+}
+
+tls.Transport corrupting(tls.Transport inner, int n) {
+    int[] count = [0];
+    return {
+        read: inner.read,
+        write: Future<void!> (byte[] b) -> flipped(inner, count, n, b),
+        close: inner.close,
+    };
+}
+
+void async serveBent(Listener l) {
+    Socket c = await net.accept(l) catch e { return; };
+    tls.Transport io = corrupting(tls.socketTransport(c, 5000), 3);
+    await tls.testAccept(io, { certificates: [der()], alpn: [] }) catch e { };
+    net.close(c);
+}
+
+void async drive() {
+    Listener l = net.tcp.listen("127.0.0.1:0");
+    String addr = net.address(l);
+    async.run(serveBent(l), void () -> { });
+
+    tls.Conn? c = await tls.connect(addr, "localhost", { insecureSkipVerify: true }) catch e {
+        print("refused " + string.from(e.code == crypto.ErrorCode.AUTHENTICATION));
+        print("alert " + string.from(tls.alertFor(e.code)));
+    };
+    print("connected " + string.from(c != null));
+    net.close(l);
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["refused true", "alert 20", "connected false"]);
+});
+
+test.start("tls: a peer whose Finished is wrong is refused", void () -> {
+    harness.expectOutput(`
+import 'tls';
+import 'net';
+import 'async';
+import 'string';
+import 'crypto';
+
+// A server built from this module's own exports, correct in every respect
+// but one: its Finished carries verify_data computed under the wrong
+// secret. Everything before it authenticates, so the client reaches the
+// check and must fail there. That check is where DECRYPT_ERROR comes from,
+// and it proves that the peer shared the key exchange.
+//
+// This peer also shows that the pieces of the handshake are exported and
+// not sealed inside one function, so that another transport, such as QUIC,
+// can drive them.
+void async serveLying(Listener l) {
+    Socket sock = await net.accept(l) catch e { print("peer: " + e.message); return; };
+    tls.Transport io = tls.socketTransport(sock, 5000);
+    tls.Framer f = tls.framer(io);
+    tls.Transcript t = tls.transcript();
+
+    byte[] chMsg = await f.expect(tls.HandshakeType.CLIENT_HELLO) catch e { print("peer: " + e.message); return; };
+    tls.ClientHello ch = tls.parseClientHello(tls.messageBody(chMsg)) catch e { print("peer: " + e.message); return; };
+    t.push(chMsg);
+
+    byte[] priv = crypto.randomBytes(32);
+    byte[] shared = crypto.x25519SharedSecret(priv, ch.keyShare) catch e { print("peer: " + e.message); return; };
+
+    tls.Writer sh = tls.writer();
+    sh.u16(771);
+    sh.raw(crypto.randomBytes(32));
+    int sid = sh.open8();
+    sh.raw(ch.sessionId);
+    sh.close8(sid) catch e { print("peer: " + e.message); return; };
+    sh.u16(4867);
+    sh.u8(0);
+    int exts = sh.open16();
+    sh.u16(43); sh.u16(2); sh.u16(772);
+    sh.u16(51); sh.u16(36); sh.u16(29); sh.u16(32);
+    sh.raw(crypto.x25519PublicKey(priv));
+    sh.close16(exts) catch e { print("peer: " + e.message); return; };
+
+    byte[] shMsg = tls.handshakeMessage(tls.HandshakeType.SERVER_HELLO, sh.out);
+    t.push(shMsg);
+    await io.write(tls.plaintextRecord(22, shMsg)) catch e { print("peer: " + e.message); return; };
+
+    byte[] early = tls.earlySecret(null);
+    byte[] hs = tls.handshakeSecret(early, shared);
+    byte[] serverHs = tls.deriveSecret(hs, "s hs traffic", t.hash()) catch e { print("peer: " + e.message); return; };
+    tls.RecordProtection out = tls.protectionKeys(serverHs, tls.TLS_CHACHA20_POLY1305_SHA256);
+
+    byte[] ee = tls.handshakeMessage(8, [0, 0]);
+    t.push(ee);
+    await io.write(out.seal(22, ee)) catch e { print("peer: " + e.message); return; };
+
+    // Certificate: no context, one entry, no extensions.
+    tls.Writer cw = tls.writer();
+    cw.u8(0);
+    cw.u24(6);
+    cw.u24(1);
+    cw.u8(88);
+    cw.u16(0);
+    byte[] cert = tls.handshakeMessage(11, cw.out);
+    t.push(cert);
+    await io.write(out.seal(22, cert)) catch e { print("peer: " + e.message); return; };
+
+    tls.Writer vw = tls.writer();
+    vw.u16(2052);
+    vw.u16(4);
+    vw.u8(1); vw.u8(2); vw.u8(3); vw.u8(4);
+    byte[] cv = tls.handshakeMessage(15, vw.out);
+    t.push(cv);
+    await io.write(out.seal(22, cv)) catch e { print("peer: " + e.message); return; };
+
+    // The lie: verify_data under a secret the client does not have.
+    byte[] wrong = tls.finishedVerifyData(crypto.randomBytes(32), t.hash());
+    await io.write(out.seal(22, tls.handshakeMessage(20, wrong))) catch e { print("peer: " + e.message); return; };
+
+    // Drain before closing. Closing a socket
+    // that still holds unread bytes (the client's compatibility
+    // change_cipher_spec, which this peer never read) makes the
+    // kernel answer RST rather than FIN, and an RST discards data already
+    // sent: the client would lose the Finished it is meant to reject and
+    // see a connection reset instead. Reading to the end waits for the
+    // client's own alert and leaves nothing behind to force one.
+    while (true) {
+        byte[] rest = await io.read(4096) catch e { break; };
+        if (rest.length == 0) { break; }
+    }
+    net.close(sock);
+}
+
+void async drive() {
+    Listener l = net.tcp.listen("127.0.0.1:0");
+    String addr = net.address(l);
+    async.run(serveLying(l), void () -> { });
+
+    tls.Conn? c = await tls.connect(addr, "localhost", { insecureSkipVerify: true }) catch e {
+        print("refused " + string.from(e.code == tls.ErrorCode.DECRYPT_ERROR));
+        print("alert " + string.from(tls.alertFor(e.code)));
+        print(e.message);
+    };
+    print("connected " + string.from(c != null));
+    net.close(l);
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["refused true", "alert 51", "server Finished does not verify", "connected false"]);
+});
+
+// ---------------------------------------------------------------------------
+// Verification is the default
+// ---------------------------------------------------------------------------
+//
+// `tls.connect` authenticates its peer unless a caller opts out. The three
+// cases below each leave one thing wrong: the root, the hostname, or the proof
+// of key possession. The certificates come from tests/golden/x509_fixtures.txt,
+// because the validity of the RFC 8448 certificate ends in 2026.
+
+String fixtureHex(String name) {
+    forEach(string.split(repo.readText("tests/golden/x509_fixtures.txt"), "\n"), line) {
+        if (string.length(line) == 0 || line[0] == 35) {
+            continue;
+        }
+        String[] f = string.split(line, " ");
+        if (f.length == 2 && f[0] == name) {
+            return f[1];
+        }
+    }
+    return Error("no x509 fixture named " + name);
+}
+
+// The same, from the ECDSA fixture PKI.
+String ecFixtureHex(String name) {
+    forEach(string.split(repo.readText("tests/golden/x509_ec_fixtures.txt"), "\n"), line) {
+        if (string.length(line) == 0 || line[0] == 35) {
+            continue;
+        }
+        String[] f = string.split(line, " ");
+        if (f.length == 2 && f[0] == name) {
+            return f[1];
+        }
+    }
+    return Error("no EC x509 fixture named " + name);
+}
+
+// A peer that serves the leaf and intermediate of the fixture PKI. The chain is
+// real, so only the item that each case changes is wrong.
+String verifyPrelude() {
+    return `
+import 'tls';
+import 'net';
+import 'async';
+import 'string';
+import 'crypto';
+import 'x509';
+
+byte[] hex(String h) {
+    return crypto.hexDecode(h) catch e { return string.toByteArray(""); };
+}
+
+byte[] leafDer() { return hex("` + fixtureHex("leaf") + `"); }
+byte[] interDer() { return hex("` + fixtureHex("inter") + `"); }
+byte[] rootDer() { return hex("` + fixtureHex("root") + `"); }
+byte[] rogueDer() { return hex("` + fixtureHex("rogue") + `"); }
+
+void async serveFixture(Listener l) {
+    Socket c = await net.accept(l) catch e { return; };
+    await tls.testAccept(tls.socketTransport(c, 5000), {
+        certificates: [leafDer(), interDer()], alpn: [],
+    }) catch e { net.close(c); return; };
+}
+`;
+}
+
+test.start("tls: connect refuses a peer no root vouches for", void () -> {
+    harness.expectOutput(verifyPrelude() + `
+void async drive() {
+    Listener l = net.tcp.listen("127.0.0.1:0");
+    String addr = net.address(l);
+    async.run(serveFixture(l), void () -> { });
+
+    // No roots and no insecureSkipVerify: the fixture PKI is not in any
+    // system store, so this must not connect.
+    tls.Conn? c = await tls.connect(addr, "leaf.example.com", { timeout: 5000 }) catch e {
+        print("code " + string.from(e.code));
+        print("untrusted root " + string.from(e.code == x509.ErrorCode.UNTRUSTED_ROOT));
+        print("alert " + string.from(tls.alertFor(e.code)));
+        net.close(l);
+        return;
+    };
+    print("connected, which is wrong");
+    net.close(l);
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["code 304", "untrusted root true", "alert 48"]);
+});
+
+test.start("tls: connect refuses a peer named for another host", void () -> {
+    harness.expectOutput(verifyPrelude() + `
+void async drive() {
+    Listener l = net.tcp.listen("127.0.0.1:0");
+    String addr = net.address(l);
+    async.run(serveFixture(l), void () -> { });
+
+    // The chain is trusted here, because the fixture root is supplied. The
+    // only error left is the name, and that is the error that comes back.
+    x509.Certificate root = x509.parseCertificate(rootDer()) catch e {
+        print("parse " + e.message); net.close(l); return;
+    };
+    tls.Conn? c = await tls.connect(addr, "wrong.example.com",
+        { roots: [root], timeout: 5000 }) catch e {
+        print("code " + string.from(e.code));
+        print("hostname mismatch " + string.from(e.code == x509.ErrorCode.HOSTNAME_MISMATCH));
+        print("alert " + string.from(tls.alertFor(e.code)));
+        net.close(l);
+        return;
+    };
+    print("connected, which is wrong");
+    net.close(l);
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["code 305", "hostname mismatch true", "alert 42"]);
+});
+
+test.start("tls: connect refuses a peer that cannot prove it holds the key", void () -> {
+    // The chain and the name are both correct, but `testAccept` cannot sign a
+    // CertificateVerify. Certificates are public, so anybody can replay one.
+    // Only the signature over the transcript identifies this peer.
+    harness.expectOutput(verifyPrelude() + `
+void async drive() {
+    Listener l = net.tcp.listen("127.0.0.1:0");
+    String addr = net.address(l);
+    async.run(serveFixture(l), void () -> { });
+
+    x509.Certificate root = x509.parseCertificate(rootDer()) catch e {
+        print("parse " + e.message); net.close(l); return;
+    };
+    tls.Conn? c = await tls.connect(addr, "leaf.example.com",
+        { roots: [root], timeout: 5000 }) catch e {
+        print("code " + string.from(e.code));
+        print("decrypt error " + string.from(e.code == tls.ErrorCode.DECRYPT_ERROR));
+        print("alert " + string.from(tls.alertFor(e.code)));
+        net.close(l);
+        return;
+    };
+    print("connected, which is wrong");
+    net.close(l);
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["code 206", "decrypt error true", "alert 51"]);
+});
+
+test.start("tls: a pin the peer's chain does not carry refuses the connection", void () -> {
+    // The chain verifies, because the test gives the fixture root, and the name
+    // is correct. Only the pin can refuse it. The pin check runs before the
+    // CertificateVerify, so the client refuses the peer before it checks a
+    // signature.
+    harness.expectOutput(verifyPrelude() + `
+void async drive() {
+    Listener l = net.tcp.listen("127.0.0.1:0");
+    String addr = net.address(l);
+    async.run(serveFixture(l), void () -> { });
+
+    x509.Certificate root = x509.parseCertificate(rootDer()) catch e {
+        print("parse " + e.message); net.close(l); return;
+    };
+    // The rogue certificate is not in the chain, so its key is a pin no
+    // certificate the peer sent can match.
+    x509.Certificate rogue = x509.parseCertificate(rogueDer()) catch e {
+        print("parse " + e.message); net.close(l); return;
+    };
+    tls.Conn? c = await tls.connect(addr, "leaf.example.com",
+        { roots: [root], pins: [x509.spkiPin(rogue)], timeout: 5000 }) catch e {
+        print("code " + string.from(e.code));
+        print("pin mismatch " + string.from(e.code == tls.ErrorCode.PIN_MISMATCH));
+        print("alert " + string.from(tls.alertFor(e.code)));
+        net.close(l);
+        return;
+    };
+    print("connected, which is wrong");
+    net.close(l);
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["code 210", "pin mismatch true", "alert 42"]);
+});
+
+test.start("tls: a pin the peer's chain does carry lets verification continue", void () -> {
+    // The same connection with the pin of the leaf. The pin passes. The
+    // handshake then fails where every loopback handshake fails, at the
+    // CertificateVerify that `testAccept` cannot sign. This shows that the pin
+    // adds a check and replaces no other check.
+    harness.expectOutput(verifyPrelude() + `
+void async drive() {
+    Listener l = net.tcp.listen("127.0.0.1:0");
+    String addr = net.address(l);
+    async.run(serveFixture(l), void () -> { });
+
+    x509.Certificate root = x509.parseCertificate(rootDer()) catch e {
+        print("parse " + e.message); net.close(l); return;
+    };
+    x509.Certificate leaf = x509.parseCertificate(leafDer()) catch e {
+        print("parse " + e.message); net.close(l); return;
+    };
+    tls.Conn? c = await tls.connect(addr, "leaf.example.com",
+        { roots: [root], pins: [x509.spkiPin(leaf)], timeout: 5000 }) catch e {
+        print("code " + string.from(e.code));
+        print("past the pin " + string.from(e.code == tls.ErrorCode.DECRYPT_ERROR));
+        net.close(l);
+        return;
+    };
+    print("connected, which is wrong");
+    net.close(l);
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["code 206", "past the pin true"]);
+});
+
+test.start("tls: options that cannot both be honored are refused before anything is sent",
+    void () -> {
+        // Both cases are errors of this end and not of the peer. Neither gets
+        // an alert, and both are refused before the ClientHello. If either one
+        // is ignored, the connection succeeds with no pin.
+        harness.expectOutput(verifyPrelude() + `
+void async withSkip(String addr) {
+    x509.Certificate leaf = x509.parseCertificate(leafDer()) catch e {
+        print("parse " + e.message); return;
+    };
+    tls.Conn? c = await tls.connect(addr, "leaf.example.com",
+        { insecureSkipVerify: true, pins: [x509.spkiPin(leaf)], timeout: 5000 }) catch e {
+        print("with skip " + string.from(e.code == tls.ErrorCode.MISCONFIGURED));
+        print("alert " + string.from(tls.alertFor(e.code)));
+        return;
+    };
+    print("connected, which is wrong");
+}
+
+void async withEmpty(String addr) {
+    tls.Conn? c = await tls.connect(addr, "leaf.example.com",
+        { pins: [], timeout: 5000 }) catch e {
+        print("empty " + string.from(e.code == tls.ErrorCode.MISCONFIGURED));
+        return;
+    };
+    print("connected, which is wrong");
+}
+
+void async drive() {
+    // Nothing accepts on this listener. The options are read before the
+    // ClientHello, so neither connection needs a peer to be refused.
+    Listener l = net.tcp.listen("127.0.0.1:0");
+    String addr = net.address(l);
+    await withSkip(addr);
+    await withEmpty(addr);
+    net.close(l);
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["with skip true", "alert 80", "empty true"]);
+    });
+
+test.start("tls: connect refuses a CertificateVerify scheme that does not fit the certificate",
+    void () -> {
+        // The peer serves the ECDSA fixture chain, but its CertificateVerify
+        // has an RSA-PSS scheme. Only the pair of scheme and key is wrong.
+        // RFC 8446 §4.4.3 requires the scheme to match the certificate. The
+        // mismatch is a separate refusal. It is not a failed signature check
+        // against a wrong key.
+        harness.expectOutput(`
+import 'tls';
+import 'net';
+import 'async';
+import 'string';
+import 'crypto';
+import 'x509';
+
+byte[] hex(String h) {
+    return crypto.hexDecode(h) catch e { return string.toByteArray(""); };
+}
+
+byte[] ecLeafDer() { return hex("` + ecFixtureHex("ecleaf") + `"); }
+byte[] ecInterDer() { return hex("` + ecFixtureHex("ecinter") + `"); }
+byte[] ecRootDer() { return hex("` + ecFixtureHex("ecroot") + `"); }
+
+void async serveFixture(Listener l) {
+    Socket c = await net.accept(l) catch e { return; };
+    await tls.testAccept(tls.socketTransport(c, 5000), {
+        certificates: [ecLeafDer(), ecInterDer()], alpn: [],
+    }) catch e { net.close(c); return; };
+}
+
+void async drive() {
+    Listener l = net.tcp.listen("127.0.0.1:0");
+    String addr = net.address(l);
+    async.run(serveFixture(l), void () -> { });
+
+    x509.Certificate root = x509.parseCertificate(ecRootDer()) catch e {
+        print("parse " + e.message); net.close(l); return;
+    };
+    tls.Conn? c = await tls.connect(addr, "ecleaf.example.com",
+        { roots: [root], timeout: 5000 }) catch e {
+        print("code " + string.from(e.code));
+        print("mismatch " + string.from(e.code == tls.ErrorCode.UNSUPPORTED_CERTIFICATE));
+        print("alert " + string.from(tls.alertFor(e.code)));
+        net.close(l);
+        return;
+    };
+    print("connected, which is wrong");
+    net.close(l);
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["code 207", "mismatch true", "alert 43"]);
+    });

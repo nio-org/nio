@@ -1,0 +1,214 @@
+// The AST: one hand-built node of every kind, and the text §Appendix A implies
+// for it.
+import 'test';
+import 'string';
+import 'array';
+import '../src/ast' as ast;
+import '../src/token' as token;
+
+token.Token tk(String lit) {
+    token.Token t = { type: token.IDENT, literal: lit, line: 1, col: 1, note: "", quote: "", endLine: 0, endCol: 0 };
+    return t;
+}
+
+// A node and the text it must render as.
+type Case {
+    String got;
+    String want;
+}
+
+Case cs(String got, String want) {
+    Case c = { got: got, want: want };
+    return c;
+}
+
+test.start("ast: every node renders as it should", void () -> {
+    ast.NamedType named = { tok: tk("int"), module: "", name: "int", member: "" };
+    ast.NamedType qualified = { tok: tk("geo"), module: "geo", name: "point", member: "" };
+    ast.ArrayTypeNode arr = { tok: tk("["), elem: named, size: null };
+    ast.OptionalTypeNode opt = { tok: tk("?"), inner: named };
+    ast.FieldDef fieldA = {
+        name: "a", nameTok: tk("a"), type: named, rename: "", renameTok: tk(""),
+    };
+    ast.RecordTypeNode recType = { tok: tk("{"), fields: [fieldA] };
+
+    ast.Identifier ident = { id: ast.newID(), tok: tk("x"), name: "x" };
+    ast.IntLiteral intLit = { id: ast.newID(), tok: tk("5"), value: 5 };
+    ast.FloatLiteral floatLit = { id: ast.newID(), tok: tk("1.5"), value: 1.5 };
+    ast.StringLiteral strLit = { id: ast.newID(), tok: tk("hi"), value: "hi" };
+    ast.BoolLiteral boolLit = { id: ast.newID(), tok: tk("true"), value: true };
+    ast.NullLiteral nullLit = { id: ast.newID(), tok: tk("null") };
+    ast.ArrayLiteral arrLit = { id: ast.newID(), tok: tk("["), elements: [intLit], endLine: 1 };
+    ast.RecordField rfA = { name: "a", value: intLit };
+    ast.RecordLiteral recLit = { id: ast.newID(), tok: tk("{"), fields: [rfA], endLine: 1 };
+    ast.PrefixExpression prefix = {
+        id: ast.newID(), tok: tk("-"), operator: "-", right: intLit,
+    };
+    ast.InfixExpression infix = {
+        id: ast.newID(), tok: tk("+"), left: ident, operator: "+", right: intLit,
+    };
+    ast.IndexExpression index = { id: ast.newID(), tok: tk("["), left: ident, index: intLit };
+    ast.MemberExpression member = {
+        id: ast.newID(), tok: tk("."), object: ident, property: "f", optional: false,
+    };
+    ast.CallExpression call = {
+        id: ast.newID(), tok: tk("("), callee: ident, args: [intLit],
+    };
+
+    ast.BlockStatement block = { id: ast.newID(), tok: tk("{"), statements: [], endLine: 0 };
+    ast.VarDeclStatement varDecl = {
+        id: ast.newID(), tok: tk("int"), type: named, name: "x", nameTok: tk("x"),
+        value: intLit, exported: false, const: false,
+    };
+    ast.VarDeclStatement bareDecl = {
+        id: ast.newID(), tok: tk("int"), type: named, name: "x", nameTok: tk("x"),
+        value: null, exported: false, const: false,
+    };
+    ast.VarDeclStatement exportDecl = {
+        id: ast.newID(), tok: tk("int"), type: named, name: "x", nameTok: tk("x"),
+        value: intLit, exported: true, const: false,
+    };
+    ast.ImportStatement importStmt = {
+        id: ast.newID(), tok: tk("import"), path: "geo", alias: "geo",
+        pathTok: tk("geo"), aliasTok: tk("geo"),
+    };
+    ast.TypeDeclStatement typeDecl = {
+        id: ast.newID(), tok: tk("type"), name: "t", nameTok: tk("t"), extends: null,
+        fields: [fieldA],
+        methods: [], inherited: [], exported: false, sealed: false,
+    };
+    ast.TypeDeclStatement exportType = {
+        id: ast.newID(), tok: tk("type"), name: "t", nameTok: tk("t"), extends: null, fields: [],
+        methods: [], inherited: [], exported: true, sealed: false,
+    };
+    ast.FunctionDeclStatement exportFn = {
+        id: ast.newID(), tok: tk("void"), name: "f", nameTok: tk("f"), params: [],
+        returnType: null,
+        body: block, exported: true, async: false, recv: null, override: false, noalloc: false, extern: false, from: null,
+    };
+    ast.Param pa = {
+        id: ast.newID(), tok: tk("int"), type: named, name: "a", nameTok: tk("a"),
+        variadic: false,
+    };
+    ast.FunctionDeclStatement fnDecl = {
+        id: ast.newID(), tok: tk("int"), name: "f", nameTok: tk("f"), params: [pa],
+        returnType: named,
+        body: block, exported: false, async: false, recv: null, override: false, noalloc: false, extern: false, from: null,
+    };
+    ast.FunctionDeclStatement voidFn = {
+        id: ast.newID(), tok: tk("void"), name: "g", nameTok: tk("g"), params: [],
+        returnType: null,
+        body: block, exported: false, async: false, recv: null, override: false, noalloc: false, extern: false, from: null,
+    };
+    ast.AssignStatement assign = {
+        id: ast.newID(), tok: tk("x"), target: ident, value: intLit,
+    };
+    ast.ReturnStatement ret = { id: ast.newID(), tok: tk("return"), value: intLit };
+    ast.ReturnStatement bareRet = { id: ast.newID(), tok: tk("return"), value: null };
+    ast.IfStatement ifStmt = {
+        id: ast.newID(), tok: tk("if"), cond: infix, then: block, else: block,
+    };
+    ast.IfStatement ifNoElse = {
+        id: ast.newID(), tok: tk("if"), cond: infix, then: block, else: null,
+    };
+    ast.BreakStatement brk = { id: ast.newID(), tok: tk("break") };
+    ast.ContinueStatement cont = { id: ast.newID(), tok: tk("continue") };
+    ast.WhileStatement whileStmt = {
+        id: ast.newID(), tok: tk("while"), cond: infix, body: block, tail: [],
+    };
+    ast.WhileStatement whileTail = {
+        id: ast.newID(), tok: tk("while"), cond: infix, body: block, tail: [cont],
+    };
+    ast.ForEachStatement forEachStmt = {
+        id: ast.newID(), tok: tk("forEach"), array: ident, elemTok: tk("e"), elemName: "e",
+        indexTok: tk(""), indexName: "", body: block,
+    };
+    ast.ForEachStatement forEachIdx = {
+        id: ast.newID(), tok: tk("forEach"), array: ident, elemTok: tk("e"), elemName: "e",
+        indexTok: tk("i"), indexName: "i", body: block,
+    };
+    ast.ExpressionStatement exprStmt = {
+        id: ast.newID(), tok: tk("x"), expression: call,
+    };
+
+    Case[] cases = [
+        cs(ast.typeNodeString(named), "int"),
+        cs(ast.typeNodeString(qualified), "geo.point"),
+        cs(ast.typeNodeString(arr), "int[]"),
+        cs(ast.typeNodeString(opt), "int?"),
+        cs(ast.typeNodeString(recType), "{ int a; }"),
+        cs(ast.exprString(ident), "x"),
+        cs(ast.exprString(intLit), "5"),
+        cs(ast.exprString(floatLit), "1.5"),
+        cs(ast.exprString(strLit), "\"hi\""),
+        cs(ast.exprString(boolLit), "true"),
+        cs(ast.exprString(nullLit), "null"),
+        cs(ast.exprString(arrLit), "[5]"),
+        cs(ast.exprString(recLit), "{ a: 5 }"),
+        cs(ast.exprString(prefix), "(-5)"),
+        cs(ast.exprString(infix), "(x + 5)"),
+        cs(ast.exprString(index), "(x[5])"),
+        cs(ast.exprString(member), "(x.f)"),
+        cs(ast.exprString(call), "x(5)"),
+        cs(ast.stmtString(block), "{  }"),
+        cs(ast.stmtString(varDecl), "int x = 5;"),
+        cs(ast.stmtString(bareDecl), "int x;"),
+        cs(ast.stmtString(exportDecl), "export int x = 5;"),
+        cs(ast.stmtString(importStmt), "import 'geo' as geo;"),
+        cs(ast.stmtString(typeDecl), "type t { int a; }"),
+        cs(ast.stmtString(exportType), "export type t {  }"),
+        cs(ast.stmtString(exportFn), "export void f() {  }"),
+        cs(ast.stmtString(fnDecl), "int f(int a) {  }"),
+        cs(ast.stmtString(voidFn), "void g() {  }"),
+        cs(ast.stmtString(assign), "x = 5;"),
+        cs(ast.stmtString(ret), "return 5;"),
+        cs(ast.stmtString(bareRet), "return;"),
+        cs(ast.stmtString(ifStmt), "if ((x + 5)) {  } else {  }"),
+        cs(ast.stmtString(ifNoElse), "if ((x + 5)) {  }"),
+        cs(ast.stmtString(whileStmt), "while ((x + 5)) {  }"),
+        cs(ast.stmtString(whileTail), "while ((x + 5)) {  } tail { continue; }"),
+        cs(ast.stmtString(brk), "break;"),
+        cs(ast.stmtString(cont), "continue;"),
+        cs(ast.stmtString(forEachStmt), "forEach (x, e) {  }"),
+        cs(ast.stmtString(forEachIdx), "forEach (x, e, i) {  }"),
+        cs(ast.stmtString(exprStmt), "x(5);"),
+    ];
+    forEach(cases, c) {
+        test.expectString(c.got, c.want);
+    }
+
+    // `tok` is a field of the sealed base, so no switch is needed to read it.
+    test.expectInt(ident.tok.line, 1);
+    test.expectString(ident.tok.literal, "x");
+    test.expectString(named.tok.literal, "int");
+});
+
+test.start("ast: a program renders its imports then its statements", void () -> {
+    ast.NamedType intType = { tok: tk("int"), module: "", name: "int", member: "" };
+    ast.IntLiteral one = { id: ast.newID(), tok: tk("1"), value: 1 };
+    ast.ImportStatement imp = {
+        id: ast.newID(), tok: tk("import"), path: "time", alias: "time",
+        pathTok: tk("time"), aliasTok: tk("time"),
+    };
+    ast.VarDeclStatement decl = {
+        id: ast.newID(), tok: tk("int"), type: intType, name: "x", nameTok: tk("x"),
+        value: one,
+        exported: false, const: false,
+    };
+    ast.Identifier x = { id: ast.newID(), tok: tk("x"), name: "x" };
+    ast.ExpressionStatement use = { id: ast.newID(), tok: tk("x"), expression: x };
+    ast.Program p = { imports: [imp], statements: [decl, use], comments: [], parens: {}, templates: {} };
+    test.expectString(ast.programString(p), "import 'time' as time;\nint x = 1;\nx;");
+});
+
+// checker.Info is keyed by node id, so two nodes that share an id share a type.
+// newID is the single counter, and it never restarts.
+test.start("ast: newID hands out distinct ids", void () -> {
+    Map<int, bool> seen = {};
+    for (int i = 0; i < 1000; i++) {
+        int id = ast.newID();
+        test.assert(id != 0, "newID handed out 0, which every unstamped node has");
+        test.assert(seen[id] == null, "newID repeated " + string.from(id));
+        seen[id] = true;
+    }
+});

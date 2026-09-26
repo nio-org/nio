@@ -1,0 +1,5733 @@
+// End-to-end tests of the language. Each case compiles a program with clang,
+// runs it and compares the output. The fs, os and path cases need a real
+// directory, so they are in tests/lang_fs_test.nio.
+import 'test';
+import 'string';
+import 'array';
+import 'path';
+import './harness' as h;
+
+// Repeats s n times by squaring. The regexp cases below need 33,000
+// characters, and a loop that appends one copy at a time copies the whole
+// string at each step.
+String repeat(String s, int n) {
+    String out = "";
+    String chunk = s;
+    int left = n;
+    while (left > 0) {
+        if (left % 2 == 1) {
+            out = out + chunk;
+        }
+        chunk = chunk + chunk;
+        left = left / 2;
+    }
+    return out;
+}
+
+// Sorts a copy of xs without array.sort. It gives the expected order for the
+// array.sort cases below, so array.sort is not compared with itself.
+int[] sortedCopy(int[] xs) {
+    int[] out = [];
+    forEach(xs, v) {
+        array.push(out, v);
+    }
+    for (int i = 1; i < out.length; i++) {
+        int v = out[i];
+        int j = i - 1;
+        while (j >= 0 && out[j] > v) {
+            out[j + 1] = out[j];
+            j = j - 1;
+        }
+        out[j + 1] = v;
+    }
+    return out;
+}
+
+test.start("lang: spec example", void () -> {
+    h.expectOutput(`
+import 'json';
+
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+
+int[] myArray = [2,5,4]; //size is optional
+
+int sum;
+
+int sumElements(int a, int b) {
+    return a + b;
+}
+
+forEach(myArray, element) {
+    sum = sumElements(sum, element);
+}
+print(sum);
+
+Car myCar = {
+    make: "toyota",
+    age: 4
+}
+
+String myCarJson = json.toText(myCar);
+print(myCarJson);
+`, [
+        "11", "{\"make\":\"toyota\",\"age\":4}",
+    ]);
+});
+
+test.start("lang: int arithmetic", void () -> {
+    h.expectOutput(`
+print(2 + 3 * 4);
+print((2 + 3) * 4);
+print(10 / 3);
+print(-7 / 2);
+print(10 % 3);
+print(-7 % 2);
+print(-5);
+print(2 - 10);
+`, [
+        "14", "20", "3", "-3", "1", "-1", "-5", "-8",
+    ]);
+});
+
+// Codegen emits / and % inline. It guards a variable divisor and not a literal
+// one, so each case uses both forms.
+test.start("lang: int division edge cases", void () -> {
+    h.expectOutput(`
+int two = 2;
+int neg = -1;
+int one = 1;
+int min = -9223372036854775807 - 1;
+
+print(7 / 2);      print(7 / two);
+print(-7 / 2);     print(-7 / two);
+print(7 % 2);      print(7 % two);
+print(-7 % 2);     print(-7 % two);
+
+// INT64_MIN / -1 overflows the quotient: the result wraps, and the
+// remainder is 0. A raw sdiv/srem would trap here.
+print(min / neg);  print(min % neg);
+print(7 / neg);    print(7 % neg);
+print(min / one);  print(min % one);
+`, [
+        "3", "3", "-3", "-3", "1", "1", "-1", "-1", "-9223372036854775808", "0", "-7",
+        "0", "-9223372036854775808", "0",
+    ]);
+});
+
+test.start("lang: float arithmetic", void () -> {
+    h.expectOutput(`
+print(1.5 + 2.25);
+print(10.0 / 4.0);
+print(2.5 * 4.0);
+print(1.0 - 0.75);
+print(-1.5);
+print(0.1 + 0.2);
+`, [
+        "3.75", "2.5", "10", "0.25", "-1.5", "0.30000000000000004",
+    ]);
+});
+
+test.start("lang: strings", void () -> {
+    h.expectOutput(`
+print("foo" + "bar");
+String s = "hello";
+print(s + " " + "world");
+print("");
+// The empty literal is the smallest static string there is: its GC header
+// plus its length field come to exactly 16 bytes, the size of a mergeable
+// literal. Concatenating from it reads its length, which is where a
+// mis-placed constant shows up as leading garbage.
+String acc = "";
+print(acc + "x");
+print("" + "y" == "y");
+print("" + "" == "");
+print("a" < "b");
+print("abc" < "abd");
+print("ab" < "abc");
+print("a" == "a");
+print("a" != "b");
+print("b" >= "b");
+`, [
+        "foobar", "hello world", "", "x", "true", "true", "true", "true", "true",
+        "true", "true", "true",
+    ]);
+});
+
+test.start("lang: multiline strings and block comments", void () -> {
+    h.expectOutput(`
+import 'string';
+
+/* a block comment that spans lines, holding // and "quotes" and
+   code that never runs: int x = ;
+*/
+String s = \`one
+two\`;
+print(s);
+print(s == "one\\ntwo");
+print(string.length(\`
+\`));
+print(string.length(\`\`));
+print(\`a\\\`b\`);
+print(1 /* inline */ + 2);
+String[] lines = string.split(\`a
+b
+c\`, "\\n");
+print(lines[2]);
+`, [
+        "one", "two", "true", "1", "0", "a`b", "3", "c",
+    ]);
+});
+
+test.start("lang: bools and short circuit", void () -> {
+    h.expectOutput(`
+int hits = 0;
+bool inc() {
+    hits = hits + 1;
+    return true;
+}
+bool r1 = false && inc();
+print(r1);
+print(hits);
+bool r2 = true || inc();
+print(r2);
+print(hits);
+bool r3 = true && inc();
+print(r3);
+print(hits);
+print(!true);
+print(true == false);
+`, [
+        "false", "0", "true", "0", "true", "1", "false", "false",
+    ]);
+});
+
+test.start("lang: comparisons", void () -> {
+    h.expectOutput(`
+print(1.5 == 1.5);
+print(1.5 != 2.5);
+print(1.0 < 2.0);
+print(2.0 > 1.0);
+print(1.0 <= 1.0);
+print(2.0 >= 3.0);
+print(1 <= 1);
+print(2 >= 3);
+print("a" > "b");
+print("a" <= "a");
+print(true != false);
+String? s = "x";
+print(s != null);
+`, [
+        "true", "true", "true", "true", "true", "false", "true", "false", "false",
+        "true", "true", "true",
+    ]);
+});
+
+test.start("lang: control flow", void () -> {
+    h.expectOutput(`
+int i = 0;
+while (i < 3) {
+    int doubled = i * 2;
+    print(doubled);
+    i = i + 1;
+}
+if (i == 3) {
+    print("three");
+} else if (i > 3) {
+    print("big");
+} else {
+    print("small");
+}
+if (i != 3) {
+    print("no");
+} else if (i % 2 == 1) {
+    print("odd");
+} else {
+    print("even");
+}
+`, [
+        "0", "2", "4", "three", "odd",
+    ]);
+});
+
+test.start("lang: functions and recursion", void () -> {
+    h.expectOutput(`
+int fib(int n) {
+    if (n < 2) { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+print(fib(10));
+
+String greet(String name) {
+    return "hello " + name;
+}
+print(greet("world"));
+
+int early(int x) {
+    if (x > 0) {
+        return 1;
+    }
+    return -1;
+}
+print(early(5));
+print(early(-5));
+
+void voidReturn(int x) {
+    if (x > 0) {
+        return;
+    }
+    print("negative");
+}
+voidReturn(1);
+voidReturn(-1);
+`, [
+        "55", "hello world", "1", "-1", "negative",
+    ]);
+});
+
+test.start("lang: arrays", void () -> {
+    h.expectOutput(`
+int[] a = [10, 20, 30];
+print(a[0]);
+print(a[2]);
+a[1] = 99;
+print(a[1]);
+print(a.length);
+int[] empty = [];
+print(empty.length);
+
+int total = 0;
+forEach(a, e) { total = total + e; }
+print(total);
+
+String[] names = ["x", "y"];
+String joined = "";
+forEach(names, s) { joined = joined + s; }
+print(joined);
+`, [
+        "10", "30", "99", "3", "0", "139", "xy",
+    ]);
+});
+
+test.start("lang: array library", void () -> {
+    h.expectOutput(`
+import 'array';
+import 'json';
+
+// push and pop mutate in place, through every alias
+int[] xs = [1, 2, 3];
+int[] alias = xs;
+array.push(xs, 4);
+print(alias.length);
+print(alias[3]);
+print(array.pop(alias));
+print(xs.length);
+
+// growth far past the initial capacity
+int[] big = [];
+for (int i = 0; i < 1000; i++) {
+    array.push(big, i);
+}
+print(big.length);
+print(big[999]);
+int sum;
+forEach(big, e) { sum = sum + e; }
+print(sum);
+
+// copy decouples: writes and pushes to one side stay on that side
+int[] a = [1, 2, 3];
+int[] b = array.copy(a);
+b[0] = 99;
+array.push(b, 4);
+print(a[0]);
+print(a.length);
+print(json.toText(b));
+
+// pointer elements survive being pushed
+String[] words = [];
+array.push(words, "hello");
+array.push(words, "wor" + "ld");
+print(words[0] + " " + array.pop(words));
+
+// pushed value may be an optional (boxed) element
+int?[] opts = [];
+array.push(opts, 7);
+array.push(opts, null);
+print(opts[0] == 7);
+print(opts[1] == null);
+`, [
+        "4", "4", "4", "3", "1000", "999", "499500", "1", "3", "[99,2,3,4]",
+        "hello world", "true", "true",
+    ]);
+});
+
+test.start("lang: array sort natural order", void () -> {
+    h.expectOutput(`
+import 'array';
+import 'json';
+import 'time';
+
+int[] ns = [5, 3, 9, 1, 3, 7, -2];
+array.sort(ns);
+print(json.toText(ns));
+
+// -0.0 and 0.0 compare equal, so the sort is stable for them: they come out
+// in the order they went in.
+float[] fs = [2.5, -1.5, 0.0, 10.25, -0.0];
+array.sort(fs);
+print(json.toText(fs));
+
+String[] ws = ["pear", "apple", "Fig", "apple", ""];
+array.sort(ws);
+print(json.toText(ws));
+
+// Narrow numbers order as the numbers they are, not as the bytes they fit in.
+int8[] bs = [100, -100, 0, 127, -128];
+array.sort(bs);
+print(json.toText(bs));
+
+// An enum orders by its members' numbers, which is what < already means.
+enum Level { HIGH: 9, LOW: 1, MID: 5 }
+Level[] ls = [Level.HIGH, Level.LOW, Level.MID];
+array.sort(ls);
+print(ls[0], ls[1], ls[2]);
+
+Duration[] ds = [time.duration("3s"), time.duration("1s"), time.duration("2s")];
+array.sort(ds);
+print(time.milliseconds(ds[0]), time.milliseconds(ds[2]));
+
+// Nothing to do, and nothing allocated to do it with.
+int[] none = [];
+int[] one = [7];
+array.sort(none);
+array.sort(one);
+print(none.length, one[0]);
+
+// A fixed-size array sorts: reordering is not resizing, so the length being
+// part of the type is no obstacle.
+int[4] fixed = [4, 2, 3, 1];
+array.sort(fixed);
+print(json.toText(fixed));
+`, [
+        "[-2,1,3,3,5,7,9]", "[-1.5,0,-0,2.5,10.25]",
+        "[\"\",\"Fig\",\"apple\",\"apple\",\"pear\"]", "[-128,-100,0,100,127]",
+        "LOW MID HIGH", "1000 3000", "0 7", "[1,2,3,4]",
+    ]);
+});
+
+test.start("lang: array sort comparator", void () -> {
+    h.expectOutput(`
+import 'array';
+import 'json';
+import 'string';
+
+// Descending, which is the natural order asked the other way round.
+int[] ns = [5, 3, 9, 1];
+array.sort(ns, bool (int x, int y) -> x > y);
+print(json.toText(ns));
+
+// A record, sorted by a field. Nothing about the element type has an order;
+// the comparator is where the order comes from.
+type P { String name; int age; }
+P[] ps = [{ name: "cara", age: 31 }, { name: "abe", age: 44 }, { name: "bo", age: 19 }];
+array.sort(ps, bool (P x, P y) -> x.age < y.age);
+String names = "";
+forEach(ps, p) { names = names + p.name + " "; }
+print(string.trim(names));
+
+// A closure: the comparator captures, so the order can be decided at run time.
+bool up = false;
+array.sort(ps, bool (P x, P y) -> { if (up) { return x.name < y.name; } return x.name > y.name; });
+names = "";
+forEach(ps, p) { names = names + p.name + " "; }
+print(string.trim(names));
+
+// An array of arrays has no order either, and a comparator gives it one.
+int[][] rows = [[3, 3], [1, 9], [2, 0]];
+array.sort(rows, bool (int[] x, int[] y) -> x[0] < y[0]);
+print(json.toText(rows));
+`, [
+        "[9,5,3,1]", "bo cara abe", "cara bo abe", "[[1,9],[2,0],[3,3]]",
+    ]);
+});
+
+test.start("lang: array sort is stable", void () -> {
+    h.expectOutput(`
+import 'array';
+import 'string';
+
+type Row { String tag; int key; int group; }
+Row[] rows = [
+    { tag: "d", key: 2, group: 1 },
+    { tag: "a", key: 1, group: 2 },
+    { tag: "c", key: 2, group: 2 },
+    { tag: "b", key: 1, group: 1 },
+    { tag: "e", key: 1, group: 2 },
+];
+
+array.sort(rows, bool (Row x, Row y) -> x.key < y.key);
+String order = "";
+forEach(rows, r) { order = order + r.tag; }
+print(order);          // the three key-1 rows keep a, b, e; then d, c
+
+// Two keys, two passes: sort by the minor key first, then by the major one.
+// Only a stable sort leaves the first pass's work standing.
+array.sort(rows, bool (Row x, Row y) -> x.tag < y.tag);
+array.sort(rows, bool (Row x, Row y) -> x.group < y.group);
+order = "";
+forEach(rows, r) { order = order + r.tag + string.from(r.group); }
+print(order);
+`, [
+        "abedc", "b1d1a2c2e2",
+    ]);
+});
+
+// NaN sorts before every number. A plain a < b comparison leaves it in place,
+// and the result is not sorted.
+test.start("lang: array sort puts na N first", void () -> {
+    h.expectOutput(`
+import 'array';
+import 'string';
+
+float zero = 0.0;
+float nan = zero / zero;
+float inf = 1.0 / zero;
+float[] fs = [3.0, nan, -1.0, inf, 0.0 - inf, nan];
+array.sort(fs);
+
+String out = "";
+forEach(fs, f) { out = out + string.from(f) + " "; }
+print(string.trim(out));
+`, [
+        "nan nan -inf -1 3 inf",
+    ]);
+});
+
+test.start("lang: array index of", void () -> {
+    h.expectOutput(`
+import 'array';
+
+int[] ns = [5, 3, 9, 3];
+print(array.indexOf(ns, 3), array.indexOf(ns, 5), array.indexOf(ns, 100));
+
+String[] ws = ["a", "bc", "d"];
+print(array.indexOf(ws, "b" + "c"), array.indexOf(ws, "z"));
+
+int?[] opts = [1, null, 2];
+print(array.indexOf(opts, null), array.indexOf(opts, 2));
+
+enum Color { RED: 1, BLUE: 2 }
+Color[] cs = [Color.BLUE, Color.RED];
+print(array.indexOf(cs, Color.RED));
+
+int[] none = [];
+print(array.indexOf(none, 1));
+
+int[3] fixed = [7, 8, 9];
+print(array.indexOf(fixed, 9));
+`, [
+        "1 0 -1", "1 -1", "1 2", "1", "-1", "2",
+    ]);
+});
+
+test.start("lang: array slice", void () -> {
+    h.expectOutput(`
+import 'array';
+import 'json';
+
+int[] ns = [0, 1, 2, 3, 4];
+print(json.toText(array.slice(ns, 1, 4)));
+print(json.toText(array.slice(ns, 2)));
+print(json.toText(array.slice(ns, 0, 0)));
+print(json.toText(array.slice(ns, 5)));
+print(json.toText(array.slice(ns, 0, 5)));
+
+int[] part = array.slice(ns, 0, 2);
+array.push(part, 99);
+part[0] = -1;
+print(json.toText(part), json.toText(ns));
+
+String[3] fixed = ["a", "b", "c"];
+String[] grown = array.slice(fixed, 1);
+array.push(grown, "d");
+print(json.toText(grown));
+`, [
+        "[1,2,3]", "[2,3,4]", "[]", "[]", "[0,1,2,3,4]", "[-1,1,99] [0,1,2,3,4]",
+        "[\"b\",\"c\",\"d\"]",
+    ]);
+});
+
+// A comparator can be unassigned, or it can change the array during the sort.
+// Both are runtime errors.
+test.start("lang: array sort comparator misuse", void () -> {
+    h.expectRuntimeError(`
+import 'array';
+int[] ns = [3, 1, 2];
+Function(int, int)<bool> cmp;
+array.sort(ns, cmp);
+`, "called a function value that was never assigned");
+    h.expectRuntimeError(`
+import 'array';
+int[] ns = [3, 1, 2, 4];
+array.sort(ns, bool (int x, int y) -> { array.push(ns, 9); return x < y; });
+`, "array.sort: the comparator changed the array's length");
+});
+
+test.start("lang: fixed size arrays", void () -> {
+    h.expectOutput(`
+import 'array';
+import 'json';
+
+// the declared size is the actual size, elements are mutable
+int[5] xs = [10, 20, 30, 40, 50];
+xs[2] = 33;
+print(xs.length);
+print(xs[2]);
+int total;
+forEach(xs, e) { total = total + e; }
+print(total);
+
+// declared without an initializer: every slot exists, holding zero values
+int[4] zeros;
+print(zeros[3]);
+String[3] names;
+print(names[0] == "");
+names[1] = "bob";
+print(names[1]);
+
+// record elements start as distinct zero records, not shared ones
+type Point { int x; int y }
+Point[2] pts;
+pts[0].x = 7;
+print(pts[0].x);
+print(pts[1].x);
+
+// fixed arrays serialize like any array
+print(json.toText(xs));
+
+// array.copy is the bridge to a growable array
+int[] loose = array.copy(xs);
+array.push(loose, 60);
+print(loose.length);
+print(xs.length);
+
+// fixed arrays nest inside growable ones
+int[2][] rows = [[1, 2], [3, 4]];
+int[2] row = rows[1];
+print(row[0] + row[1]);
+`, [
+        "5", "33", "153", "0", "true", "bob", "7", "0", "[10,20,33,40,50]", "6", "5",
+        "7",
+    ]);
+});
+
+test.start("lang: for loops", void () -> {
+    h.expectOutput(`
+int myVariable = 4;
+int sum = 0;
+for (int i = 0; i < myVariable; i++) {
+    sum = sum + i;
+}
+print(sum);
+
+// init and post clauses may be empty; the counter may be an outer variable
+int j = 3;
+for (; j > 0; j--) {
+    print(j);
+}
+print(j);
+
+// nested loops with independent counters
+int count = 0;
+for (int a = 0; a < 3; a++) {
+    for (int b = 0; b < 3; b++) {
+        count++;
+    }
+}
+print(count);
+
+// the init declaration shadows an outer variable and ends with the loop
+int i = 99;
+for (int i = 0; i < 2; i++) {
+    print(i);
+}
+print(i);
+
+// an assignment as the post clause
+for (int k = 2; k > 0; k = k - 1) {
+    print(k);
+}
+`, [
+        "6", "3", "2", "1", "0", "9", "0", "1", "99", "2", "1",
+    ]);
+});
+
+test.start("lang: for in functions", void () -> {
+    h.expectOutput(`
+int firstOver(int[] xs, int limit) {
+    for (int i = 0; i < xs.length; i++) {
+        if (xs[i] > limit) { return xs[i]; }    // returning skips the post clause
+    }
+    return -1;
+}
+print(firstOver([1, 8, 3], 2));
+print(firstOver([1, 2], 5));
+
+String repeat(String s, int n) {
+    String out = "";
+    for (int i = 0; i < n; i++) {
+        out = out + s;
+    }
+    return out;
+}
+print(repeat("ab", 3));
+`, [
+        "8", "-1", "ababab",
+    ]);
+});
+
+test.start("lang: inc dec statements", void () -> {
+    h.expectOutput(`
+int i = 10;
+i++;
+i++;
+i--;
+print(i);
+
+float f = 1.5;
+f++;
+print(f);
+f--;
+f--;
+print(f);
+
+int[] a = [5, 7];
+a[0]++;
+a[a.length - 1]--;
+print(a[0]);
+print(a[1]);
+
+type Box { int n }
+Box b = { n: 41 };
+b.n++;
+print(b.n);
+
+// the target address is computed once: idx() runs once per statement
+int calls = 0;
+int idx() {
+    calls++;
+    return 0;
+}
+a[idx()]++;
+print(a[0]);
+print(calls);
+`, [
+        "11", "2.5", "0.5", "6", "6", "42", "7", "1",
+    ]);
+});
+
+// const freezes the binding. The array and the record it holds stay mutable.
+test.start("lang: const declarations", void () -> {
+    h.expectOutput(`
+import 'array';
+
+type Car { String make; int age; }
+
+String const greeting = "ciao";
+int const limit = 10;
+int[] const nums = [1, 2, 3];
+Car const c = { make: "fiat", age: 4 };
+
+print(greeting);
+print(limit);
+
+nums[0] = 9;
+nums[1]++;
+array.push(nums, 7);
+print(nums[0]);
+print(nums[1]);
+print(nums.length);
+array.pop(nums);
+print(nums.length);
+
+c.make = "toyota";
+c.age++;
+print(c.make);
+print(c.age);
+
+if (true) {
+    int limit = 1;      // shadowing a const with a mutable binding
+    limit++;
+    print(limit);
+}
+print(limit);
+`, [
+        "ciao", "10", "9", "3", "4", "3", "toyota", "5", "2", "10",
+    ]);
+});
+
+test.start("lang: for each statement", void () -> {
+    h.expectOutput(`
+int[] a = [10, 20, 30];
+forEach(a, e, i) {
+    print(i);
+    print(e);
+}
+
+forEach(a, e) {
+    e = e + 1;             // the element binding is a copy...
+}
+print(a[0]);
+
+forEach(a, e, i) {
+    a[i] = e * 2;          // ...writing back goes through the index
+}
+print(a[2]);
+
+int sum = 0;
+forEach([1, 2, 3], v) {
+    if (v == 2) {
+        sum = sum + 10;
+    } else {
+        sum = sum + v;
+    }
+}
+print(sum);
+
+int[] empty = [];
+forEach(empty, e) { print(e); }
+print("done");
+`, [
+        "0", "10", "1", "20", "2", "30", "10", "60", "14", "done",
+    ]);
+});
+
+test.start("lang: for each in functions", void () -> {
+    h.expectOutput(`
+int firstAbove(int[] xs, int limit) {
+    forEach(xs, x) {
+        if (x > limit) { return x; }
+    }
+    return -1;
+}
+print(firstAbove([1, 8, 3], 2));
+print(firstAbove([1, 2], 5));
+
+int cells(int[] rows, int[] cols) {
+    int n = 0;
+    forEach(rows, r) {
+        forEach(cols, c) {
+            n = n + 1;
+        }
+    }
+    return n;
+}
+print(cells([1, 2], [1, 2, 3]));
+`, [
+        "8", "-1", "6",
+    ]);
+});
+
+test.start("lang: break and continue", void () -> {
+    h.expectOutput(`
+// while: continue jumps back to the condition, break leaves the loop
+int i = 0;
+while (true) {
+    i++;
+    if (i == 3) { continue; }
+    if (i > 5) { break; }
+    print(i);
+}
+print(i);
+
+// for: continue still runs the post clause, so the counter advances
+for (int j = 0; j < 10; j++) {
+    if (j % 2 == 0) { continue; }
+    if (j > 6) { break; }
+    print(j);
+}
+
+// forEach: continue still advances to the next element
+int sum = 0;
+forEach([10, 20, 30, 40, 50], e, k) {
+    if (k == 1) { continue; }
+    if (e == 40) { break; }
+    sum = sum + e;
+}
+print(sum);
+
+// each binds to its innermost loop
+int seen = 0;
+for (int a = 0; a < 3; a++) {
+    forEach([1, 2, 3], b) {
+        if (b == 2) { continue; }
+        if (a == 2) { break; }
+        seen = seen + a * 10 + b;
+    }
+    if (a == 2) { continue; }
+    seen = seen + 1000;
+}
+print(seen);
+
+// a loop whose body is nothing but a break runs once
+int once = 0;
+while (true) {
+    once++;
+    break;
+}
+print(once);
+
+// break from an if whose else branch falls through
+int n = 0;
+for (int c = 0; c < 8; c++) {
+    if (c == 5) { break; } else { n = n + c; }
+}
+print(n);
+
+// continue in an else branch
+int m = 0;
+for (int d = 0; d < 6; d++) {
+    if (d > 3) { m = m + 100; } else { continue; }
+}
+print(m);
+`, [
+        "1", "2", "4", "5", "6", "1", "3", "5", "40", "2028", "1", "10", "200",
+    ]);
+});
+
+test.start("lang: switch statement", void () -> {
+    h.expectOutput(`
+// One clause runs and the switch ends: no clause falls into the next.
+void classify(int n) {
+    switch (n) {
+        case 1:
+        case 2:
+            print("low");
+        case 3:
+            print("three");
+        default:
+            print("other");
+    }
+}
+classify(1);
+classify(2);
+classify(3);
+classify(9);
+
+// break leaves the switch early, and needs no loop around it.
+switch (2) {
+    case 2:
+        print("before");
+        if (true) { break; }
+        print("unreachable");
+    default:
+        print("no");
+}
+
+// A switch with no default and nothing matching runs nothing at all.
+switch (99) { case 1: print("no"); }
+print("fell through");
+
+// Labels are tried in source order, so the first match wins.
+String grade(int score) {
+    switch (score) {
+        case 100:
+            return "perfect";
+        case 0:
+            return "zero";
+        default:
+            return "middling";
+    }
+}
+print(grade(100));
+print(grade(0));
+print(grade(50));
+`, [
+        "low", "low", "three", "other", "before", "fell through", "perfect", "zero",
+        "middling",
+    ]);
+});
+
+test.start("lang: switch on every comparable type", void () -> {
+    h.expectOutput(`
+enum Color { Red: 1, Green: 2, Blue: 3 }
+
+// Strings compare by contents, not by identity.
+String name = "gr" + "een";
+switch (name) {
+    case "red":
+        print("R");
+    case "green":
+        print("G");
+    default:
+        print("?");
+}
+
+// An enum subject, and an integer label against the same enum.
+Color c = Color.Blue;
+switch (c) {
+    case Color.Red:
+        print("red");
+    case Color.Blue:
+        print("blue");
+    default:
+        print("other");
+}
+switch (Color.Green) { case 2: print("two"); default: print("not two"); }
+
+// bool, float, and a negated label.
+switch (false) { case true: print("t"); default: print("f"); }
+switch (-1.5) { case -1.5: print("neg"); default: print("no"); }
+
+// Duration takes a bare millisecond count, as == does.
+Duration d = 1000;
+switch (d) { case 1000: print("a second"); default: print("other"); }
+
+// An optional subject: null is a label like any other.
+int? maybe = null;
+switch (maybe) { case null: print("absent"); case 7: print("seven"); default: print("other"); }
+maybe = 7;
+switch (maybe) { case null: print("absent"); case 7: print("seven"); default: print("other"); }
+`, [
+        "G", "blue", "two", "f", "neg", "a second", "absent", "seven",
+    ]);
+});
+
+test.start("lang: switch and loops", void () -> {
+    h.expectOutput(`
+import 'string';
+
+// A break inside a switch leaves the switch; the loop keeps going. A
+// continue inside one belongs to the loop, and still runs the post clause.
+for (int i = 0; i < 6; i++) {
+    switch (i) {
+        case 0:
+            break;
+        case 2:
+            continue;
+        case 4:
+            print("four");
+        default:
+            print(i);
+    }
+    print("end of " + string.from(i));
+}
+
+// A loop inside a switch binds its own break.
+switch (1) {
+    case 1:
+        int n = 0;
+        while (true) {
+            n++;
+            if (n == 3) { break; }
+        }
+        print(n);
+    default:
+        print("no");
+}
+
+// A switch inside a switch: each break leaves its own.
+switch (1) {
+    case 1:
+        switch (2) {
+            case 2:
+                print("inner");
+                break;
+            default:
+                print("no");
+        }
+        print("outer still running");
+    default:
+        print("no");
+}
+`, [
+        "end of 0", "1", "end of 1", "3", "end of 3", "four", "end of 4", "5",
+        "end of 5", "3", "inner", "outer still running",
+    ]);
+});
+
+test.start("lang: switch in async and methods", void () -> {
+    h.expectOutput(`
+import 'time';
+import 'string';
+
+int async slow(int n) {
+    await time.sleep(1);
+    return n;
+}
+
+// An await in the subject, and another inside a clause body: the dispatch
+// survives a suspension in either place.
+void async pick(int n) {
+    switch (await slow(n)) {
+        case 1:
+            print("one");
+            await time.sleep(1);
+            print("resumed");
+        case 2:
+            print("two");
+        default:
+            print("other");
+    }
+}
+await pick(1);
+await pick(2);
+await pick(9);
+
+// A switch in a method, on a field, allocating in its clauses.
+type Tag {
+    String kind;
+    String describe() {
+        switch (self.kind) {
+            case "a":
+            case "b":
+                return "letter " + self.kind;
+            default:
+                return "unknown " + self.kind;
+        }
+    }
+}
+Tag t = { kind: "b" };
+print(t.describe());
+Tag u = { kind: "z" };
+print(u.describe());
+
+// A fallible subject, caught before the dispatch sees it.
+int boom() { return Error("nope"); }
+switch (boom() catch -1) {
+    case -1:
+        print("caught");
+    default:
+        print("no");
+}
+
+// An inherited method body carrying a switch is cloned and compiled again
+// for the extending type, so the override is what its clause reaches.
+type Shape {
+    int sides;
+    String kind() {
+        switch (self.sides) {
+            case 3:
+                return "triangle";
+            case 4:
+                return self.quad();
+            default:
+                return "polygon";
+        }
+    }
+    String quad() { return "quadrilateral"; }
+}
+type Square extends Shape {
+    String override quad() { return "square"; }
+}
+Shape sh = { sides: 4 };
+print(sh.kind());
+Square sq = { sides: 4 };
+print(sq.kind());
+print(sq.kind() == "square");
+
+// A type switch in an inherited body. A type case has two things a value
+// case does not: the label that names the type, and the name it binds. A
+// clone that dropped them left the body
+// matching a value against a type and reading an undefined name (§4.9).
+sealed type Node { int at; }
+type Leaf extends Node { int value; }
+type Pair extends Node { int left; int right; }
+type Reader {
+    int depth;
+    String read(Node n) {
+        switch (n) {
+            case Leaf lf:
+                return "leaf " + string.from(lf.value);
+            case Pair pr:
+                return "pair " + string.from(pr.left);
+        }
+    }
+}
+type Tracing extends Reader { bool loud; }
+Tracing tr = { depth: 0, loud: true };
+Leaf lf = { at: 0, value: 7 };
+print(tr.read(lf));
+`, [
+        "one", "resumed", "two", "other", "letter b", "unknown z", "caught",
+        "quadrilateral", "square", "true", "leaf 7",
+    ]);
+});
+
+test.start("lang: break and continue in functions", void () -> {
+    h.expectOutput(`
+// break leaves only the loop; the function keeps running
+int firstNegative(int[] xs) {
+    int found = 0;
+    forEach(xs, x) {
+        if (x >= 0) { continue; }
+        found = x;
+        break;
+    }
+    return found;
+}
+print(firstNegative([1, -2, -3]));
+print(firstNegative([1, 2]));
+
+// a loop inside a function value
+Function(int)<int> countdown = int (int from) -> {
+    int steps = 0;
+    while (from > 0) {
+        from--;
+        if (from == 2) { break; }
+        steps++;
+    }
+    return steps;
+};
+print(countdown(6));
+
+// a break in a loop that also holds heap values across allocations
+String joinUntil(String[] parts, String stop) {
+    String out = "";
+    forEach(parts, p) {
+        if (p == stop) { break; }
+        if (p == "") { continue; }
+        out = out + p + "-";
+    }
+    return out;
+}
+print(joinUntil(["a", "", "b", "x", "c"], "x"));
+`, [
+        "-2", "0", "3", "a-b-",
+    ]);
+});
+
+test.start("lang: record arrays", void () -> {
+    h.expectOutput(`
+import 'json';
+type Car { String make; int age; String? owner; }
+
+Car[] myCars = [{
+    make: "toyota",
+    age: 4
+},
+{
+    make: "honda",
+    age: 6
+}];
+print(myCars.length);
+forEach(myCars, c, i) {
+    print(c.make);
+    print(i);
+}
+myCars[1].age = 7;
+print(json.toText(myCars));
+Car? maybe = myCars[0];
+print(maybe == null);
+`, [
+        "2", "toyota", "0", "honda", "1",
+        "[{\"make\":\"toyota\",\"age\":4},{\"make\":\"honda\",\"age\":7}]", "false",
+    ]);
+});
+
+test.start("lang: nested anonymous types", void () -> {
+    h.expectOutput(`
+import 'json';
+
+type CarWeight {
+    int empty;
+    int? full
+}
+
+type Car {
+    String make;
+    {
+        int amount;
+        String? piece
+    }[]? repairs;
+    CarWeight weight;
+}
+
+Car c = { make: "toyota", weight: { empty: 1200 } }
+print(json.toText(c));
+
+c.repairs = [{ amount: 250, piece: "brakes" }, { amount: 90 }];
+print(json.toText(c));
+print(c.weight.empty);
+
+Car zero;
+print(json.toText(zero));
+`, [
+        "{\"make\":\"toyota\",\"weight\":{\"empty\":1200}}",
+        "{\"make\":\"toyota\",\"repairs\":[{\"amount\":250,\"piece\":\"brakes\"},{\"amount\":90}],\"weight\":{\"empty\":1200}}",
+        "1200", "{\"make\":\"\",\"weight\":{\"empty\":0}}",
+    ]);
+});
+
+test.start("lang: JSON field renaming", void () -> {
+    h.expectOutput(`
+import 'json';
+
+type Engine {
+    float liters;
+    int power 'json:engine_power';
+    String? serial 'json:serial_no';
+}
+
+type Truck {
+    String make 'json:manufacturer';
+    Engine engine;
+    { int weight 'json:weight_kg'; }[] cargo;
+}
+
+Truck t = {
+    make: "volvo",
+    engine: { liters: 12.8, power: 550 },
+    cargo: [{ weight: 14000 }, { weight: 9000 }]
+}
+print(json.toText(t));
+
+// Renaming is serialization-only: the field is read by its Nio name.
+print(t.engine.power);
+print(t.cargo[0].weight);
+
+// An absent optional is omitted under its renamed key, present under it too.
+print(json.toText(t.engine));
+t.engine.serial = "X-1";
+print(json.toText(t.engine));
+`, [
+        "{\"manufacturer\":\"volvo\",\"engine\":{\"liters\":12.8,\"engine_power\":550},\"cargo\":[{\"weight_kg\":14000},{\"weight_kg\":9000}]}",
+        "550", "14000", "{\"liters\":12.8,\"engine_power\":550}",
+        "{\"liters\":12.8,\"engine_power\":550,\"serial_no\":\"X-1\"}",
+    ]);
+});
+
+test.start("lang: JSON strips function fields", void () -> {
+    h.expectOutput(`
+import 'json';
+
+type Car {
+    String make;
+    Function()<int> year;
+    Function(int)<int>? maybe;
+    Function()<void>[] handlers;
+    int? age;
+}
+
+Car c = { make: "volvo", year: int () -> 1922, handlers: [] }
+print(json.toText(c));
+c.age = 4;
+print(json.toText(c));
+print(c.year());
+
+// Every field stripped: a well-formed empty object, not a broken one.
+type OnlyFns { Function()<int> a; Function()<int> b; }
+OnlyFns o = { a: int () -> 1, b: int () -> 2 }
+print(json.toText(o));
+
+// Stripping is per-record, so an outer record keeps a field whose element
+// type is a record that merely contains a function.
+type Inner { int n; Function()<int> f; }
+type Outer { Inner[] xs; }
+Outer out = { xs: [{ n: 7, f: int () -> 1 }] }
+print(json.toText(out));
+`, [
+        "{\"make\":\"volvo\"}", "{\"make\":\"volvo\",\"age\":4}", "1922", "{}",
+        "{\"xs\":[{\"n\":7}]}",
+    ]);
+});
+
+test.start("lang: JSON parse", void () -> {
+    h.expectOutput(`
+import 'json';
+
+type Engine {
+    float liters;
+    int power 'json:engine_power';
+}
+
+type Truck {
+    String make;
+    Engine engine;
+    String? nickname;
+    { String label; int weight; }[] cargo;
+}
+
+// Keys the type does not declare are dropped, however deeply nested, and
+// a renamed field is read under its JSON key.
+String text = \`{
+  "make": "volvo",
+  "unknown": {"deeply": [1, 2, {"nested": true}]},
+  "engine": { "liters": 12.8, "engine_power": 550, "extra": "dropped" },
+  "cargo": [ {"label":"timber","weight":14000}, {"label":"steel","weight":9000} ]
+}\`;
+
+Truck t = json.parse(text) as Truck;
+print(t.make);
+print(t.engine.power);
+print(t.engine.liters);
+print(t.cargo[1].label);
+print(t.cargo.length);
+print(t.nickname == null);
+print(json.toText(t));
+`, [
+        "volvo", "550", "12.8", "steel", "2", "true",
+        "{\"make\":\"volvo\",\"engine\":{\"liters\":12.8,\"engine_power\":550},\"cargo\":[{\"label\":\"timber\",\"weight\":14000},{\"label\":\"steel\",\"weight\":9000}]}",
+    ]);
+});
+
+test.start("lang: JSON parse scalars and shapes", void () -> {
+    h.expectOutput(`
+import 'json';
+import 'time';
+
+enum Status { OK: 200, GONE: 410 }
+type Node { int value; Node? next; }
+
+print(json.parse("42") as int);
+print(json.parse("1.5e2") as float);
+print(json.parse("true") as bool);
+print((json.parse("\\"a\\\\nb\\"") as String) == "a\\nb");   // escapes decode
+print(json.parse("\\"caf\\\\u00e9\\"") as String);         // \\u decodes to UTF-8
+print((json.parse("null") as int?) == null);
+print(json.parse("7") as int?);
+print(json.parse("410") as Status);
+print(time.date.year(json.parse("\\"2026-07-25T10:00:00Z\\"") as DateTime));
+
+int[] xs = json.parse("[1,2,3]") as int[];
+print(xs.length);
+print(xs[2]);
+
+String[][] grid = json.parse("[[\\"a\\"],[\\"b\\",\\"c\\"]]") as String[][];
+print(grid[1][1]);
+
+// A recursive record type, and an absent optional at the end of the chain.
+Node n = json.parse("{\\"value\\":1,\\"next\\":{\\"value\\":2,\\"next\\":null}}") as Node;
+print(n.next?.value);
+print(n.next?.next == null);
+`, [
+        "42", "150", "true", "true", "café", "true", "7", "GONE", "2026", "3", "3",
+        "c", "2", "true",
+    ]);
+});
+
+// json.parse reads a byte[] in place (§6.3), without a copy to a String.
+test.start("lang: JSON parse from bytes", void () -> {
+    h.expectOutput(`
+import 'json';
+import 'string';
+
+type Point { int x; int y; }
+
+byte[] doc = string.toByteArray('{"x":1,"y":2}');
+Point p = json.parse(doc) as Point;
+print(p.x + p.y);
+
+Json j = json.parse(doc);
+print(json.asInt(j["y"]) catch -1);
+
+// strict applies to the byte form exactly as to the string one.
+Point? q = json.parse(string.toByteArray('{"x":1,"y":2,"z":3}')) strict as Point
+    catch e { print(e.message); };
+print(q == null);
+
+// A malformed document raises the same catchable error.
+Json? bad = json.parse(string.toByteArray("{oops")) catch e { print("malformed"); };
+print(bad == null);
+`, [
+        "3", "2",
+        "cannot parse JSON: unknown key \"z\"", "true",
+        "malformed", "true",
+    ]);
+});
+
+// The reader parses the digits as an integer, not through a double.
+// 9007199254740993 is the first integer a double cannot hold. 2^63 must be out
+// of range.
+test.start("lang: JSON signed int is exact", void () -> {
+    h.expectOutput(`
+import 'json';
+type T { int v; }
+T a = json.parse('{"v":9007199254740993}') as T;
+print(a.v);
+T b = json.parse('{"v":-9223372036854775808}') as T;
+print(b.v);
+T c = json.parse('{"v":9223372036854775807}') as T;
+print(c.v);
+T? d = json.parse('{"v":9223372036854775808}') as T catch e { print(e.message); };
+print(d == null);
+`, [
+        "9007199254740993",
+        "-9223372036854775808",
+        "9223372036854775807",
+        "cannot parse JSON: expected a whole number an int can hold at v",
+        "true",
+    ]);
+});
+
+test.start("lang: JSON parse skips function fields", void () -> {
+    h.expectOutput(`
+import 'json';
+type Car { String make; Function()<int> year; int? age; }
+Car c = json.parse('{"make":"volvo","age":4}') as Car;
+print(c.make);
+print(c.age);
+print(json.toText(c));
+`, [
+        "volvo", "4", "{\"make\":\"volvo\",\"age\":4}",
+    ]);
+});
+
+test.start("lang: records", void () -> {
+    h.expectOutput(`
+type Point { int x; int y; }
+Point p = { x: 1, y: 2 }
+print(p.x);
+p.x = 10;
+print(p.x);
+print(p.x + p.y);
+
+type Nested { String name; Point at; }
+Nested n = { name: "spot", at: { x: 5, y: 6 } }
+print(n.at.y);
+n.at = { x: 7, y: 8 }
+print(n.at.x);
+`, [
+        "1", "10", "12", "6", "7",
+    ]);
+});
+
+test.start("lang: zero values", void () -> {
+    h.expectOutput(`
+import 'json';
+import 'time';
+type Car { String make; int age; String? owner; }
+Car c;
+print(json.toText(c));
+int i;
+float f;
+String s;
+bool b;
+int[] xs;
+DateTime d;
+print(i);
+print(f);
+print(s == "");
+print(b);
+print(xs.length);
+print(time.date.year(d));
+`, [
+        "{\"make\":\"\",\"age\":0}", "0", "0", "true", "false", "0", "1970",
+    ]);
+});
+
+test.start("lang: optionals", void () -> {
+    h.expectOutput(`
+String? s;
+print(s);
+print(s == null);
+s = "hi";
+print(s);
+print(s == null);
+print(s == "hi");
+print(s != "no");
+
+int? n;
+print(n == null);
+n = 5;
+print(n);
+print(n == 5);
+print(n != 5);
+
+int? a = 5;
+int? b = 5;
+print(a == b);
+b = 6;
+print(a == b);
+int? unset;
+print(a == unset);
+print(null == null);
+`, [
+        "null", "true", "hi", "false", "true", "true", "true", "5", "true", "false",
+        "true", "false", "false", "true",
+    ]);
+});
+
+test.start("lang: optional record field", void () -> {
+    h.expectOutput(`
+import 'json';
+type Car { String make; int age; String? owner; }
+Car c = { make: "t", age: 4 }
+print(c.owner);
+print(c.owner == null);
+c.owner = "alice";
+print(c.owner);
+print(c.owner == "alice");
+print(json.toText(c));
+c.owner = null;
+print(json.toText(c));
+`, [
+        "null", "true", "alice", "true",
+        "{\"make\":\"t\",\"age\":4,\"owner\":\"alice\"}",
+        "{\"make\":\"t\",\"age\":4}",
+    ]);
+});
+
+test.start("lang: optional narrowing", void () -> {
+    h.expectOutput(`
+type Node { int value; Node? next; }
+
+Node first = { value: 1, next: null };
+Node second = { value: 2, next: first };
+
+if (second.next != null) {
+    print(second.next.value);
+}
+
+String? owner;
+if (owner == null) {
+    print("nobody");
+} else {
+    print(owner + "!");
+}
+owner = "alice";
+print(owner + "!");
+
+int? n = 5;
+print(n + 1);
+
+int? m;
+if (m != null && m > 3) {
+    print("big");
+} else {
+    print("null or small");
+}
+
+int sum = 0;
+Node? cur = second;
+while (cur != null) {
+    sum = sum + cur.value;
+    cur = cur.next;
+}
+print(sum);
+
+int valueOf(Node? x) {
+    if (x == null) {
+        return -1;
+    }
+    return x.value;
+}
+print(valueOf(second));
+print(valueOf(null));
+
+int? k;
+if (k == 7) {
+    print("seven");
+} else {
+    print("not seven");
+}
+`, [
+        "1", "nobody", "alice!", "6", "null or small", "3", "2", "-1", "not seven",
+    ]);
+});
+
+// ++ and -- on a narrowed optional read through the box and store a new box.
+test.start("lang: narrowed inc dec", void () -> {
+    h.expectOutput(`
+int? count = 5;
+count++;
+count++;
+print(count);
+print(count + 1);
+
+float? f = 1.5;
+f--;
+print(f);
+
+type Stats { int? hits; }
+Stats s = { hits: null };
+s.hits = 0;
+s.hits++;
+print(s.hits);
+
+int? n = 0;
+while (n != null && n < 3) {
+    n++;
+}
+print(n);
+`, [
+        "7", "8", "0.5", "1", "3",
+    ]);
+});
+
+// A chain never gives T??. A field that is already optional keeps its type.
+test.start("lang: optional chaining", void () -> {
+    h.expectOutput(`
+import 'json';
+type Team { String name; String[] members; }
+type Company { Team? boss; }
+type Node { int value; Node? next; }
+
+Company c = { boss: { name: "core", members: ["ada", "bob"] } };
+Company empty = { boss: null };
+
+print(c.boss?.name);
+print(empty.boss?.name);
+print(c.boss?.members.length);
+print(c.boss?.members[1]);
+print(empty.boss?.members.length);
+print(empty.boss?.members[0]);
+
+Node first = { value: 1, next: null };
+Node second = { value: 2, next: first };
+print(second.next?.value);
+print(second.next?.next?.value);
+print(first.next?.value);
+
+// a chain result is an ordinary optional: compare, narrow, serialize
+if (c.boss?.name != null) {
+    print("named");
+}
+String? bossName = c.boss?.name;
+print(bossName == "core");
+print(json.toText(empty.boss?.name));
+`, [
+        "core", "null", "2", "bob", "null", "null", "1", "null", "null", "named",
+        "true", "null",
+    ]);
+});
+
+test.start("lang: int8", void () -> {
+    h.expectOutput(`
+int8 a = 100;
+int8 b = 27;
+print(a + b);
+int widened = a + b;
+print(widened);
+int8 neg = -128;
+print(neg);
+byte alias = 7;
+print(alias);
+print(a == 100);
+`, [
+        "127", "127", "-128", "7", "true",
+    ]);
+});
+
+test.start("lang: narrow integers", void () -> {
+    h.expectOutput(`
+int16 short = 32767;
+int16 shortMin = -32768;
+int32 long = 2147483647;
+int32 longMin = -2147483648;
+print(short);
+print(shortMin);
+print(long);
+print(longMin);
+print(short + long);
+print(-short);
+int8 small = 100;
+int16 widerA = small;
+int32 widerB = widerA;
+int64 widerC = widerB;
+print(widerC + 1);
+print(small == widerA);
+print(widerA < long);
+int16[] xs = [3, 1, 2];
+print(xs[widerA - 100]);
+print(xs.length);
+`, [
+        "32767", "-32768", "2147483647", "-2147483648", "2147516414", "-32767", "101",
+        "true", "true", "3", "3",
+    ]);
+});
+
+// A hexadecimal literal is an integer literal (§1.6). This includes the three
+// places that take a literal and not an expression: a map key, an enum member
+// value and a fixed-size array length.
+test.start("lang: hexadecimal literals", void () -> {
+    h.expectOutput(`
+enum Mask { LOW: 0x0F, HIGH: 0xF0 }
+
+int mask = 0xFF;
+int upper = 0X10;
+int lower = 0xff;
+int wide = 0xDEADBEEF;
+int most = 0x7FFFFFFFFFFFFFFF;
+int neg = -0x80;
+uint every = 0xFFFFFFFF;
+byte b = 0x80;
+int8 edge = 0x7F;
+uint16 wider = 0xFFFF;
+print(mask, upper, lower);
+print(wide);
+print(most);
+print(neg);
+print(every);
+print(b, edge, wider);
+print(0x10 == 16, 0xFF == 255, 0xa == 0xA);
+print(0xA + 0xB, 0xFF - 0x0F);
+print(getType(0xFF));
+Map<int, String> names = { 0xFF: "high", 0x00: "low" };
+print(names[255], names[0]);
+int[0x4] quad = [1, 2, 3, 4];
+print(quad.length, quad[0x3]);
+print(Mask.LOW, Mask.HIGH);
+print(Mask.HIGH == 240);
+`, [
+        "255 16 255", "3735928559", "9223372036854775807", "-128", "4294967295",
+        "128 127 65535", "true true true", "21 240", "int", "high low", "4 4",
+        "LOW HIGH", "true",
+    ]);
+});
+
+// A float32 literal rounds once, at compile time, onto the binary32 grid.
+test.start("lang: float32", void () -> {
+    h.expectOutput(`
+float32 tenth = 0.1;
+float32 half = 0.5;
+float32 negative = -2.25;
+print(tenth);
+print(half);
+print(negative);
+// Arithmetic widens, so a sum of float32s is a float64 and shows the
+// digits of one: 0.1 as a float32 is not the double 0.1, and past the
+// widening it no longer pretends to be.
+float64 widened = tenth + half;
+print(widened);
+print(tenth + tenth);
+float64 exact = tenth;
+print(exact);
+// Which is also why an exact literal compares equal and an inexact one
+// does not: 0.1 on the right is a float64, and the two are different
+// numbers (the same result C gives, for the same reason).
+print(half == 0.5);
+print(tenth == 0.1);
+print(half < 0.75);
+float32[] temps = [0.1, 0.5];
+print(temps[0]);
+float32? maybe = 0.25;
+print(maybe);
+maybe = null;
+print(maybe);
+`, [
+        "0.1", "0.5", "-2.25", "0.6000000014901161", "0.20000000298023224",
+        "0.10000000149011612", "true", "false", "true", "0.1", "0.25", "null",
+    ]);
+});
+
+// JSON is the only source of values that the checker does not check, so the
+// reader checks the range of every narrow type.
+test.start("lang: narrow numbers JSON", void () -> {
+    h.expectOutput(`
+import 'json';
+type Reading { int8 flag; int16 id; int32 count; float32 temp; }
+Reading r = { flag: -128, id: 300, count: 100000, temp: 0.1 }
+print(json.toText(r));
+Reading back = json.parse('{"flag":127,"id":-32768,"count":2147483647,"temp":0.30000000000000004}') as Reading;
+print(back.flag);
+print(back.id);
+print(back.count);
+print(back.temp);
+print(json.toText([back.temp]));
+`, [
+        "{\"flag\":-128,\"id\":300,\"count\":100000,\"temp\":0.1}", "127", "-32768",
+        "2147483647", "0.3", "[0.3]",
+    ]);
+    h.expectRuntimeError(`
+import 'json';
+type T { int16 v; }
+T t = json.parse('{"v":40000}') as T;
+`, "int16 out of range at v");
+    h.expectRuntimeError(`
+import 'json';
+type T { int32 v; }
+T t = json.parse('{"v":3000000000}') as T;
+`, "int32 out of range at v");
+    h.expectRuntimeError(`
+import 'json';
+type T { float32 v; }
+T t = json.parse('{"v":400000000000000000000000000000000000000}') as T;
+`, "float32 out of range at v");
+});
+
+test.start("lang: unsigned integers", void () -> {
+    h.expectOutput(`
+import 'array';
+import 'json';
+import 'string';
+
+uint8 a = 255;
+uint16 b = 65535;
+uint32 c = 4294967295;
+uint64 d = 9223372036854775807;
+uint e = 0;
+print(a, b, c, d, e);
+print(getType(a), getType(b), getType(c), getType(d), getType(e));
+
+// Subtracting below zero wraps to the top of the range, and the value
+// prints, formats and orders as the large number it is rather than as -1.
+uint top = e - 1;
+print(top);
+print(string.from(top));
+print(top > d, top / 2, top % 10, top / c);
+
+// Arithmetic widens to uint, and a narrow unsigned type cannot hold it back.
+uint8 x = 200;
+uint8 y = 100;
+print(getType(x + y), x + y);
+
+// A byte is a uint8, so it meets an int without either side converting.
+byte raw = 200;
+int widened = raw + 1;
+print(widened, getType(widened));
+
+// A plain number written beside an unsigned value takes its type. No
+// literal can name the top half of a uint64 (§1.6), so d + d + 1 is how
+// that value is reached. This also shows the wrap.
+print(top == d + d + 1, e == 0, x > 0, d <= d);
+
+// Sorting is unsigned too: the wrapped value is the largest, not the least.
+uint64[] xs = [1, 0, d];
+array.push(xs, top);
+array.sort(xs);
+print(json.toText(xs));
+
+// JSON writes the top half of a uint64 and reads it back exactly.
+type Header { uint8 version; uint32 length; uint64 id; }
+Header h = { version: a, length: c, id: top };
+print(json.toText(h));
+Header back = json.parse(json.toText(h)) as Header;
+print(back.version, back.length, back.id);
+Json tree = json.parse(json.toText(h));
+print(json.toText(tree));
+
+// And the rest of the language treats them as the scalars they are.
+uint8? maybe = 7;
+print(maybe, maybe == 7);
+Map<uint8, String> names = { 1: "one", 200: "many" };
+print(names[200]);
+switch (a) {
+    case 255: print("full");
+    default: print("other");
+}
+`, [
+        "255 65535 4294967295 9223372036854775807 0",
+        "uint8 uint16 uint32 uint64 uint", "18446744073709551615",
+        "18446744073709551615", "true 9223372036854775807 5 4294967297", "uint 300",
+        "201 int", "true true true true",
+        "[0,1,9223372036854775807,18446744073709551615]",
+        "{\"version\":255,\"length\":4294967295,\"id\":18446744073709551615}",
+        "255 4294967295 18446744073709551615",
+        "{\"version\":255,\"length\":4294967295,\"id\":18446744073709551615}",
+        "7 true", "many", "full",
+    ]);
+});
+
+// int and int64 are different types with the same width on this host. On a
+// 32-bit host, only the int-to-int64 direction compiles.
+test.start("lang: sized and natural integers", void () -> {
+    h.expectOutput(`
+int64 a = 7;
+int b = a;
+int64 c = b + a;
+float64 x = 1.5;
+float y = x;
+float64 z = y + x;
+print(c);
+print(z);
+print(getType(a));
+print(getType(b));
+print(getType(x));
+print(getType(y));
+print(getType(1));
+print(getType(1.5));
+// Arithmetic keeps the sized type when both sides have it, and falls back
+// to the natural one when they disagree.
+print(getType(a + a));
+print(getType(a + b));
+print(getType(x + x));
+`, [
+        "14", "3", "int64", "int", "float64", "float", "int", "float", "int64", "int",
+        "float64",
+    ]);
+});
+
+// A narrow result crosses the async boundary in its family's register.
+test.start("lang: narrow numbers async", void () -> {
+    h.expectOutput(`
+import 'async';
+int16 async id() { return 300; }
+float32 async temp() { return 0.5; }
+void async report() {
+    print(await id());
+    print(await temp());
+    print(getType(await temp()));
+}
+report();
+async.run(temp(), void (float32 v) -> print(v));
+`, [
+        "0.5", "300", "0.5", "float32",
+    ]);
+});
+
+test.start("lang: JSON", void () -> {
+    h.expectOutput(`
+import 'json';
+import 'time';
+type Point { int x; float y; }
+type Shape { String name; Point center; String[] tags; bool visible; DateTime created; }
+Shape s = {
+    name: "circle",
+    center: { x: 1, y: 2.5 },
+    tags: ["round", "red"],
+    visible: true,
+    created: time.date.fromText("2026-07-25")
+}
+print(json.toText(s));
+print(json.toText(42));
+print(json.toText(1.5));
+print(json.toText(true));
+print(json.toText("plain"));
+print(json.toText([1, 2, 3]));
+print(json.toText("he said \\"hi\\"\\n"));
+int? maybe = 3;
+print(json.toText(maybe));
+int? absent;
+print(json.toText(absent));
+print(json.toText([[1], [2, 3]]));
+`, [
+        "{\"name\":\"circle\",\"center\":{\"x\":1,\"y\":2.5},\"tags\":[\"round\",\"red\"],\"visible\":true,\"created\":\"2026-07-25T00:00:00Z\"}",
+        "42", "1.5", "true", "\"plain\"", "[1,2,3]", "\"he said \\\"hi\\\"\\n\"", "3",
+        "null", "[[1],[2,3]]",
+    ]);
+});
+
+test.start("lang: time calendar", void () -> {
+    h.expectOutput(`
+import 'time';
+DateTime d = time.date.fromText("2026-07-25T13:45:10Z");
+print(time.date.toText(d));
+print(time.date.year(d));
+print(time.date.month(d));
+print(time.date.day(d));
+
+DateTime dayOnly = time.date.fromText("2026-01-02");
+print(time.date.toText(dayOnly));
+
+DateTime later = time.date.addDays(dayOnly, 31);
+print(time.date.toText(later));
+print(time.date.addDays(dayOnly, -2) < dayOnly);
+print(d > dayOnly);
+print(d == d);
+print(time.date.year(time.now()) >= 2026);
+`, [
+        "2026-07-25T13:45:10Z", "2026", "7", "25", "2026-01-02T00:00:00Z",
+        "2026-02-02T00:00:00Z", "true", "true", "true", "true",
+    ]);
+});
+
+// A Duration is a count of milliseconds and prints as one.
+test.start("lang: time duration", void () -> {
+    h.expectOutput(`
+import 'time';
+print(time.duration("1s"));
+print(time.duration("10s"));
+print(time.duration("30m"));
+print(time.duration("2h"));
+print(time.duration("1d"));
+print(time.duration("0s"));
+print(time.duration("+90s"));
+print(time.duration("-1d"));
+print(time.milliseconds(time.duration("2h")));
+print(time.duration("1d") > time.duration("23h"));
+print(time.duration("60s") == time.duration("1m"));
+`, [
+        "1000", "10000", "1800000", "7200000", "86400000", "0", "90000", "-86400000",
+        "7200000", "true", "true",
+    ]);
+    h.expectOutput(`
+import 'time';
+
+DateTime start = time.date.fromText("2026-07-25T00:00:00Z");
+DateTime end = start + time.duration("90m");
+print(time.date.toText(end));
+print(end - start);
+print(time.date.toText(end - time.duration("30m")));
+print(time.date.toText(time.duration("1h") + start));
+
+Duration gap = end - start;
+print(gap + gap);
+print(gap - time.duration("30m"));
+print(gap * 2);
+print(3 * gap);
+print(gap / 3);
+print(-gap);
+print(time.milliseconds(gap));
+
+// A bare number where a Duration is wanted is that many milliseconds.
+Duration half = 500;
+print(half, -half);
+print(gap == 5400000, 5400000 == gap, gap > 1000);
+print(time.date.toText(start + 1000));
+print(time.date.toText(start - 1000));
+`, [
+        "2026-07-25T01:30:00Z", "5400000", "2026-07-25T01:00:00Z",
+        "2026-07-25T01:00:00Z", "10800000", "3600000", "10800000", "16200000",
+        "1800000", "-5400000", "5400000", "500 -500", "true true true",
+        "2026-07-25T00:00:01Z", "2026-07-24T23:59:59Z",
+    ]);
+    h.expectOutput(`
+import 'time';
+import 'json';
+
+type Span { DateTime at; Duration took; }
+Span s = { at: time.date.fromText("2026-07-25"), took: time.duration("2s") }
+print(json.toText(s));
+
+Span back = json.parse("{\\"at\\":\\"2026-07-25T00:00:00Z\\",\\"took\\":4500}") as Span;
+print(time.date.toText(back.at), back.took);
+print(json.toText(time.duration("1m")));
+`, [
+        "{\"at\":\"2026-07-25T00:00:00Z\",\"took\":2000}",
+        "2026-07-25T00:00:00Z 4500", "60000",
+    ]);
+});
+
+test.start("lang: print record and time", void () -> {
+    h.expectOutput(`
+import 'json';
+import 'time';
+type Car { String make; int age; String? owner; }
+Car c = { make: "t", age: 4 }
+print(json.toText(c));
+print(json.toText([1, 2]));
+print(time.date.fromText("2026-07-25"));
+`, [
+        "{\"make\":\"t\",\"age\":4}", "[1,2]", "2026-07-25T00:00:00Z",
+    ]);
+});
+
+// This case compares the whole output byte for byte. expectOutput compares by
+// line.
+test.start("lang: print and print inline", void () -> {
+    h.Run r = h.runProgram(`
+enum Color { RED: 1, BLUE: 2 }
+String? absent;
+printInline("a");
+printInline("b", "c");
+print();
+print("x", 1, true, 0.5, Color.BLUE, absent);
+print("only");
+printInline("no", "newline", "at", "end");
+`);
+    h.expectCode(r, 0);
+    test.expectString(r.out, "ab c\nx 1 true 0.5 BLUE null\nonly\nno newline at end");
+});
+
+test.start("lang: print evaluates arguments first", void () -> {
+    h.Run r = h.runProgram(`
+String shout(String s) {
+    printInline("[", s, "]");
+    return s;
+}
+int boom() {
+    return Error("nope");
+}
+print("first", shout("mid"), "last");
+
+int f() {
+    print("never", boom());
+    return 0;
+}
+f() catch e { print("caught:", e.message); };
+`);
+    h.expectCode(r, 0);
+    test.expectString(r.out, "[ mid ]first mid last\ncaught: nope\n");
+});
+
+test.start("lang: get type", void () -> {
+    h.expectOutput(`
+import 'time';
+type Car { String make; int age; { int amount; }[]? repairs; }
+enum Color { RED: 1 }
+int8[] bytes = [1, 2];
+int[3] fixed = [1, 2, 3];
+Car c = { make: "t", age: 4 }
+Function(int)<int> dbl = int (int n) -> n * 2;
+int async slow() { return 1; }
+print(getType("s"));
+print(getType(1));
+print(getType(1.5));
+print(getType(true));
+print(getType(time.now()));
+print(getType(time.duration("1s")));
+print(getType(bytes));
+print(getType(bytes[0]));
+print(getType(fixed));
+print(getType(c));
+print(getType(c.make));
+print(getType(c.repairs));
+print(getType(Color.RED));
+print(getType(dbl));
+print(getType(dbl(2)));
+print(getType(slow()));
+print(getType(null));
+print(getType(getType(1)));
+`, [
+        "String", "int", "float", "bool", "DateTime", "Duration", "int8[]", "int8",
+        "int[3]", "Car", "String", "Car.repairs[]?", "Color", "Function(int)<int>",
+        "int", "Future<int>", "null", "String",
+    ]);
+});
+
+test.start("lang: get type ignores narrowing", void () -> {
+    h.expectOutput(`
+String? maybe = "x";
+print(getType(maybe));
+if (maybe != null) {
+    print(getType(maybe));
+    String sure = maybe;    // narrowing itself still applies here
+    print(sure);
+}
+`, [
+        "String?", "String?", "x",
+    ]);
+});
+
+// getType folds to a constant. The constant must not depend on the block where
+// the call started.
+test.start("lang: get type with branching argument", void () -> {
+    h.expectOutput(`
+type Node { int value; Node? next; }
+Node n = { value: 1, next: null }
+print(getType(n.next));
+print(getType(n.next?.value));
+print(getType(n.next?.next?.value));
+print(getType(true && n.value > 0));
+`, [
+        "Node?", "int?", "int?", "bool",
+    ]);
+});
+
+test.start("lang: get type evaluates its argument", void () -> {
+    h.expectOutput(`
+int calls = 0;
+int bump() {
+    calls = calls + 1;
+    return calls;
+}
+print(getType(bump()));
+print(getType(bump()));
+print(calls);
+`, [
+        "int", "int", "2",
+    ]);
+});
+
+test.start("lang: get type in async functions", void () -> {
+    h.expectOutput(`
+int async slow() { return 7; }
+void async report() {
+    print(getType(await slow()));
+    print(getType(1 + await slow()));
+}
+report();
+`, [
+        "int", "int",
+    ]);
+});
+
+// math.toInt is the only math function that can stop the program (§6.21). A
+// float with no int value is a program error. The caller can use floor, ceil
+// or round to select the rounding.
+test.start("lang: math.toInt refuses a value no int holds", void () -> {
+    h.expectRuntimeError(`
+import 'math';
+float z = 0.0;
+print(math.toInt(z / z));
+`, "math.toInt");
+    h.expectRuntimeError(`
+import 'math';
+float big = 1.0;
+for (int i = 0; i < 70; i++) {
+    big = big * 2.0;
+}
+print(math.toInt(big));
+`, "math.toInt");
+});
+
+// The two random calls that stop the program (§6.22): pick on an empty array,
+// and int with an inverted range.
+test.start("lang: random refuses an empty pick and an inverted range", void () -> {
+    h.expectRuntimeError(`
+import 'random';
+int[] none = [];
+print(random.pick(none));
+`, "random.pick: the array is empty");
+    h.expectRuntimeError(`
+import 'random';
+print(random.int(5, 1));
+`, "random.int: the low bound is above the high bound");
+});
+
+test.start("lang: runtime errors", void () -> {
+    h.expectRuntimeError(`
+int zero = 0;
+print(1 / zero);
+`, "division by zero");
+    h.expectRuntimeError(`
+int zero = 0;
+print(1 % zero);
+`, "modulo by zero");
+    h.expectRuntimeError(`
+int[] a = [1];
+print(a[2]);
+`, "index 2 out of range (array length 1)");
+    h.expectRuntimeError(`
+int[] a = [1];
+int i = -1;
+print(a[i]);
+`, "index -1 out of range");
+    h.expectRuntimeError(`
+import 'time';
+DateTime d = time.date.fromText("not a date");
+`, "invalid date text");
+    h.expectRuntimeError(`
+import 'time';
+Duration d = time.duration("soon");
+`, "invalid duration");
+    h.expectRuntimeError(`
+import 'time';
+Duration d = time.duration("10y");
+`, "invalid duration unit");
+    h.expectRuntimeError(`
+import 'time';
+Duration d = time.duration("9999999999999999999d");
+`, "duration out of range");
+    h.expectRuntimeError(`
+import 'array';
+int[] a = [1];
+print(array.pop(a));
+print(array.pop(a));
+`, "pop from an empty array");
+    h.expectRuntimeError(`
+int f(int x) {
+    if (x > 0) { return 1; }
+}
+print(f(-1));
+`, "missing return in function f");
+});
+
+test.start("lang: enums", void () -> {
+    h.expectOutput(`
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+
+HttpResponses r = HttpResponses.OK;
+print(r);                              // prints the member's name
+print(HttpResponses.NOT_FOUND);
+int code = r;                          // an enum widens to int
+print(code);
+print(r == HttpResponses.OK);
+print(r == HttpResponses.NOT_FOUND);
+print(r == 200);                       // and compares with ints
+print(r < 300);
+print(HttpResponses.OK < HttpResponses.NOT_FOUND);
+r = HttpResponses.NOT_FOUND;
+print(r);
+`, [
+        "OK", "NOT_FOUND", "200", "true", "false", "true", "true", "true",
+        "NOT_FOUND",
+    ]);
+});
+
+test.start("lang: enum zero value and negative members", void () -> {
+    h.expectOutput(`
+enum HttpResponses { OK: 200, NOT_FOUND: 404 }
+enum Signal { UP: 1, FLAT: 0, DOWN: -1 }
+
+HttpResponses r;                       // zero value 0: no member, prints the number
+print(r);
+Signal s;                              // zero value 0 names FLAT
+print(s);
+print(Signal.DOWN);
+print(Signal.DOWN < Signal.FLAT);
+`, [
+        "0", "FLAT", "DOWN", "true",
+    ]);
+});
+
+test.start("lang: enums in shapes", void () -> {
+    h.expectOutput(`
+import 'json';
+import 'array';
+
+enum Status { OK: 200, NOT_FOUND: 404 }
+type Response { Status status; String? body }
+
+Response resp = { status: Status.NOT_FOUND }
+print(resp.status);
+print(json.toText(resp));              // enums serialize as their number
+
+Status[] all = [Status.OK, resp.status];
+array.push(all, Status.OK);
+forEach(all, e) {
+    print(e);
+}
+print(json.toText(all));
+
+Status? maybe = null;
+print(maybe);
+print(json.toText(maybe));
+maybe = Status.OK;
+if (maybe != null) {
+    print(maybe);                      // narrowed to Status
+}
+print(maybe == Status.OK);
+`, [
+        "NOT_FOUND", "{\"status\":404}", "OK", "NOT_FOUND", "OK", "[200,404,200]",
+        "null", "null", "OK", "true",
+    ]);
+});
+
+test.start("lang: enums through functions", void () -> {
+    h.expectOutput(`
+enum Status { OK: 200, NOT_FOUND: 404 }
+
+Status classify(int code) {
+    if (code == 404) {
+        return Status.NOT_FOUND;
+    }
+    return Status.OK;
+}
+void log(Status s) { print(s); }
+
+log(classify(404));
+log(classify(500));
+
+Status async fetch(Status s) { return s; }
+print(await fetch(Status.NOT_FOUND));  // enums flow through futures
+`, [
+        "NOT_FOUND", "OK", "NOT_FOUND",
+    ]);
+});
+
+// s[i] is the byte at i (§3.5, rt_str_byte). Its type is uint8.
+test.start("lang: string index", void () -> {
+    h.expectOutput(`
+import 'string';
+
+type Rec { String name }
+
+Rec? pick(bool yes) {
+    if (yes) {
+        Rec r = { name: "abc" };
+        return r;
+    }
+    return null;
+}
+
+String s = "hello";
+print(s[0]);
+print(s[4]);
+print(s[1] == 101);
+
+byte[] b = string.toByteArray(s);
+print(b[2] == s[2]);
+
+// A byte above 127 reads as 128..255, exactly as toByteArray's element does.
+String hi = "é";
+byte[] hb = string.toByteArray(hi);
+print(hi[0]);
+print(hb[0] == hi[0]);
+
+print(pick(true)?.name[1]);
+print(pick(false)?.name[1]);
+
+// Arithmetic on the byte -- the reason it is a byte rather than a String.
+print("7"[0] - 48);
+
+// The index is an expression, and it may allocate: the string has to stay
+// rooted across it.
+print(s[string.length(string.substring(s, 0, 2))]);
+`, [
+        "104", "111", "true", "true", "195", "true", "98", "null", "7", "108",
+    ]);
+});
+
+test.start("lang: string index out of range", void () -> {
+    h.expectRuntimeError(`
+String s = "hi";
+int i = 5;
+print(s[i]);
+`, "index 5 out of range (string length 2)");
+});
+
+// A chain of + is one n-ary concatenation (genConcatChain in codegen). The
+// operands are in frame slots, so a later operand that allocates must not
+// sweep an earlier one.
+test.start("lang: string concat chain", void () -> {
+    h.expectOutput(`
+import 'string';
+import 'array';
+
+String[] order = [];
+
+String tag(String s) {
+    array.push(order, s);
+    return s;
+}
+
+// Every call allocates, so under a collector that runs on allocation the
+// earlier operands are reachable only through the chain's frame slots.
+String churn(String s) {
+    String[] junk = [];
+    for (int i = 0; i < 20; i++) {
+        array.push(junk, s + string.from(i));
+    }
+    return s;
+}
+
+print("a" + "b" + "c");
+print("a" + "b" + "c" + "d" + "e" + "f" + "g" + "h");
+print("[" + "" + "" + "]");
+print("x" + ("y" + "z") + "w");
+print(("a" + "b") + ("c" + "d"));
+print(churn("aaaa") + churn("bbbb") + churn("cccc") + churn("dddd"));
+
+// The operands must be evaluated left to right, exactly as the cascade did.
+String out = tag("1") + tag("2") + tag("3") + tag("4");
+print(out + "/" + string.join(order, ""));
+
+// A number still has to be converted explicitly, and the conversion is an
+// ordinary operand of the chain.
+print("n=" + string.from(1 + 2) + "!" + string.from(4.5));
+`, [
+        "abc", "abcdefgh", "[]", "xyzw", "abcd", "aaaabbbbccccdddd", "1234/1234",
+        "n=3!4.5",
+    ]);
+});
+
+// In an async body, the chain's slots are in the heap frame, because each
+// operand but the last is held across a suspension. A fallible operand raises
+// from the middle of the chain.
+test.start("lang: string concat chain async and fallible", void () -> {
+    h.expectOutput(`
+import 'string';
+import 'async';
+
+String async piece(String s) {
+    return s;
+}
+
+String async build() {
+    String a = await piece("aa");
+    return a + await piece("bb") + await piece("cc") + await piece("dd");
+}
+
+String failing(bool boom) {
+    if (boom) {
+        return Error("boom", 1);
+    }
+    return "ok";
+}
+
+String tryChain(bool boom) {
+    return ("[" + failing(boom) + "-" + failing(false) + "]") catch "caught";
+}
+
+print(await build());
+print(tryChain(false));
+print(tryChain(true));
+`, [
+        "aabbccdd", "[ok-ok]", "caught",
+    ]);
+});
+
+test.start("lang: string library", void () -> {
+    h.expectOutput(`
+import 'string';
+import 'json';
+
+String s = "  Hello, World  ";
+print(string.trim(s));
+print(string.toUpperCaseAscii("nio v1.0!"));
+print(string.toLowerCaseAscii("Nio V1.0!"));
+print(string.length("hello"));
+print(string.length(""));
+print(string.append("foo", "bar"));
+print(string.contains("hello world", "lo w"));
+print(string.contains("hello world", "xyz"));
+print(string.find("my findValue", "findValue"));
+print(string.find("abc", "z"));
+print(string.copy("dup"));
+print(string.replace("a-b-c", "-", "+"));
+print(string.replaceAll("a-b-c", "-", "+"));
+print(json.toText(string.split("hello - world", "-")));
+print(json.toText(string.toByteArray("Az")));
+print(string.toUpperCaseAscii(string.trim("  ok  ")));
+`, [
+        "Hello, World", "NIO V1.0!", "nio v1.0!", "5", "0", "foobar", "true", "false",
+        "3", "-1", "dup", "a+b-c", "a+b+c", "[\"hello \",\" world\"]", "[65,122]",
+        "OK",
+    ]);
+});
+
+// A program can declare its own Cpu. Codegen interns type descriptors by qual
+// and name, so the two must stay different.
+test.start("lang: OS cpu does not collide with A user record", void () -> {
+    h.expectOutput(`
+import 'os';
+import 'json';
+
+type Cpu { String label; int[] cores; }
+
+Cpu mine = { label: "mine", cores: [1, 2, 3] };
+os.Cpu theirs = os.getCpus()[0];
+
+print(json.toText(mine));
+print(getType(mine), getType(theirs));
+print(theirs.model != null || theirs.model == null);
+`, [
+        "{\"label\":\"mine\",\"cores\":[1,2,3]}", "Cpu os.Cpu", "true",
+    ]);
+});
+
+// A built-in module's name is claimed only in a file that imports it.
+test.start("lang: library names are ordinary without the import", void () -> {
+    h.expectOutput(`
+type Route { String path; int os; }
+
+String path = "/usr/local";
+int[] array = [3, 1, 2];
+Map<String, int> map = { "hits": 7 }
+int time = 2026;
+
+String json(String s) { return "<" + s + ">"; }
+int async(int n) { return n * 2; }
+Route fs(String string) { return { path: string, os: array.length } }
+
+print(path, json(path), fs(path).os);
+print(async(time), map["hits"]);
+forEach(array, string, os) { printInline(string + os); }
+print();
+`, [
+        "/usr/local </usr/local> 3", "4052 7", "324",
+    ]);
+});
+
+test.start("lang: renamed import frees the library name", void () -> {
+    h.expectOutput(`
+import 'path' as p;
+
+String path = "/tmp";
+print(p.join(path, "nio", "out.txt"));
+`, [
+        path.localize("/tmp/nio/out.txt"),
+    ]);
+});
+
+// join cleans its result, so elements that are all empty give "." and not "".
+test.start("lang: path join of nothing is here", void () -> {
+    h.expectOutput(`
+import 'path';
+
+print(path.join(""));
+print(path.join("", ""));
+print(path.join("", "", ""));
+`, [
+        ".", ".", ".",
+    ]);
+});
+
+test.start("lang: FS empty file", void () -> {
+    String dir = h.scratch();
+    h.expectOutput(`
+import 'fs';
+import 'string';
+
+String p = ` + h.nioPath([dir, "empty"]) + `;
+byte[] nothing = [];
+fs.writeFile(p, nothing);
+print(fs.exists(p));
+print(fs.readFile(p).length);
+print(string.fromByteArray(fs.readFile(p)) == "");
+print(fs.stat(p).size);
+`, [
+        "true", "0", "true", "0",
+    ]);
+});
+
+// A prefix must be a name. A separator in it would escape the temporary
+// directory.
+test.start("lang: FS create temp dir refuses prefixes that are not names", void () -> {
+    h.expectOutput(`
+import 'fs';
+import 'string';
+
+fs.createTempDir("../escape") catch e { print(e.message); }
+fs.createTempDir("a/b") catch e { print(e.message); }
+fs.createTempDir("a\\\\b") catch e { print(e.message); }
+fs.createTempDir(string.fromByteArray([110, 0, 120])) catch e { print(e.message); }
+
+// A prefix is optional in the sense that nothing requires one: the system
+// still picks a name nothing else has.
+String bare = fs.createTempDir("") catch "";
+print(bare != "", fs.exists(bare));
+fs.delete(bare);
+`, [
+        "fs.createTempDir: a prefix cannot contain a path separator",
+        "fs.createTempDir: a prefix cannot contain a path separator",
+        "fs.createTempDir: a prefix cannot contain a path separator",
+        "fs.createTempDir: a prefix cannot contain a NUL byte", "true true",
+    ]);
+});
+
+test.start("lang: string join", void () -> {
+    h.expectOutput(`
+import 'string';
+import 'array';
+
+print(string.join(["a", "b", "c"], ", "));
+print(string.join(["a"], ", "));                  // no separator to place
+print(string.length(string.join([], ", ")));      // 0 -- and no separator
+print(string.join(["a", "b"], ""));               // an empty separator is fine
+print(string.join(["", "", ""], "-"));            // empty pieces are kept
+
+// The round trip with split, which is the property that ties the two
+// together: for any non-empty separator, joining what split produced
+// reproduces the string, empty pieces and all.
+String s = "-a--b-";
+print(string.join(string.split(s, "-"), "-") == s);
+
+// Bytes, not characters: a multi-byte piece and separator contribute every
+// byte they have.
+print(string.length(string.join(["é", "ü"], "·")));
+
+// A NUL is an ordinary byte in a piece, as everywhere else.
+print(string.length(string.join([string.fromByteArray([97, 0]), "b"], "")));
+
+// Built one at a time, which is what join is for.
+String[] parts = [];
+for (int i = 0; i < 4; i++) { array.push(parts, string.from(i)); }
+print(string.join(parts, "+"));
+
+// The array is untouched -- join copies out of it.
+print(parts.length, parts[0]);
+`, [
+        "a, b, c", "a", "0", "ab", "--", "true", "6", "3", "0+1+2+3", "4 0",
+    ]);
+});
+
+// A Nio string can hold a NUL byte, which no escape can write.
+test.start("lang: string from byte array", void () -> {
+    h.expectOutput(`
+import 'string';
+import 'json';
+
+print(string.fromByteArray(string.toByteArray("hello")));
+print(string.length(string.fromByteArray([])));
+print(string.fromByteArray([104, 105]));
+
+// Multi-byte UTF-8 survives: "é" is two bytes, both above 127.
+String e = "é";
+print(string.fromByteArray(string.toByteArray(e)) == e);
+print(json.toText(string.toByteArray(e)));
+
+// A NUL is an ordinary byte in a counted string: it neither ends it nor is
+// dropped, so the length is the whole array.
+print(string.length(string.fromByteArray([97, 0, 98])));
+`, [
+        "hello", "0", "hi", "true", "[195,169]", "3",
+    ]);
+});
+
+test.start("lang: string library edge cases", void () -> {
+    h.expectOutput(`
+import 'string';
+import 'json';
+
+print(string.find("abc", ""));                  // an empty sub is found at 0
+print(string.contains("abc", ""));
+print(string.replace("abc", "", "x"));          // empty old: unchanged
+print(string.replaceAll("abc", "zz", "x"));     // absent old: unchanged
+print(string.replaceAll("aaa", "a", "aa"));     // replacements are not rescanned
+print(string.replaceAll("banana", "ana", "X")); // matches never overlap
+print(string.length(string.trim("   ")));       // all whitespace trims to ""
+print(string.trim("\\ta b\\n"));                  // inner whitespace stays
+print(json.toText(string.split("a--b", "-")));  // empty pieces are kept
+print(json.toText(string.split("-", "-")));
+print(json.toText(string.split("abc", "abc")));
+print(json.toText(string.split("abc", "xyz"))); // no separator: one piece
+print(json.toText(string.toByteArray("")));
+print(string.toByteArray("é")[0]);              // a byte is a uint8: 0..255
+print(getType(string.split("a", "-")));
+print(getType(string.toByteArray("a")));
+`, [
+        "0", "true", "abc", "abc", "aaaaaa", "bXna", "0", "a b", "[\"a\",\"\",\"b\"]",
+        "[\"\",\"\"]", "[\"\",\"\"]", "[\"abc\"]", "[]", "195", "String[]", "uint8[]",
+    ]);
+});
+
+test.start("lang: string split empty separator", void () -> {
+    h.expectRuntimeError(`
+import 'string';
+String[] parts = string.split("abc", "");
+`, "split with an empty separator");
+});
+
+test.start("lang: string substring", void () -> {
+    h.expectOutput(`
+import 'string';
+
+String s = "hello world";
+print(string.substring(s, 6, 11));            // a middle slice
+print(string.substring(s, 0, 5));             // a prefix
+print(string.substring(s, 0, 11));            // the whole string
+print(string.length(string.substring(s, 3, 3)));   // empty, start == end
+print(string.length(string.substring("", 0, 0)));  // empty input
+print(string.substring("héllo", 1, 3));       // bytes, not characters: é is two
+`, [
+        "world", "hello", "hello world", "0", "0", "é",
+    ]);
+});
+
+test.start("lang: string to int and to float", void () -> {
+    h.expectOutput(`
+import 'string';
+
+print(string.toInt("42"));
+print(string.toInt("+42"));
+print(string.toInt("-42"));
+print(string.toInt("0042"));                       // leading zeros are fine
+print(string.toInt("9223372036854775807"));        // the widest int
+print(string.toInt("-9223372036854775808"));       // and the narrowest
+print(string.toInt("abc") catch -1);               // not a number: caught
+print(string.toInt("12x") catch -1);               // trailing junk too
+print(string.toInt(" 12") catch -1);               // no implicit trim
+print(string.toInt("") catch -1);
+print(string.toInt("9223372036854775808") catch -2);   // one past the top
+print(string.toInt("-9223372036854775809") catch -2);  // one past the bottom
+
+print(string.toFloat("3.14"));
+print(string.toFloat("3"));                        // a whole number is a float too
+print(string.toFloat("-0.5"));
+print(string.toFloat(".5"));                       // a bare fraction
+print(string.toFloat("2.5e2"));                    // exponents
+print(string.toFloat("1e-3"));
+print(string.toFloat("x") catch -1.0);
+print(string.toFloat("1.2.3") catch -1.0);
+print(string.toFloat("1e") catch -1.0);            // an exponent needs digits
+print(string.toFloat("1e999") catch -2.0);         // too large for a double
+
+string.toInt("bad") catch e {
+    print(e.message);                              // the fs message shape
+}
+string.toFloat("1e999") catch e {
+    print(e.message);
+}
+`, [
+        "42", "42", "-42", "42", "9223372036854775807", "-9223372036854775808", "-1",
+        "-1", "-1", "-1", "-2", "-2", "3.14", "3", "-0.5", "0.5", "250", "0.001",
+        "-1", "-1", "-1", "-2", "string.toInt \"bad\": not an integer",
+        "string.toFloat \"1e999\": out of range",
+    ]);
+});
+
+// toInt cannot replace toUint (§6.6). An int does not assign to a uint, and no
+// int holds the top half of the uint64 range.
+test.start("lang: string to uint", void () -> {
+    h.expectOutput(`
+import 'string';
+
+print(string.toUint("42"));
+print(string.toUint("+42"));
+print(string.toUint("0"));
+print(string.toUint("0042"));                          // leading zeros are fine
+print(string.toUint("18446744073709551615"));          // the widest uint64
+print(getType(string.toUint("1") catch 0));            // and it is a uint
+
+// A bare default takes its type from the call, so catch 0 is a uint here.
+print(string.toUint("abc") catch 0);
+print(string.toUint("12x") catch 0);                   // trailing junk
+print(string.toUint(" 12") catch 0);                   // no implicit trim
+print(string.toUint("") catch 0);
+print(string.toUint("-") catch 0);                     // a sign is not a number
+print(string.toUint("18446744073709551616") catch 1);  // one past the top
+
+// A negative is the case toInt does not have: well formed, and simply not a
+// value this type holds.
+string.toUint("-1") catch e {
+    print(e.message, e.code == string.ErrorCode.INVALID);
+}
+string.toUint("-x") catch e {
+    print(e.message);                                  // shape wins over range
+}
+
+// It reaches the sized unsigned types through the ordinary assignment rules.
+uint8 small = 0;
+uint32 mid = 0;
+small = 255;
+mid = 4294967295;
+print(small, mid);
+`, [
+        "42", "42", "0", "42", "18446744073709551615", "uint", "0", "0", "0", "0",
+        "0", "1", "string.toUint \"-1\": out of range true",
+        "string.toUint \"-x\": not an integer", "255 4294967295",
+    ]);
+});
+
+// A catch default with no declared type takes the type of the guarded
+// expression. As an int literal, catch 0 would not assign to a uint, a
+// Duration or a narrow result.
+test.start("lang: catch default takes the calls type", void () -> {
+    h.expectOutput(`
+import 'string';
+import 'time';
+
+uint count(String s) { return string.toUint(s); }
+Duration wait(String s) {
+    if (string.length(s) == 0) { return Error("empty"); }
+    return time.duration(s);
+}
+int8 tiny(String s) {
+    if (string.length(s) == 0) { return Error("empty"); }
+    return 1;
+}
+
+print(getType(count("x") catch 0));
+print(getType(wait("") catch 0));
+print(getType(tiny("") catch 0));
+print(time.milliseconds(wait("") catch 2000));
+
+// A declared type still decides when there is one, which is what makes a
+// null default under a declared optional type work, and what lets a narrow
+// result answer with the wider type it was assigned to.
+uint wide = count("7") catch 0;
+print(wide, getType(wide));
+int fromNarrow = tiny("") catch 0;
+print(fromNarrow, getType(fromNarrow));
+uint? maybe = count("x") catch null;
+print(maybe);
+`, [
+        "uint", "Duration", "int8", "2000", "7 uint", "0 int", "null",
+    ]);
+});
+
+// string.from returns the text that print writes, so the two must agree. Each
+// case prints twice, so each expected line repeats.
+test.start("lang: string from", void () -> {
+    h.expectOutput(`
+import 'string';
+import 'time';
+
+enum Status { OK: 200, NOT_FOUND: 404 }
+
+int n = -42;
+print(n);
+print(string.from(n));
+
+float f = 0.1;
+print(f);
+print(string.from(f));
+
+// A float32 keeps the digits of its own width, which is the whole reason the
+// descriptor travels with the value instead of the parameter naming a type:
+// widening to float first would print the double's digits.
+float32 narrow = 0.1;
+print(narrow);
+print(string.from(narrow));
+
+print(true);
+print(string.from(true));
+print(string.from("already text"));
+print(string.from(Status.NOT_FOUND));
+
+DateTime moment = time.date.fromText("2026-07-28T09:31:04Z");
+print(moment);
+print(string.from(moment));
+
+Duration d = 1500;
+print(d);
+print(string.from(d));
+
+// An optional formats as print writes it: the value when present, "null"
+// when not.
+int? present = 7;
+int? absent = null;
+print(string.from(present));
+print(string.from(absent));
+
+// The round trip the parsers make: text out, the same value back.
+print((string.toFloat(string.from(f)) catch -1.0) == f);
+print((string.toInt(string.from(n)) catch -1) == n);
+print((string.toFloat(string.from(1.0 / 3.0)) catch -1.0) == 1.0 / 3.0);
+
+// The result is an ordinary string, so it concatenates and measures.
+print("n = " + string.from(n) + "!");
+print(string.length(string.from(1000)));
+`, [
+        "-42", "-42", "0.1", "0.1", "0.1", "0.1", "true", "true", "already text",
+        "NOT_FOUND", "2026-07-28T09:31:04Z", "2026-07-28T09:31:04Z", "1500", "1500",
+        "7", "null", "true", "true", "true", "n = -42!", "4",
+    ]);
+});
+
+test.start("lang: string to int uncaught stops the program", void () -> {
+    h.expectRuntimeError(`
+import 'string';
+print(string.toInt("nope"));
+`, "string.toInt \"nope\": not an integer");
+});
+
+test.start("lang: maps", void () -> {
+    h.expectOutput(`
+import 'map';
+
+Map<String, int> ages;
+print(ages.length);
+ages["alice"] = 31;
+ages["bob"] = 27;
+ages["alice"] = 32;
+print(ages.length);
+
+int? age = ages["alice"];
+if (age != null) {
+    print(age);
+}
+print(ages["carol"]);
+
+print(map.has(ages, "bob"));
+print(map.remove(ages, "bob"));
+print(map.remove(ages, "bob"));
+print(ages.length);
+
+ages["dana"] = 45;
+forEach(map.keys(ages), name, i) {
+    print(name);
+    print(i);
+}
+
+Map<String, int> dup = map.copy(ages);
+dup["eve"] = 1;
+print(ages.length);
+print(dup.length);
+forEach(map.values(dup), v) {
+    print(v);
+}
+
+print(getType(ages));
+`, [
+        "0", "2", "32", "null", "true", "true", "false", "1", "alice", "0", "dana",
+        "1", "2", "3", "32", "45", "1", "Map<String, int>",
+    ]);
+});
+
+test.start("lang: map literals", void () -> {
+    h.expectOutput(`
+import 'map';
+
+Map<String, int> ages = { "alice": 31, "bob": 27 };
+print(ages.length);
+Map<String, int> empty = {};
+print(empty.length);
+
+Map<int, String> codes = { 200: "ok", 404: "not found", -1: "minus" };
+print(codes[404]);
+print(codes[-1]);
+print(codes[500]);
+
+// Narrow keys and values take the literal's context type.
+Map<int8, int8> tiny = { 100: 100 };
+print(tiny[100]);
+
+enum Color { RED: 1, BLUE: 2 }
+Map<Color, String> names;
+names[Color.RED] = "red";
+print(names[Color.RED]);
+print(names[Color.BLUE]);
+
+Map<bool, String> flags;
+flags[true] = "yes";
+print(flags[true]);
+
+type Point { int x; int y; }
+Map<String, Point> pts = { "one": { x: 1, y: 2 } };
+Point? p = pts["one"];
+if (p != null) {
+    print(p.x + p.y);
+}
+`, [
+        "2", "0", "not found", "minus", "null", "100", "red", "null", "yes", "3",
+    ]);
+});
+
+test.start("lang: map growth and order", void () -> {
+    h.expectOutput(`
+import 'map';
+import 'json';
+
+// Enough entries to force several rehashes; every key stays findable.
+Map<int, int> squares;
+for (int i = 0; i < 300; i++) {
+    squares[i] = i * i;
+}
+print(squares.length);
+print(squares[299]);
+bool ok = true;
+for (int i = 0; i < 300; i++) {
+    int? v = squares[i];
+    if (v == null || v != i * i) {
+        ok = false;
+    }
+}
+print(ok);
+
+// Overwrites do not change length; removal keeps insertion order.
+Map<String, int> m = { "a": 0, "b": 1, "c": 2, "d": 3 };
+m["b"] = 10;
+print(m.length);
+map.remove(m, "a");
+map.remove(m, "c");
+print(json.toText(map.keys(m)));
+m["a"] = 99;
+print(json.toText(m));
+
+// Runtime-built string keys hash by content.
+String k = "ke";
+m[k + "y"] = 7;
+print(m["key"]);
+`, [
+        "300", "89401", "true", "4", "[\"b\",\"d\"]", "{\"b\":10,\"d\":3,\"a\":99}",
+        "7",
+    ]);
+});
+
+test.start("lang: map JSON", void () -> {
+    h.expectOutput(`
+import 'json';
+
+// Serialization: entries in insertion order, keys escaped like any string.
+Map<String, int> ages;
+ages["alice"] = 31;
+ages["say \\"hi\\""] = 1;
+print(json.toText(ages));
+
+// Dynamic keys parse into a map; nesting and records compose.
+type Ledger { int total; }
+String text = '{"user-1":{"total":30},"user-2":{"total":12}}';
+Map<String, Ledger> byUser = json.parse(text) as Map<String, Ledger>;
+print(byUser.length);
+print(byUser["user-2"]?.total);
+print(byUser["user-3"]?.total);
+
+// A duplicate key in the document overwrites, like rt_map_set always does.
+Map<String, int> dup = json.parse('{"a":1,"a":2}') as Map<String, int>;
+print(dup.length);
+print(dup["a"]);
+
+// Maps nested in maps, and maps as record fields, round-trip.
+Map<String, Map<String, int>> nested = json.parse('{"outer":{"a":1}}') as Map<String, Map<String, int>>;
+print(json.toText(nested));
+type Blob { Map<String, int> counts; }
+Blob b = json.parse('{"counts":{"x":5}}') as Blob;
+print(json.toText(b));
+`, [
+        "{\"alice\":31,\"say \\\"hi\\\"\":1}", "2", "12", "null", "1", "2",
+        "{\"outer\":{\"a\":1}}", "{\"counts\":{\"x\":5}}",
+    ]);
+});
+
+test.start("lang: map JSON parse error names key", void () -> {
+    h.expectRuntimeError(`
+import 'json';
+Map<String, int> m = json.parse('{"count":"x"}') as Map<String, int>;
+`, "cannot parse JSON: expected a number at count");
+});
+
+test.start("lang: map optional chaining", void () -> {
+    h.expectOutput(`
+type Garage { Map<String, int>? slots; }
+type Lot { Garage? garage; }
+
+Garage empty = { slots: null };
+Garage full = { slots: { "front": 1 } };
+print(empty.slots?.length);
+print(full.slots?.length);
+
+// Indexing continues a chain, and the map lookup's V? is the chain's own
+// optional shape.
+Lot l = { garage: { slots: { "front": 1 } } };
+print(l.garage?.slots["front"]);
+print(l.garage?.slots["back"]);
+Lot none = { garage: null };
+print(none.garage?.slots["front"]);
+`, [
+        "null", "1", "1", "null", "null",
+    ]);
+});
+
+test.start("lang: maps in functions and closures", void () -> {
+    h.expectOutput(`
+import 'map';
+
+int count(Map<String, int> m) {
+    return m.length;
+}
+Map<String, int> make() {
+    Map<String, int> m;
+    m["a"] = 1;
+    m["b"] = 2;
+    return m;
+}
+print(count(make()));
+
+// A captured map is shared by reference through its box.
+Map<String, int> shared;
+Function()<void> bump = void () -> {
+    shared["hits"] = shared.length + 1;
+};
+bump();
+bump();
+print(shared["hits"]);
+print(shared.length);
+`, [
+        "2", "2", "1",
+    ]);
+});
+
+test.start("lang: maps across await", void () -> {
+    h.expectOutput(`
+import 'time';
+
+int async tally() {
+    Map<String, int> local;
+    local["before"] = 1;
+    await time.sleep(1);
+    // The map lives in the state-machine frame and survives the suspension.
+    local["after"] = 2;
+    return local.length;
+}
+print(await tally());
+`, [
+        "2",
+    ]);
+});
+
+test.start("lang: variadic parameters", void () -> {
+    h.expectOutput(`
+void customPrint(int myInt, ...String logs) {
+    print(myInt);
+    forEach(logs, log) {
+        print(log);
+    }
+}
+customPrint(0, "hello", "world", "!");
+
+// The collecting parameter is an ordinary array: no trailing argument
+// makes it empty, and it carries its length like any other.
+int sum(...int ns) {
+    print(ns.length);
+    int total = 0;
+    forEach(ns, n) {
+        total = total + n;
+    }
+    return total;
+}
+print(sum());
+print(sum(1, 2, 3));
+`, [
+        "0", "hello", "world", "!", "0", "0", "3", "6",
+    ]);
+});
+
+test.start("lang: variadic function values", void () -> {
+    h.expectOutput(`
+Function(...String)<void> shout = void (...String parts) -> {
+    forEach(parts, p) {
+        print(p + "!");
+    }
+};
+shout("a", "b");
+shout();
+print(getType(shout));
+
+// A variadic parameter can be captured, like any other.
+Function()<int> adder(...int seed) {
+    return int () -> seed[0] + seed[1];
+}
+print(adder(10, 5)());
+`, [
+        "a!", "b!", "Function(...String)<void>", "15",
+    ]);
+});
+
+test.start("lang: variadic async and fallible", void () -> {
+    h.expectOutput(`
+int async twice(int n) {
+    return n * 2;
+}
+int async total(...int ns) {
+    int t = 0;
+    forEach(ns, n) {
+        t = t + await twice(n);
+    }
+    return t;
+}
+// The arguments are evaluated and collected at the call, before the body
+// runs; an await among them completes first.
+print(await total(1, 2, 3));
+print(await total(await twice(5), 1));
+
+int first(...int ns) {
+    if (ns.length == 0) {
+        return Error("nothing to pick");
+    }
+    return ns[0];
+}
+print(first(7));
+print(first() catch -1);
+`, [
+        "12", "22", "7", "-1",
+    ]);
+});
+
+// Each argument stays live while the later ones are evaluated, and while the
+// array that collects them is allocated.
+test.start("lang: variadic rooting", void () -> {
+    h.expectOutput(`
+void join(String head, String sep, ...String rest) {
+    String out = head;
+    forEach(rest, r) {
+        out = out + sep + r;
+    }
+    print(out);
+}
+String a = "a";
+join(a + "1", "-" + "-", a + "2", a + "3", a + "4");
+`, [
+        "a1--a2--a3--a4",
+    ]);
+});
+
+test.start("lang: methods", void () -> {
+    h.expectOutput(`
+import 'json';
+
+type Car {
+    String make;
+    int buildYear;
+
+    // The receiver reads its own fields. A function-typed field cannot do
+    // this, because a closure captures variables and not the record.
+    int returnYear() {
+        return self.buildYear;
+    }
+
+    void rename(String name) {
+        self.make = name;
+    }
+
+    // one method calling another on the same receiver
+    String describe() {
+        return self.make + " (" + self.age() + " years)";
+    }
+
+    String age() {
+        return json.toText(2026 - self.returnYear());
+    }
+}
+
+Car myCar = { make: "myCar", buildYear: 1922 }
+print(myCar.returnYear());
+myCar.rename("Toyota");
+print(myCar.make);
+print(myCar.describe());
+
+// Methods are not fields: the JSON form is the data alone.
+print(json.toText(myCar));
+
+// Every value of the type shares one method; nothing is stored per value.
+Car other = { make: "honda", buildYear: 2000 }
+print(other.describe());
+`, [
+        "1922", "Toyota", "Toyota (104 years)",
+        "{\"make\":\"Toyota\",\"buildYear\":1922}", "honda (26 years)",
+    ]);
+});
+
+test.start("lang: method receiver kinds", void () -> {
+    h.expectOutput(`
+import 'array';
+
+type Counter {
+    int n;
+    int bump() {
+        self.n = self.n + 1;
+        return self.n;
+    }
+    Counter self() { return self; }   // the receiver as a value
+}
+
+type Garage {
+    Counter[] counters;
+    Counter? spare;
+
+    int total() {
+        int sum = 0;
+        forEach(self.counters, c) {
+            sum = sum + c.n;
+        }
+        return sum;
+    }
+}
+
+Counter makeCounter(int n) { return { n: n }; }
+
+Garage g = { counters: [{ n: 1 }, { n: 2 }] };
+print(g.total());
+
+// through an array element, a narrowed optional, a call result, and a chain
+print(g.counters[0].bump());
+g.spare = { n: 100 };
+if (g.spare != null) {
+    print(g.spare.bump());
+}
+print(makeCounter(7).bump());
+print(makeCounter(7).self().bump());
+array.push(g.counters, makeCounter(10));
+print(g.total());
+
+// Records are references, so a method mutates the value it was called on.
+Counter c = { n: 0 };
+Counter alias = c;
+print(alias.bump());
+print(c.n);
+`, [
+        "3", "2", "101", "8", "8", "14", "1", "1",
+    ]);
+});
+
+test.start("lang: methods with closures and errors", void () -> {
+    h.expectOutput(`
+import 'array';
+
+type Box {
+    int n;
+    String label;
+
+    // a function value capturing the receiver, outliving the call
+    Function()<int> stepper() {
+        return int () -> {
+            self.n = self.n + 1;
+            return self.n;
+        };
+    }
+
+    Function()<int>[] steppers(int times) {
+        Function()<int>[] out = [];
+        for (int i = 0; i < times; i = i + 1) {
+            array.push(out, self.stepper());
+        }
+        return out;
+    }
+
+    // fallible, inferred from the body
+    int risky() {
+        if (self.n > 10) {
+            return Error("too big");
+        }
+        return self.n;
+    }
+
+    // a catch handler inside a method may mutate the receiver
+    int safe() {
+        return self.risky() catch e {
+            self.label = e.message;
+            return -1;
+        };
+    }
+}
+
+Box b = { n: 0, label: "start" };
+Function()<int> step = b.stepper();
+print(step());
+print(step());
+print(b.n);
+
+forEach(b.steppers(2), s) {
+    print(s());
+}
+
+print(b.safe());
+b.n = 50;
+print(b.safe());
+print(b.label);
+print(b.risky() catch -1);
+`, [
+        "1", "2", "2", "3", "4", "4", "-1", "too big", "-1",
+    ]);
+});
+
+test.start("lang: async methods", void () -> {
+    h.expectOutput(`
+import 'time';
+
+type Node {
+    int value;
+    Node? next;
+
+    int async total() {
+        await time.sleep(1);
+        if (self.next != null) {
+            return self.value + await self.next.total();
+        }
+        return self.value;
+    }
+
+    int async risky() {
+        await time.sleep(1);
+        if (self.value < 0) {
+            return Error("negative");
+        }
+        return self.value;
+    }
+}
+
+Node c = { value: 3 };
+Node b = { value: 2, next: c };
+Node a = { value: 1, next: b };
+
+Future<int> f = a.total();
+print(await f);
+print(await f);          // the result is remembered
+
+print(await a.risky() catch -1);
+a.value = -5;
+print(await a.risky() catch -1);
+`, [
+        "6", "6", "1", "-1",
+    ]);
+});
+
+// A method call on a null receiver is a runtime error (§5.5).
+test.start("lang: method on narrowed null receiver", void () -> {
+    h.expectRuntimeError(`
+type T {
+    int n;
+    T? other;
+    int get() { return self.n; }
+    void clear() { self.other = null; }
+}
+
+T t = { n: 1 };
+t.other = { n: 2 };
+if (t.other != null) {
+    t.clear();
+    print(t.other.get());
+}
+`, "null");
+});
+
+// An argument that awaits hoists the receiver and not the callee, because a
+// method is not a value.
+test.start("lang: async method arguments", void () -> {
+    h.expectOutput(`
+import 'time';
+
+type T {
+    int n;
+    T? other;
+
+    int add(int a, int b) { return self.n + a + b; }
+    int async val() { await time.sleep(1); return self.n; }
+    T async mk(int v) { await time.sleep(1); return { n: v }; }
+
+    int async go() { return self.add(await self.val(), 1); }
+    int async chained() { return (await self.mk(100)).add(await self.val(), 2); }
+    int async viaOther() {
+        if (self.other != null) {
+            return self.other.add(await self.val(), 3);
+        }
+        return 0;
+    }
+}
+
+T t = { n: 5 };
+t.other = { n: 7 };
+print(await t.go());
+print(await t.chained());
+print(await t.viaOther());
+`, [
+        "11", "107", "15",
+    ]);
+});
+
+// A captured self moves into a heap box in the state-0 prologue.
+test.start("lang: async method captures receiver", void () -> {
+    h.expectOutput(`
+import 'time';
+
+type T {
+    int n;
+
+    int async run() {
+        Function()<int> bump = int () -> {
+            self.n = self.n + 1;
+            return self.n;
+        };
+        int a = bump();
+        await time.sleep(1);
+        int b = bump();
+        return a + b + self.n;
+    }
+}
+
+T t = { n: 0 };
+print(await t.run());
+print(t.n);
+`, [
+        "5", "2",
+    ]);
+});
+
+// extends copies the members (§2.4). The base's fields keep their indices, and
+// the inherited bodies call the override.
+test.start("lang: extends", void () -> {
+    h.expectOutput(`
+import 'json';
+
+type Car {
+    String make;
+    String? owner;
+
+    int wheels() { return 4; }
+
+    void describe() {
+        print(self.make, "has", self.wheels(), "wheels");
+    }
+}
+
+type Truck extends Car {
+    int load;
+
+    int override wheels() { return 6; }
+
+    int carry(int extra) { return self.load + extra; }
+}
+
+type Van extends Truck {
+    void override describe() {
+        print("van:", self.make, self.wheels());
+    }
+}
+
+Car c = { make: "toyota" };
+Truck t = { make: "volvo", owner: "eli", load: 900 };
+Van v = { make: "ford", load: 300 };
+
+c.describe();
+t.describe();          // the base's body, calling Truck's override
+v.describe();
+
+print(t.owner, t.load, t.carry(100));
+print(getType(c), getType(t), getType(v));
+print(json.toText(t));
+
+// A method mutating the receiver reaches an inherited field.
+t.make = "scania";
+print(t.make);
+`, [
+        "toyota has 4 wheels", "volvo has 6 wheels", "van: ford 6", "eli 900 1000",
+        "Car Truck Van", "{\"make\":\"volvo\",\"owner\":\"eli\",\"load\":900}",
+        "scania",
+    ]);
+});
+
+// An inherited body belongs to the extending type, so self carries that type.
+test.start("lang: extends inherited body kinds", void () -> {
+    h.expectOutput(`
+import 'time';
+
+type Base {
+    String name;
+
+    String risky(bool bad) {
+        if (bad) { return Error("boom"); }
+        return self.name;
+    }
+
+    Function()<String> closure() {
+        return String () -> self.name + "/" + self.tag();
+    }
+
+    String async fetch() {
+        await time.sleep(1);
+        return self.name + ":" + self.tag();
+    }
+
+    String tag() { return "base"; }
+}
+
+type Sub extends Base {
+    String[] extras;                  // a reference field the base knows nothing about
+    String override tag() { return "sub"; }
+}
+
+Sub s = { name: "s", extras: ["e"] };
+print(s.risky(false));
+print(s.risky(true) catch "caught");
+Function()<String> f = s.closure();
+print(f());
+print(await s.fetch());
+print(s.extras[0]);
+`, [
+        "s", "caught", "s/sub", "s:sub", "e",
+    ]);
+});
+
+// A parse with no type. Navigation never stops the program, and the readers
+// return their failures as errors.
+test.start("lang: json dynamic", void () -> {
+    h.expectOutput(`
+import 'json';
+
+Json? raw = json.parse('{"name":"api","port":8080,"tls":{"on":false},"tags":["a","b"]}')
+    catch e { print(e.message); };
+if (raw != null) {
+    print(json.getType(raw) == json.Type.OBJECT);
+    print(json.asText(raw["name"]) catch "?");
+    print(json.asInt(raw["port"]) catch -1);
+    print(json.asBool(raw["tls"]["on"]) catch true);
+
+    // An absent key is MISSING, and a chain through one does not trap.
+    print(json.getType(raw["nope"]) == json.Type.MISSING);
+    print(json.getType(raw["a"]["b"]["c"]) == json.Type.MISSING);
+
+    // Arrays.
+    print(json.length(raw["tags"]));
+    print(json.asText(raw["tags"][1]) catch "?");
+    print(json.getType(raw["tags"][9]) == json.Type.MISSING);
+    forEach(json.keys(raw), k) { printInline(k + " "); }
+    print("");
+
+    // Asking for the wrong shape is catchable, not fatal.
+    print(json.asInt(raw["name"]) catch -1);
+}
+
+// So is a malformed document.
+Json? bad = json.parse("{oops") catch e { print("caught"); };
+print(bad == null);
+`, [
+        "true", "api", "8080", "false", "true", "true", "2", "b", "true",
+        "name port tls tags ", "-1", "caught", "true",
+    ]);
+});
+
+// A key that is present with the value null is different from an absent key.
+test.start("lang: json null is not missing", void () -> {
+    h.expectOutput(`
+import 'json';
+
+Json? d = json.parse('{"a":null}') catch e { print(e.message); };
+if (d != null) {
+    print(json.getType(d["a"]) == json.Type.NULL);
+    print(json.getType(d["b"]) == json.Type.MISSING);
+    print(json.toText(d));
+}
+`, [
+        "true", "true", "{\"a\":null}",
+    ]);
+});
+
+// A read aliases into the tree; a write deep-copies into it.
+test.start("lang: json writing", void () -> {
+    h.expectOutput(`
+import 'json';
+
+Json? w = json.parse('{"a":1,"nested":{"x":10}}') catch e { print(e.message); };
+if (w != null) {
+    w["a"] = 2;
+    w["added"] = "new";
+    w["flag"] = true;
+    w["ratio"] = 0.5;
+    w["list"] = [1, 2, 3];
+    w["nothing"] = null;
+
+    // A read is a view: writing through it changes the document.
+    Json nested = w["nested"];
+    nested["x"] = 11;
+    nested["y"] = 12;
+
+    json.push(w["list"], 4);
+    w["list"][0] = 9;
+    json.remove(w, "flag");
+    print(json.toText(w));
+
+    // A write copies: the source cannot be changed through the document.
+    Json? src = json.parse('{"k":1}') catch e { print(e.message); };
+    if (src != null) {
+        w["copied"] = src;
+        src["k"] = 99;
+        print(json.toText(w["copied"]));
+    }
+}
+`, [
+        "{\"a\":2,\"nested\":{\"x\":11,\"y\":12},\"added\":\"new\",\"ratio\":0.5,\"list\":[9,2,3,4],\"nothing\":null}",
+        "{\"k\":1}",
+    ]);
+});
+
+// A json* field keeps the undeclared keys and writes them back with the
+// declared fields.
+test.start("lang: json catch all", void () -> {
+    h.expectOutput(`
+import 'json';
+
+type Tls    { bool enabled; String cert;  Json extra 'json*'; }
+type Config { String name; int port; Tls tls; Json extra 'json*'; }
+
+String migrate(String text) {
+    Config c = json.parse(text) as Config;
+    c.port = c.port + 1;
+    c.tls.enabled = true;
+
+    Json limits = c.extra["limits"];
+    if (json.getType(limits) == json.Type.OBJECT) {
+        limits["rate"] = json.asInt(limits["rate"]) * 2;
+    }
+    c.extra["added"] = true;
+    json.remove(c.extra, "drop");
+    return json.toText(c);
+}
+
+String? out = migrate('{"name":"api","port":8080,"tls":{"enabled":false,"cert":"/c","min":"1.2"},"owner":"me","limits":{"rate":100},"drop":true}')
+    catch e { print(e.message); };
+print(out);
+
+// A record with a catch-all and no unknown keys leaves an empty object,
+// not a missing one, so a program can still write into it.
+type Small { int n; Json rest 'json*'; }
+Small? s = json.parse('{"n":1}') as Small catch e { print(e.message); };
+if (s != null) {
+    print(json.getType(s.rest) == json.Type.OBJECT);
+    s.rest["late"] = 1;
+    print(json.toText(s));
+}
+`, [
+        "{\"name\":\"api\",\"port\":8081,\"tls\":{\"enabled\":true,\"cert\":\"/c\",\"min\":\"1.2\"},\"owner\":\"me\",\"limits\":{\"rate\":200},\"added\":true}",
+        "true", "{\"n\":1,\"late\":1}",
+    ]);
+});
+
+// strict refuses a key the type does not declare, at every depth.
+test.start("lang: json strict", void () -> {
+    h.expectOutput(`
+import 'json';
+
+type Inner  { int b; }
+type Limits { int rate; Inner inner; }
+
+Limits? ok = json.parse('{"rate":1,"inner":{"b":2}}') strict as Limits
+    catch e { print(e.message); };
+print(ok?.rate);
+
+Limits? typo = json.parse('{"rat":1,"inner":{"b":2}}') strict as Limits
+    catch e { print(e.message); };
+print(typo == null);
+
+// At every depth: a typo inside inner is the same bug as one at the top.
+Limits? deep = json.parse('{"rate":1,"inner":{"c":2,"b":3}}') strict as Limits
+    catch e { print(e.message); };
+print(deep == null);
+
+// Without strict the same documents parse and the extra key is dropped.
+Limits? loose = json.parse('{"rate":7,"inner":{"b":2},"rat":1}') as Limits
+    catch e { print(e.message); };
+print(loose?.rate);
+`, [
+        "1", "cannot parse JSON: unknown key \"rat\"", "true",
+        "cannot parse JSON: unknown key \"c\" at inner", "true", "7",
+    ]);
+});
+
+test.start("lang: json as on tree", void () -> {
+    h.expectOutput(`
+import 'json';
+import 'string';
+
+type Circle { String type; float r; }
+type Square { String type; float side; }
+
+Json[]? shapes = json.parse('[{"type":"circle","r":2},{"type":"square","side":3},{"type":"circle"}]')
+    as Json[] catch e { print(e.message); };
+
+if (shapes != null) {
+    forEach(shapes, it) {
+        String tag = json.asText(it["type"]) catch "";
+        if (tag == "circle") {
+            Circle? c = it as Circle catch e { print(e.message); };
+            if (c != null) { print("circle " + string.from(c.r)); }
+        }
+        if (tag == "square") {
+            Square? s = it as Square catch e { print(e.message); };
+            if (s != null) { print("square " + string.from(s.side)); }
+        }
+    }
+}
+`, [
+        "circle 2", "square 3", "cannot parse JSON: missing field at r",
+    ]);
+});
+
+// A NUMBER node records that it holds an integer. A double would round this
+// value.
+test.start("lang: json big integer round trips", void () -> {
+    h.expectOutput(`
+import 'json';
+
+Json? d = json.parse('{"id":9007199254740993,"f":0.5,"neg":-9007199254740993}')
+    catch e { print(e.message); };
+if (d != null) {
+    print(json.toText(d));
+    print(json.asInt(d["id"]) catch -1);
+}
+`, [
+        "{\"id\":9007199254740993,\"f\":0.5,\"neg\":-9007199254740993}",
+        "9007199254740993",
+    ]);
+});
+
+test.start("lang: json composes", void () -> {
+    h.expectOutput(`
+import 'json';
+import 'string';
+
+type Log { int id; Json[] events; Map<String, Json> meta; }
+
+Log? log = json.parse('{"id":42,"events":[1,"s",{"p":5},null,[1,2]],"meta":{"a":1,"b":"two"}}')
+    as Log catch e { print(e.message); };
+
+if (log != null) {
+    print(log.id);
+    forEach(log.events, e) { printInline(string.from(json.getType(e)) + " "); }
+    print("");
+    Json? a = log.meta["a"];
+    if (a != null) { print(json.getType(a) == json.Type.NUMBER); }
+    print(json.toText(log));
+}
+`, [
+        "42", "NUMBER STRING OBJECT NULL ARRAY ", "true",
+        "{\"id\":42,\"events\":[1,\"s\",{\"p\":5},null,[1,2]],\"meta\":{\"a\":1,\"b\":\"two\"}}",
+    ]);
+});
+
+// A handler dispatches on Error.code (§2.9). The message is prose.
+test.start("lang: error code", void () -> {
+    h.expectOutput(`
+import 'fs';
+
+enum Mine { BAD_INPUT: 100, TOO_BIG: 101 }
+
+// A library failure carries a code from the documented set.
+byte[]? d = fs.readFile("no-such-file-anywhere.txt") catch e {
+    print(e.code == fs.ErrorCode.NOT_FOUND);
+    print(e.code == fs.ErrorCode.PERMISSION);
+};
+print(d == null);
+
+// An Error written without one carries 0.
+String plain() { return Error("plain"); }
+String? a = plain() catch e { print(e.code); };
+
+// And a program declares its own set, which widens to the int field.
+String mine() { return Error("mine", Mine.TOO_BIG); }
+String? b = mine() catch e {
+    print(e.code == Mine.TOO_BIG);
+    print(e.message);
+};
+print(a == null && b == null);
+`, [
+        "true", "false", "true", "0", "true", "mine", "true",
+    ]);
+});
+
+// strict is a modifier only directly before an as. In other positions it is an
+// ordinary name.
+test.start("lang: strict is contextual", void () -> {
+    h.expectOutput(`
+import 'json';
+
+type P { int n; }
+
+int strict = 7;
+print(strict);
+
+// A variable called strict, and a strict parse, in the same expression.
+P? p = json.parse('{"n":1}') strict as P catch e { print(e.message); };
+if (p != null) { print(p.n + strict); }
+
+void strictly(bool strict) { print(strict); }
+strictly(true);
+`, [
+        "7", "8", "true",
+    ]);
+});
+
+// The regexp language surface (§6.14). A RegExp is a value that a program can
+// name, hold, pass and store. tests/regexp_test.nio tests the engine.
+test.start("lang: regexp module", void () -> {
+    h.expectOutput(`
+import 'regexp';
+
+RegExp mySearchRegexp = regexp.create("ab+c", "i");
+print(regexp.find("xxABBBCyy", mySearchRegexp));
+print(regexp.match("xxABBBCyy", mySearchRegexp));
+print(regexp.match("xxacyy", mySearchRegexp));
+print(regexp.find("nothing here", mySearchRegexp));
+
+// The flags argument may be left off, which means no flags at all.
+RegExp digits = regexp.create("[0-9]+");
+print(regexp.find("abc 4321 def", digits));
+print(regexp.match("abc", digits));
+
+// A RegExp is an ordinary value: passed, returned, held in an array.
+int countMatches(String[] lines, RegExp re) {
+    int n = 0;
+    forEach(lines, line) {
+        if (regexp.match(line, re)) { n++; }
+    }
+    return n;
+}
+print(countMatches(["a1", "bb", "c3"], digits));
+
+RegExp[] all = [mySearchRegexp, digits];
+print(regexp.match("abbc", all[0]));
+print(all.length);
+`, [
+        "2", "true", "false", "-1", "4", "false", "2", "true", "2",
+    ]);
+});
+
+// One line for each construct in §6.14, so a missing construct fails here.
+test.start("lang: regexp pattern syntax", void () -> {
+    h.expectOutput(`
+import 'regexp';
+
+bool m(String pattern, String flags, String subject) {
+    return regexp.match(subject, regexp.create(pattern, flags));
+}
+
+print(m("a.c", "", "abc"));            // . is any byte
+print(m("a.c", "", "a\\nc"));           // but not a newline
+print(m("a.c", "s", "a\\nc"));          // unless the s flag says so
+print(m("^abc$", "", "abc"));          // anchors
+print(m("^b", "", "a\\nb"));            // ^ is the text, not the line
+print(m("^b", "m", "a\\nb"));           // until the m flag says otherwise
+print(m("colou?r", "", "color"));      // ?
+print(m("ab+c", "", "abbbc"));         // +
+print(m("ab*c", "", "ac"));            // *
+print(m("a{2,3}", "", "aa"));          // counted
+print(m("a{4}", "", "aaa"));
+print(m("cat|dog", "", "hotdog"));     // alternation
+print(m("(ab)+c", "", "ababc"));       // groups
+print(m("(?:ab)+c", "", "ababc"));     // and their non-capturing spelling
+print(m("[aeiou]", "", "xyz"));        // classes
+print(m("[^aeiou]", "", "xyz"));
+print(m("[a-f]", "", "d"));
+print(m("\\\\d\\\\d", "", "a42"));         // shorthands
+print(m("\\\\w+", "", "  "));
+print(m("\\\\s", "", "a b"));
+print(m("\\\\bcat\\\\b", "", "the cat"));  // word boundaries
+print(m("\\\\bcat\\\\b", "", "concat"));
+print(m("a\\\\+b", "", "a+b"));          // escaped metacharacters
+print(m("HELLO", "i", "hello"));       // case folding
+print(m("[a-f]+", "i", "DEAF"));
+`, [
+        "true", "false", "true", "true", "false", "true", "true", "true", "true",
+        "true", "false", "true", "true", "true", "false", "true", "true", "true",
+        "false", "true", "true", "false", "true", "true", "true",
+    ]);
+});
+
+// Patterns come from outside the program, so regexp.create is fallible (§6.14).
+test.start("lang: regexp create is fallible", void () -> {
+    h.expectOutput(`
+import 'regexp';
+import 'string';
+
+RegExp? bad = regexp.create("a(b") catch e {
+    print(e.message);
+    // The library's one ErrorCode enum, named through the module that raised.
+    print(e.code == regexp.ErrorCode.INVALID);
+    print(e.code == string.ErrorCode.INVALID);
+};
+print(bad == null);
+
+// The failure propagates like any other, so a function that compiles a
+// pattern is inferred fallible without saying so.
+RegExp compile(String p) { return regexp.create(p, "i"); }
+RegExp? ok = compile("x+") catch e { print("unreachable"); };
+print(ok != null);
+RegExp? no = compile("[z-a]") catch e { print(string.contains(e.message, "range")); };
+print(no == null);
+`, [
+        "regexp.create \"a(b\": unmatched (", "true", "true", "true", "true", "true",
+        "true",
+    ]);
+});
+
+test.start("lang: regexp bad pattern aborts", void () -> {
+    h.expectRuntimeError(`
+import 'regexp';
+
+RegExp re = regexp.create("*oops");
+print(regexp.match("x", re));
+`, "regexp.create \"*oops\": nothing to repeat");
+});
+
+// Use of a RegExp that was never created is a program error. It cannot be
+// caught.
+test.start("lang: regexp uninitialized panics", void () -> {
+    h.expectRuntimeError(`
+import 'regexp';
+
+RegExp re;
+print(regexp.match("x", re));
+`, "use of a RegExp that was never created");
+});
+
+// The engine is a Thompson NFA simulation (§6.14). A backtracking engine does
+// not finish this case in practical time.
+test.start("lang: regexp no catastrophic backtracking", void () -> {
+    h.expectOutput(`
+import 'regexp';
+
+String subject = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+print(regexp.match(subject, regexp.create("(a+)+b")));
+print(regexp.match(subject, regexp.create("(a|a)*b")));
+print(regexp.match(subject, regexp.create("(a*)*b")));
+print(regexp.match(subject + "b", regexp.create("(a+)+b")));
+print(regexp.find(subject + "b", regexp.create("(a|aa)+b")));
+`, [
+        "false", "false", "false", "true", "0",
+    ]);
+});
+
+// A record holds its own descriptor. In a base-typed slot, an extender keeps
+// its fields, its tracing and its JSON form.
+test.start("lang: sealed upcast", void () -> {
+    h.expectOutput(`
+import 'json';
+
+sealed type Expr { int line; }
+type IntLit extends Expr { int value; }
+type Ident  extends Expr { String name; }
+
+IntLit a = { line: 1, value: 42 };
+Ident  b = { line: 2, name: "x" };
+
+Expr e = a;
+print(e.line);
+
+Expr[] all = [a, b];
+forEach(all, x) { print(x.line); }
+
+// Serialized as the type it is, not the type of the slot it arrived in.
+print(json.toText(e));
+`, [
+        "1", "1", "2", "{\"line\":1,\"value\":42}",
+    ]);
+});
+
+test.start("lang: sealed downcast", void () -> {
+    h.expectOutput(`
+sealed type Expr { int line; }
+type IntLit extends Expr { int value; }
+type Ident  extends Expr { String name; }
+
+IntLit a = { line: 1, value: 42 };
+Ident  b = { line: 2, name: "x" };
+Expr[] all = [a, b];
+
+forEach(all, e) {
+    IntLit? lit = e as IntLit;
+    if (lit != null) { print("int", lit.value); }
+    Ident? id = e as Ident;
+    if (id != null) { print("ident", id.name); }
+}
+`, [
+        "int 42", "ident x",
+    ]);
+});
+
+// An exhaustive type switch needs no default and counts as terminating (§4.9).
+test.start("lang: sealed type switch", void () -> {
+    h.expectOutput(`
+import 'string';
+
+sealed type Expr { int line; }
+type IntLit extends Expr { int value; }
+type Ident  extends Expr { String name; }
+type Binary extends Expr { String op; Expr left; Expr right; }
+
+String render(Expr e) {
+    switch (e) {
+        case IntLit n:
+            return string.from(n.value);
+        case Ident n:
+            return n.name;
+        case Binary n:
+            return "(" + render(n.left) + " " + n.op + " " + render(n.right) + ")";
+    }
+}
+
+IntLit two = { line: 1, value: 2 };
+Ident  x   = { line: 1, name: "x" };
+Binary sum = { line: 1, op: "+", left: two, right: x };
+Binary out = { line: 1, op: "*", left: sum, right: two };
+print(render(out));
+`, [
+        "((2 + x) * 2)",
+    ]);
+});
+
+// Narrowing makes the receiver's type known, so the override of that type runs.
+test.start("lang: sealed method after narrowing", void () -> {
+    h.expectOutput(`
+sealed type Shape {
+    int sides;
+    String describe() { return "a shape"; }
+}
+type Square extends Shape {
+    String override describe() { return "a square"; }
+}
+type Tri extends Shape {
+    String override describe() { return "a triangle"; }
+}
+
+Square sq = { sides: 4 };
+Tri    tr = { sides: 3 };
+Shape[] shapes = [sq, tr];
+forEach(shapes, s) {
+    switch (s) {
+        case Square q:
+            print(q.describe());
+        case Tri q:
+            print(q.describe());
+    }
+}
+`, [
+        "a square", "a triangle",
+    ]);
+});
+
+// The collector traces the extra reference fields of an extender that is in a
+// base-typed slot.
+test.start("lang: sealed upcast survives collection", void () -> {
+    h.StressRun sr = h.runStressed(`
+sealed type Node { int tag; }
+type Labelled extends Node { String label; String[] parts; }
+
+// The base-typed slot is what this is about, but a sealed type cannot be
+// constructed (§2.4), so the slot is seeded with an extender.
+Labelled seed = { tag: 0, label: "", parts: [] };
+Node hold = seed;
+int i;
+while (i < 2000) {
+    Labelled l = { tag: i, label: "n" + "ame", parts: ["a" + "b", "c" + "d"] };
+    hold = l;
+    i = i + 1;
+}
+Labelled? last = hold as Labelled;
+if (last != null) {
+    print(last.label, last.parts[0], last.parts[1], last.parts.length);
+}
+`);
+    test.expectString(sr.stressed.out, "name ab cd 2\n");
+});
+
+// A sealed type is not one of its own extenders, so a value of it would match
+// no clause of an exhaustive type switch (§4.9).
+test.start("lang: a sealed type cannot be constructed", void () -> {
+    h.expectCompileError(`
+sealed type Shape { int sides; }
+type Circle extends Shape { int r; }
+Shape s = { sides: 7 };
+`, "cannot construct Shape");
+});
+
+// The zero value of a sealed type is null. An exhaustive switch reports it at
+// the switch, and not as a missing return several frames later.
+test.start("lang: an unassigned sealed value is reported at the switch", void () -> {
+    h.expectRuntimeError(`
+sealed type Shape { int sides; }
+type Circle extends Shape { int r; }
+type Square extends Shape { int side; }
+
+String name(Shape s) {
+    switch (s) {
+        case Circle c: return "circle";
+        case Square q: return "square";
+    }
+}
+Shape unset;
+print(name(unset));
+`, "switch on a Shape that was never assigned");
+});
+
+// A base-typed read is a load at a fixed offset valid for every extender.
+test.start("lang: a sealed base still carries fields and recurses", void () -> {
+    h.expectOutput(`
+sealed type TypeNode { int line; }
+type NameNode  extends TypeNode { String name; }
+type ArrayNode extends TypeNode { TypeNode elem; }
+
+int lineOf(TypeNode t) { return t.line; }
+
+String render(TypeNode t) {
+    switch (t) {
+        case NameNode n:  return n.name;
+        case ArrayNode n: return render(n.elem) + "[]";
+    }
+}
+
+NameNode  i  = { line: 3, name: "int" };
+ArrayNode ia = { line: 4, elem: i };
+print(render(ia), lineOf(ia));
+`, ["int[] 4"]);
+});
+
+// A union is a sealed base with one generated record for each member. Each
+// record holds its value in a field that no identifier can name (§1.3). Rule 7
+// wraps a value in its member.
+test.start("lang: union wraps and matches", void () -> {
+    h.expectOutput(`
+import 'string';
+union Text { String, byte[] Bytes }
+
+String render(Text t) {
+    switch (t) {
+        case Text.String v: return "chars(" + v + ")";
+        case Text.Bytes  v: return "bytes(" + string.fromByteArray(v) + ")";
+    }
+}
+
+Text a = "hi";                          // rule 7: exactly one member accepts
+Text b = string.toByteArray("raw");
+print(render(a));
+print(render(b));
+`, ["chars(hi)", "bytes(raw)"]);
+});
+
+// A member typed with a single capitalized name takes its tag from the type.
+test.start("lang: a union member tags itself", void () -> {
+    h.expectOutput(`
+import 'string';
+enum ADC { IMM: 105, ZP: 101 }
+enum AND { IMM: 41,  ZP: 37  }
+union Opcode { ADC, AND }
+
+String name(Opcode op) {
+    switch (op) {
+        case Opcode.ADC m: return "ADC " + string.from(m);
+        case Opcode.AND m: return "AND " + string.from(m);
+    }
+}
+
+Opcode a = ADC.IMM;
+Opcode b = AND.ZP;
+print(name(a));
+print(name(b));
+`, ["ADC IMM", "AND ZP"]);
+});
+
+// A function goes into a union only through a named member. §2.9 decides a
+// literal's contract from its expected type, before rule 7 can infer a member.
+test.start("lang: union construction names the member", void () -> {
+    h.expectOutput(`
+import 'string';
+type Req { String path }
+type Res { int status }
+
+union Handler {
+    Function(Req)<Res!>        Sync,
+    Function(Req)<Future<Res>> Async
+}
+
+Res okSync(Req r)        { return { status: 200 }; }
+Res badSync(Req r)       { return Error("boom"); }
+Res async okAsync(Req r) { return { status: 202 }; }
+
+Res async run(Handler h, Req req) {
+    switch (h) {
+        case Handler.Sync  f: return f(req) catch e { return { status: 500 }; };
+        case Handler.Async f: return await f(req);
+    }
+}
+
+Handler a = Handler.Sync(Res (Req r) -> okSync(r));
+Handler b = Handler.Sync(Res (Req r) -> badSync(r));
+Handler c = Handler.Async(Future<Res> (Req r) -> okAsync(r));
+Req q = { path: "/" };
+forEach([a, b, c], hh) {
+    Res got = await run(hh, q);
+    print(string.from(got.status));
+}
+`, ["200", "500", "202"]);
+});
+
+// The message names the tag in the source, never the generated record.
+test.start("lang: a union switch must cover every member", void () -> {
+    h.expectCompileError(`
+union Text { String, byte[] Bytes, int Count }
+String render(Text t) {
+    switch (t) {
+        case Text.String v: return "s";
+        case Text.Bytes  v: return "b";
+    }
+}
+print(render("hi"));
+`, "add Text.Count");
+});
+
+// Two members can accept the same value, so the error is at the assignment.
+test.start("lang: an ambiguous union member must be named", void () -> {
+    h.expectCompileError(`
+union Distance { float Meters, float Feet }
+Distance d = 3.0;
+print("unreachable");
+`, "cannot tell which member of Distance");
+});
+
+// On a union, as gives the value the member holds, because no program can name
+// the payload field.
+test.start("lang: as narrows a union to what the member holds", void () -> {
+    h.expectOutput(`
+import 'string';
+union Text { String, byte[] Bytes, int Count }
+Text a = "hi";
+Text b = 7;
+
+String? s = a as Text.String;
+if (s != null) { print("string: " + s); }
+print(a as Text.Count == null);            // a is not a Count
+int? m = b as Text.Count;
+if (m != null) { print("count: " + string.from(m)); }
+`, ["string: hi", "true", "count: 7"]);
+});
+
+// as only narrows (§3.6). When as is written towards a union, the error tells
+// which direction is valid.
+test.start("lang: as towards a union says which way it goes", void () -> {
+    h.expectCompileError(`
+union Text { String, byte[] Bytes }
+Text greeting = "hello" as Text;
+print("unreachable");
+`, "String is already Text and needs no 'as'");
+    h.expectCompileError(`
+union Text { String, byte[] Bytes }
+int n = 5;
+Text t = n as Text;
+print("unreachable");
+`, "int is not Text, and 'as' cannot make it one: Text has members String, Bytes");
+    // A hand-written sealed type has extenders and no members.
+    h.expectCompileError(`
+sealed type Shape { int sides; }
+type Square extends Shape { int w; }
+Square q = { sides: 4, w: 2 };
+Shape s = q as Shape;
+print("unreachable");
+`, "'as' narrows Shape to one of the types extending it");
+    // A pair that is not a narrowing or a conversion gets the JSON message.
+    h.expectCompileError(`
+int x = "s" as int;
+print("unreachable");
+`, "'as' reads JSON into a type");
+});
+
+// A member from another module takes three segments: alias, union and tag.
+test.start("lang: a union crosses a module boundary", void () -> {
+    h.expectFilesOutput([
+        h.file("text.nio", `
+export union Text { String, byte[] Bytes }
+`),
+        h.file("main.nio", `
+import 'string';
+import './text' as tx;
+
+String render(tx.Text t) {
+    switch (t) {
+        case tx.Text.String v: return "chars(" + v + ")";
+        case tx.Text.Bytes  v: return "bytes(" + string.fromByteArray(v) + ")";
+    }
+}
+tx.Text a = "hi";
+tx.Text b = string.toByteArray("raw");
+print(render(a));
+print(render(b));
+String? s = a as tx.Text.String;
+if (s != null) { print("as: " + s); }
+`),
+    ], "main.nio", ["chars(hi)", "bytes(raw)", "as: hi"]);
+});
+
+// A union reads JSON by kind (§6.3). The value's JSON kind selects the member,
+// and the writer writes the payload with no wrapper.
+test.start("lang: a union parses from JSON by kind and round-trips", void () -> {
+    h.expectOutput(`
+import 'json';
+import 'string';
+
+union Price { String, int Amount }
+
+type Score { float average; int reviews }
+union Rating { Score, String Note }
+
+type Item {
+    Price price;
+    Rating rating;
+}
+
+String doc = '[{"price":"$16.99","rating":{"average":4.5,"reviews":10}},{"price":100,"rating":"nice"}]';
+Item[] items = json.parse(doc) as Item[];
+forEach(items, it) {
+    switch (it.price) {
+        case Price.String s: print("s " + s);
+        case Price.Amount n: print("n " + string.from(n));
+    }
+}
+print(json.toText(items) == doc);
+
+// The tree form of "as" takes the same dispatch.
+Json tree = json.parse(doc);
+print(json.toText(tree as Item[]) == doc);
+
+// A union value that was never parsed serializes the same way: the member
+// is representation, and its generated field never shows.
+Rating r = "great";
+print(json.toText(r));
+`, ["s $16.99", "n 100", "true", "true", '"great"']);
+});
+
+// A kind no member accepts fails at the value's path, in both forms of as.
+test.start("lang: a union refuses a JSON kind no member takes", void () -> {
+    h.expectOutput(`
+import 'json';
+union Price { String, int Amount }
+type Item { Price price; }
+
+Item? bad = json.parse('{"price":true}') as Item catch e { print(e.message); };
+print(bad == null);
+Json tree = json.parse('{"price":[1]}');
+Item? bad2 = tree as Item catch e { print(e.message); };
+print(bad2 == null);
+`, [
+        "cannot parse JSON: expected a string or a number at price",
+        "true",
+        "cannot parse JSON: expected a string or a number at price",
+        "true",
+    ]);
+});
+
+// JSON null belongs to an optional, never to a member.
+test.start("lang: an optional union field takes JSON null", void () -> {
+    h.expectOutput(`
+import 'json';
+union Price { String, int Amount }
+type Item { Price? price; }
+
+Item a = json.parse('{"price":null}') as Item;
+Item b = json.parse('{}') as Item;
+Item c = json.parse('{"price":7}') as Item;
+print(a.price == null);
+print(b.price == null);
+Price? p = c.price;
+if (p != null) { print(json.toText(p)); }
+`, ["true", "true", "7"]);
+});
+
+// The dispatch is sound because no two members read from the same kind. The
+// checker checks this where the as is written.
+test.start("lang: a union the kinds cannot tell apart will not parse", void () -> {
+    h.expectCompileError(`
+import 'json';
+union Bad { int I, float F }
+Bad b = json.parse("1") as Bad;
+`, "members I and F are both read from a number");
+});
+
+test.start("lang: a union with a Json member will not parse", void () -> {
+    h.expectCompileError(`
+import 'json';
+union Bad { String, Json J }
+Bad b = json.parse("1") as Bad;
+`, "member J is a Json");
+});
+
+test.start("lang: a DateTime member reads as a string", void () -> {
+    h.expectCompileError(`
+import 'json';
+union Bad { String, DateTime When }
+Bad b = json.parse("1") as Bad;
+`, "members String and When are both read from a string");
+});
+
+test.start("lang: a sealed type is not a JSON target", void () -> {
+    h.expectCompileError(`
+import 'json';
+sealed type Shape { }
+type Circle extends Shape { float r; }
+Shape s = json.parse("{}") as Shape;
+`, "Shape is sealed, and a document names no type to build");
+});
+
+// A literal's member comes from its written signature. Fallibility is the only
+// difference a literal can cross, so this needs no tag.
+test.start("lang: a function literal finds its union member", void () -> {
+    h.expectOutput(`
+import 'string';
+type Req { String path }
+type Res { int status }
+
+union Handler {
+    Function(Req)<Res!>        Sync,
+    Function(Req)<Future<Res>> Async
+}
+
+Res okSync(Req r)        { return { status: 200 }; }
+Res badSync(Req r)       { return Error("boom"); }
+Res async okAsync(Req r) { return { status: 202 }; }
+
+Res async run(Handler h, Req req) {
+    switch (h) {
+        case Handler.Sync  f: return f(req) catch e { return { status: 500 }; };
+        case Handler.Async f: return await f(req);
+    }
+}
+
+Handler a = Res (Req r) -> okSync(r);            // no tag written
+Handler b = Res (Req r) -> badSync(r);
+Handler c = Future<Res> (Req r) -> okAsync(r);
+
+Req q = { path: "/" };
+forEach([a, b, c], hh) {
+    Res got = await run(hh, q);
+    print(string.from(got.status));
+}
+`, ["200", "500", "202"]);
+});
+
+// An unknown tag is reported as a tag, never as an unknown module.
+test.start("lang: a union reports an unknown tag", void () -> {
+    h.expectCompileError(`
+union Text { String, byte[] Bytes }
+void f(Text t) {
+    switch (t) {
+        case Text.Nope v: return;
+        default: return;
+    }
+}
+`, "union Text has no member tagged");
+});
+
+// An async variadic packs its arguments before the frame is built.
+test.start("lang: variadic across modules", void () -> {
+    h.expectFilesOutput([
+        h.file("strings.nio", `
+export String join(String sep, ...String parts) {
+    String out = "";
+    forEach(parts, p, i) {
+        if (i > 0) {
+            out = out + sep;
+        }
+        out = out + p;
+    }
+    return out;
+}
+export int async count(...int ns) {
+    return ns.length;
+}
+`),
+        h.file("main.nio", `
+import './strings.nio' as s;
+print(s.join("-", "a", "b", "c"));
+print(s.join("-"));
+print(await s.count(1, 2, 3, 4));
+`),
+    ], "main.nio", ["a-b-c", "", "4"]);
+});
+
+// The module that declares the type emits its methods
+// (@fn.<qual>.<Type>.<name>). An importer calls that module's body, also when
+// the method is fallible.
+test.start("lang: methods across modules", void () -> {
+    h.expectFilesOutput([
+        h.file("shapes.nio", `
+export type Rect {
+    int w;
+    int h;
+
+    int area() { return self.w * self.h; }
+
+    void scale(int by) {
+        self.w = self.w * by;
+        self.h = self.h * by;
+    }
+
+    int checked() {
+        if (self.w <= 0) {
+            return Error("empty rect");
+        }
+        return self.area();
+    }
+}
+
+export Rect unit = { w: 1, h: 1 };
+`),
+        h.file("main.nio", `
+import './shapes.nio';
+
+shapes.Rect r = { w: 3, h: 4 };
+print(r.area());
+r.scale(2);
+print(r.area());
+print(shapes.unit.area());
+print(r.checked() catch -1);
+r.w = 0;
+print(r.checked() catch -1);
+`),
+    ], "main.nio", ["12", "48", "1", "48", "-1"]);
+});
+
+// array.sort calls back into Nio, so the comparator can allocate and collect at
+// each comparison. Its scratch space is a second Nio array, rooted with the
+// closure.
+test.start("lang: GC stress array sort", void () -> {
+    h.expectSameUnderStress(`
+import 'array';
+import 'string';
+import 'json';
+
+// Every comparison builds two strings, so under stress every comparison
+// collects while the sort holds all 200 elements.
+String[] words = [];
+for (int i = 0; i < 200; i++) {
+    array.push(words, string.append("w", string.from((i * 37) % 200)));
+}
+array.sort(words, bool (String x, String y) -> string.append(x, "!") < string.append(y, "!"));
+print(words[0], words[1], words[199]);
+
+// Record elements: pointers whose only root is the array being sorted.
+type Item { String tag; int key; }
+Item[] items = [];
+for (int i = 0; i < 150; i++) {
+    array.push(items, { tag: string.from(i), key: (i * 91) % 150 });
+}
+array.sort(items, bool (Item x, Item y) -> string.append(x.tag, "") != "" && x.key < y.key);
+print(items[0].key, items[149].key, items[0].tag);
+
+// slice's own allocation, with the source live across it.
+int[] ns = [];
+for (int i = 0; i < 100; i++) { array.push(ns, (i * 7) % 100); }
+array.sort(ns);
+print(array.indexOf(ns, 42), json.toText(array.slice(ns, 97)));
+`, "w0 w1 w99\n0 149 0\n42 [97,98,99]\n");
+});
+
+// A compiled RegExp is one GC block with no pointers, so TD_REGEXP marks it and
+// does not walk it. The block must still be marked.
+test.start("lang: GC stress regexp", void () -> {
+    h.expectContains(h.sameUnderStress(`
+import 'regexp';
+import 'string';
+
+int hits = 0;
+String last = "";
+for (int i = 0; i < 200; i++) {
+    RegExp re = regexp.create(string.append("a", "b+c"), string.toLowerCaseAscii("I"));
+    if (regexp.match(string.append("xxAB", "BCyy"), re)) { hits++; }
+    last = string.append("at ", string.from(regexp.find("zzabbc", re)));
+}
+print(hits);
+print(last);
+
+// A RegExp held across allocations of its own, and one that is only ever a
+// temporary. Neither may be collected while it is in use.
+RegExp kept = regexp.create("[0-9]+");
+String junk = "";
+for (int i = 0; i < 500; i++) { junk = string.append(junk, "x"); }
+print(regexp.find(string.append(junk, "42"), kept));
+print(regexp.match("7", regexp.create(string.append("[0-", "9]"))));
+`), "200\nat 2\n500\ntrue");
+});
+
+// These sizes are where a bottom-up merge changes shape. The values repeat, so
+// the sort has ties to break.
+test.start("lang: array sort matches reference", void () -> {
+    forEach([2, 3, 7, 8, 9, 33, 1000, 2001], n) {
+        int[] values = [];
+        for (int i = 0; i < n; i++) {
+            array.push(values, (i * 7919) % 101);
+        }
+        String[] parts = [];
+        forEach(values, v) {
+            array.push(parts, string.from(v));
+        }
+        String literal = string.join(parts, ",");
+        String[] wantParts = [];
+        forEach(sortedCopy(values), v) {
+            array.push(wantParts, string.from(v));
+        }
+        h.Run r = h.runProgram(`
+import 'array';
+import 'string';
+
+int[] xs = [` + literal + `];
+array.sort(xs);
+String out = "";
+forEach(xs, v, i) {
+    if (i > 0) { out = out + ","; }
+    out = out + string.from(v);
+}
+print(out);
+
+// The comparator form over the same input must agree with it.
+int[] ys = [` + literal + `];
+array.sort(ys, bool (int a, int b) -> a < b);
+String other = "";
+forEach(ys, v, i) {
+    if (i > 0) { other = other + ","; }
+    other = other + string.from(v);
+}
+print(other == out);
+`);
+        if (r.code != 0) {
+            return Error("n=" + string.from(n) + ": exit code " + string.from(r.code)
+                + "\n" + r.err);
+        }
+        String want = string.join(wantParts, ",") + "\ntrue\n";
+        if (r.out != want) {
+            return Error("n=" + string.from(n) + ": got \"" + r.out + "\", want \""
+                + want + "\"");
+        }
+    }
+});
+
+test.start("lang: array slice out of range", void () -> {
+    String[] calls = [
+        "array.slice(ns, 0, 9)", "array.slice(ns, -1)",
+        "array.slice(ns, 3, 2)", "array.slice(ns, 5)",
+    ];
+    String[] wants = [
+        "slice [0, 9) out of range (array length 4)",
+        "slice [-1, 4) out of range (array length 4)",
+        "slice [3, 2) out of range (array length 4)",
+        "slice [5, 4) out of range (array length 4)",
+    ];
+    for (int i = 0; i < calls.length; i++) {
+        h.expectRuntimeError(`
+import 'array';
+int[] ns = [1, 2, 3, 4];
+` + calls[i] + `;
+`, wants[i]);
+    }
+});
+
+// substring's bounds are 0 <= start <= end <= length. It does not clamp them.
+test.start("lang: string substring out of range", void () -> {
+    forEach([
+        `string.substring("abc", -1, 2);`, `string.substring("abc", 0, 4);`,
+        `string.substring("abc", 2, 1);`,
+    ], src) {
+        h.expectRuntimeError("import 'string';\n" + src, "substring out of range");
+    }
+});
+
+// as T reports the path in the document where it stopped. The walk builds the
+// path as it descends.
+test.start("lang: JSON parse errors", void () -> {
+    String decl = `import 'json';
+type Car { String make; int age; { int n; }[] parts; }
+`;
+    String[] srcs = [
+        `Car c = json.parse('{"make":"v"}') as Car;`,
+        `Car c = json.parse('{"make":"v","age":"old","parts":[]}') as Car;`,
+        `Car c = json.parse('{"make":"v","age":1,"parts":[{"n":1},{"n":"x"}]}') as Car;`,
+        `Car c = json.parse('{"make":null,"age":1,"parts":[]}') as Car;`,
+        `Car c = json.parse('{"make":') as Car;`,
+        `Car c = json.parse('[1,2]') as Car;`,
+        `Car c = json.parse('{"make":"v","age":1,"parts":[]} junk') as Car;`,
+    ];
+    String[] wants = [
+        "cannot parse JSON: missing field at age",
+        "cannot parse JSON: expected a number at age",
+        "cannot parse JSON: expected a number at parts[1].n",
+        "unexpected null (the type is not optional) at make",
+        "cannot parse JSON",
+        "cannot parse JSON: expected an object",
+        "trailing text after the value",
+    ];
+    for (int i = 0; i < srcs.length; i++) {
+        h.expectRuntimeError(decl + srcs[i] + "\nprint(c.age);", wants[i]);
+    }
+});
+
+// The runtime checks the narrow unsigned ranges when it reads JSON. lib/json.c
+// keeps an integer too large for an int64 exact, and does not round it to a
+// double.
+test.start("lang: unsigned JSON range", void () -> {
+    String[] types = ["uint8", "uint8", "uint16", "uint32", "uint64", "uint64", "uint8"];
+    String[] docs = [
+        `{"v":256}`, `{"v":-1}`, `{"v":65536}`, `{"v":4294967296}`,
+        `{"v":18446744073709551616}`, `{"v":-1}`, `{"v":1.5}`,
+    ];
+    String[] wants = [
+        "uint8 out of range at v", "uint8 out of range at v",
+        "uint16 out of range at v", "uint32 out of range at v",
+        "uint64 out of range at v", "uint64 out of range at v",
+        "expected a whole number at v",
+    ];
+    for (int i = 0; i < types.length; i++) {
+        h.expectRuntimeError(`
+import 'json';
+type T { ` + types[i] + ` v; }
+T t = json.parse('` + docs[i] + `') as T;
+`, wants[i]);
+    }
+
+    // The largest uint64 is valid. A double would round it to 2^64 and reject
+    // it.
+    h.expectOutput(`
+import 'json';
+type T { uint64 v; }
+T t = json.parse('{"v":18446744073709551615}') as T;
+print(t.v);
+print(json.toText(t));
+`, ["18446744073709551615", `{"v":18446744073709551615}`]);
+});
+
+// A file claims a module name only for itself, so another module can export
+// the same name.
+test.start("lang: library name is per file", void () -> {
+    h.expectFilesOutput([
+        h.file("routes.nio", `
+export String path = "/from/routes";
+export String fs(String s) { return s + "!"; }
+`),
+        h.file("main.nio", `
+import 'path';
+import './routes.nio' as r;
+print(path.join("a", "b"));
+print(r.path, r.fs("x"));
+`),
+    ], "main.nio", [path.join("a", "b"), "/from/routes x!"]);
+});
+
+// Each print argument is live while the next one allocates, so all of them are
+// rooted before the call.
+test.start("lang: print arguments survive collection", void () -> {
+    h.expectOutput(`
+String repeat(String s, int n) {
+    String out = "";
+    for (int i = 0; i < n; i++) {
+        out = out + s;
+    }
+    return out;
+}
+print(repeat("a", 3), repeat("b", 4), repeat("c", 5));
+`, ["aaa bbbb ccccc"]);
+});
+
+// Counted repeats multiply, so a length check alone cannot find a pattern whose
+// compiled size is too large. Both failures are errors that a program can
+// catch.
+test.start("lang: regexp long patterns", void () -> {
+    String long = repeat("a", 15000);
+    String[] branches = [];
+    for (int i = 0; i < 4000; i++) {
+        array.push(branches, "kw" + string.from(i));
+    }
+    h.expectOutput(`
+import 'regexp';
+
+RegExp cat = regexp.create("` + long + `");
+print(regexp.match("` + long + `", cat));
+print(regexp.match("` + repeat("a", 14999) + `", cat));
+
+RegExp alt = regexp.create("` + string.join(branches, "|") + `");
+print(regexp.find("zzkw3999yy", alt));
+print(regexp.match("nope", alt));
+
+// Over the length limit, which is an ordinary catchable failure.
+RegExp? huge = regexp.create("` + repeat("b", 33000) + `") catch e {
+    print(e.message);
+};
+print(huge == null);
+
+// And the one the length limit cannot catch, since counted repeats multiply.
+RegExp? blown = regexp.create("(a{1000}){1000}") catch e { print(e.message); };
+print(blown == null);
+`, [
+        "true", "false", "2", "false",
+        `regexp.create "` + repeat("b", 200) + `": pattern too long`, "true",
+        `regexp.create "(a{1000}){1000}": pattern too large`, "true",
+    ]);
+});
+
+// ---- §3.1 bitwise operators ----
+// Each expected value is calculated by hand from the bit patterns.
+test.start("lang: bitwise operators", void () -> {
+    h.expectOutput(`
+int a = 12;      // 1100
+int b = 10;      // 1010
+print(a & b, a | b, a ^ b, ~a);
+print(a << 3, a >> 2, -13 >> 2);
+
+// The two families shift right differently, and that is the whole
+// difference: signed fills with the sign, unsigned with zeros.
+uint u = 12;
+uint zero = 0;
+uint all = ~zero;
+print(u >> 2, ~u, all >> 60);
+
+// & binds like *, and | and ^ bind like +. So the
+// comparison below means what it looks like:
+// (a & 12) == 12.
+print(1 | 2 ^ 3 & 2);
+print(a & 12 == 12);
+`, [
+        "8 14 6 -13", "96 3 -4",
+        "3 18446744073709551603 15", "1", "true",
+    ]);
+});
+
+// A shift past the width has a defined result (§3.1). LLVM's shl gives poison
+// there.
+test.start("lang: shifts past the width", void () -> {
+    h.expectOutput(`
+uint zero = 0;
+uint all = ~zero;
+int n = 64;
+print(1 << 64, 1 << n, -1 >> 64, -1 >> n);
+print(all >> 64, all >> n);
+// A variable count in range still shifts.
+int two = 2;
+print(12 >> two, 12 << two);
+`, ["0 0 -1 -1", "0 0", "3 48"]);
+});
+
+// A narrow operand shifts as its value, and not as the 8-byte unit that holds
+// it. genShift does not extend it, because the unit holds the value already
+// extended by its family.
+test.start("lang: shifts on narrow types", void () -> {
+    h.expectOutput(`
+byte b = 200;
+print(b >> 1, getType(b >> 1));       // unsigned: zeros come in
+int8 x = -100;
+print(x >> 1, getType(x >> 1));       // signed: the sign comes in
+
+// The count carries no family of its own (§3.1), so either family may
+// count for either.
+int i = -16;
+uint c = 2;
+print(i >> c, getType(i >> c));
+uint u = 16;
+int c2 = 2;
+print(u >> c2, getType(u >> c2));
+`, ["100 uint", "-50 int", "-4 int", "4 uint"]);
+});
+
+test.start("lang: negative shift count", void () -> {
+    h.expectRuntimeError(`
+int n = -1;
+print(1 << n);
+`, "negative shift count");
+});
+
+// ---- §3.6 numeric conversion ----
+// Each operator widens (§2.1), so as is the only way back to a narrow type.
+test.start("lang: numeric conversion", void () -> {
+    h.expectOutput(`
+byte a = 200;
+byte b = 55;
+byte[] out = [0, 0];
+out[0] = (a + b) as byte;        // 255 exactly
+out[1] = (a + b + 1) as byte;    // 256, which wraps
+print(out[0], out[1]);
+print(getType((a + b) as byte));
+
+// Reinterpreting between the families at one width, which assignment
+// refuses and this is the only spelling of.
+int i = -1;
+uint u = 4294967296;
+print(i as uint);
+print(u as uint32, u as int);
+
+// A float narrows in precision rather than in range.
+float f = 0.1;
+print(f as float32);
+`, ["255 0", "uint8", "18446744073709551615", "0 4294967296", "0.1"]);
+});
+
+test.start("lang: numeric conversion refusals", void () -> {
+    h.expectCompileError(`
+int i = 3;
+print(i as float);
+`, "'as' does not convert between int and float");
+    h.expectCompileError(`
+import 'time';
+DateTime t = time.now();
+print(t as int);
+`, "say so with time.milliseconds(x)");
+});
+
+// ---- §6.6 constant-time comparison ----
+test.start("lang: constant-time comparison", void () -> {
+    h.expectOutput(`
+import 'string';
+
+String token = "s3cr3t-token";
+print(string.equalsConstantTime(token, "s3cr3t-token"));
+print(string.equalsConstantTime(token, "s3cr3t-tokeX"));
+print(string.equalsConstantTime(token, "x"));
+print(string.equalsConstantTime("", ""));
+
+byte[] mac = string.toByteArray("abc");
+print(string.bytesEqualConstantTime(mac, string.toByteArray("abc")));
+print(string.bytesEqualConstantTime(mac, string.toByteArray("abd")));
+print(string.bytesEqualConstantTime(mac, string.toByteArray("ab")));
+print(string.bytesEqualConstantTime([], []));
+`, ["true", "false", "false", "true", "true", "false", "false", "true"]);
+});
+
+// ---- §2.12 noalloc ----
+test.start("lang: noalloc bodies", void () -> {
+    h.expectOutput(`
+import 'string';
+
+int noalloc ctSelect(int cond, int a, int b) {
+    int mask = -cond;                    // 0 or -1, no branch
+    return (a & mask) | (b & ~mask);
+}
+
+void noalloc xorInto(byte[] buf, byte[] key) {
+    for (int i = 0; i < buf.length; i++) {
+        buf[i] = (buf[i] ^ key[i % key.length]) as byte;
+    }
+}
+
+// A noalloc body may call another, and may use the allocation-free
+// built-ins.
+bool noalloc sameLength(String a, String b) {
+    return string.length(a) == string.length(b);
+}
+
+int noalloc twice(int x) { return ctSelect(1, x + x, 0); }
+
+print(ctSelect(1, 42, 99), ctSelect(0, 42, 99));
+print(twice(21));
+print(sameLength("abc", "xyz"), sameLength("abc", "xy"));
+
+byte[] data = string.toByteArray("hello world");
+byte[] key = string.toByteArray("k3y");
+xorInto(data, key);
+print(string.equalsConstantTime(string.fromByteArray(data), "hello world"));
+xorInto(data, key);
+print(string.fromByteArray(data));
+`, ["42 99", "42", "true false", "false", "hello world"]);
+});
+
+// Each way that a body can allocate is refused. The cases are the complement
+// of the whitelist in noteAlloc.
+test.start("lang: noalloc refusals", void () -> {
+    h.expectCompileError(`String noalloc f() { return "a" + "b"; }`,
+        "joining strings allocates the new one");
+    h.expectCompileError(`int[] noalloc f() { return [1, 2]; }`,
+        "an array literal allocates the array");
+    h.expectCompileError(`type P { int x; }
+P noalloc f() { P p = { x: 1 }; return p; }`,
+        "a record literal allocates the record");
+    h.expectCompileError(`Map<String, int> noalloc f() { return {"a": 1}; }`,
+        "a map literal allocates the map");
+    h.expectCompileError(`int noalloc f() { int? x = 1; return 0; }`,
+        "declaring x optional means boxing what goes in it");
+    h.expectCompileError(`int? noalloc f() { return 1; }`,
+        "returning an optional means boxing the value");
+    h.expectCompileError(`int noalloc f(int? x) { return 1; }`,
+        "an optional parameter means its caller boxes the value");
+    h.expectCompileError(`int noalloc f() { return g(); }
+int g() { return 1; }`,
+        "g is not declared noalloc");
+    h.expectCompileError(`void noalloc f() { Function(int)<int> g = int (int x) -> x; }`,
+        "a function value allocates the block");
+    h.expectCompileError(`int noalloc f() { return Error("x").code; }`,
+        "an Error is a record, so building one allocates it");
+    h.expectCompileError(`import 'string';
+String noalloc f(String s) { return string.trim(s); }`,
+        "string.trim allocates the value it answers");
+    h.expectCompileError(`import 'time';
+void noalloc f() { print(time.now()); }`,
+        "time.now allocates the value it answers");
+    // An async function allocates its frame before the body runs.
+    h.expectCompileError(`void noalloc async f() { }`,
+        "cannot be both async and noalloc");
+});
+
+// print writes through a stack buffer for every type but DateTime.
+test.start("lang: noalloc and print", void () -> {
+    h.expectOutput(`
+void noalloc f(int n) {
+    print("n is", n, getType(n));
+}
+f(7);
+`, ["n is 7 int"]);
+    h.expectCompileError(`import 'time';
+void noalloc f(DateTime t) { print(t); }`,
+        "printing a DateTime allocates the text it is rendered into");
+});
+
+test.start("lang: noalloc is contextual", void () -> {
+    h.expectOutput(`
+int noalloc = 5;
+void noalloc2() { print(noalloc); }
+noalloc2();
+print(noalloc + 1);
+`, ["5", "6"]);
+});
+
+// ---- §5.7 packing ----
+// An element occupies its own width. A program cannot see the layout, so a
+// wrong width shows as a wrong number.
+test.start("lang: packed array elements round-trip at every width", void () -> {
+    h.expectOutput(`
+int8[] a8 = [-128, 127, -1, 0];
+uint8[] b8 = [0, 255, 128, 1];
+int16[] a16 = [-32768, 32767, -1, 0];
+uint16[] b16 = [0, 65535, 32768, 1];
+int32[] a32 = [-2147483648, 2147483647, -1, 0];
+uint32[] b32 = [0, 4294967295, 2147483648, 1];
+float32[] f32 = [0.5, -0.5, 3.25, 0.0];
+bool[] bs = [true, false, true, false];
+
+print(a8[0], a8[1], a8[2], a8[3]);
+print(b8[0], b8[1], b8[2], b8[3]);
+print(a16[0], a16[1], a16[2], a16[3]);
+print(b16[0], b16[1], b16[2], b16[3]);
+print(a32[0], a32[1], a32[2], a32[3]);
+print(b32[0], b32[1], b32[2], b32[3]);
+print(f32[0], f32[1], f32[2], f32[3]);
+print(bs[0], bs[1], bs[2], bs[3]);
+
+// Written back through the other path: an assignment rather than a literal.
+a8[0] = 127; b8[0] = 255; a16[0] = 32767; b16[0] = 65535;
+a32[0] = 2147483647; b32[0] = 4294967295; f32[0] = -3.25; bs[0] = false;
+print(a8[0], b8[0], a16[0], b16[0]);
+print(a32[0], b32[0], f32[0], bs[0]);
+
+// And read back through forEach, which loads an element by a third path.
+forEach(a8, v) { printInline(v, " "); }
+print("");
+forEach(f32, v) { printInline(v, " "); }
+print("");
+`, [
+        "-128 127 -1 0",
+        "0 255 128 1",
+        "-32768 32767 -1 0",
+        "0 65535 32768 1",
+        "-2147483648 2147483647 -1 0",
+        "0 4294967295 2147483648 1",
+        "0.5 -0.5 3.25 0",
+        "true false true false",
+        "127 255 32767 65535",
+        "2147483647 4294967295 -3.25 false",
+        "127  127  -1  0  ",
+        "-3.25  -0.5  3.25  0  ",
+    ]);
+});
+
+// The array library reads and writes elements in C, through rt_arr_get and
+// rt_arr_set.
+test.start("lang: the array library at every width", void () -> {
+    h.expectOutput(`
+import 'array';
+
+byte[] b = [3, 1, 2];
+array.push(b, 255 as byte);
+array.push(b, 0 as byte);
+print(b.length, b[3], b[4]);
+print(array.pop(b));
+print(array.indexOf(b, 255 as byte), array.indexOf(b, 9 as byte));
+array.sort(b);
+print(b[0], b[1], b[2], b[3]);
+byte[] bs = array.slice(b, 1, 3);
+print(bs.length, bs[0], bs[1]);
+
+int8[] s = [3, -128, 127, -1];
+array.sort(s);
+print(s[0], s[1], s[2], s[3]);
+
+int16[] w = [300, -300, 0];
+array.sort(w);
+print(w[0], w[1], w[2]);
+
+float32[] f = [2.5, -1.25, 0.5];
+array.sort(f);
+print(f[0], f[1], f[2]);
+
+// A comparator takes its arguments as the unit, so a narrow element reaches
+// it widened. This is where packing could change what a program's own
+// code sees.
+int8[] c = [1, -2, 3];
+array.sort(c, bool (int8 x, int8 y) -> { return x * x < y * y; });
+print(c[0], c[1], c[2]);
+
+uint32[] u = [4294967295, 0, 7];
+array.sort(u);
+print(u[0], u[1], u[2]);
+`, [
+        "5 255 0", "0", "3 -1", "1 2 3 255", "2 2 3",
+        "-128 -1 3 127",
+        "-300 0 300",
+        "-1.25 0.5 2.5",
+        "1 -2 3",
+        "0 7 4294967295",
+    ]);
+});
+
+// The JSON reader and writer access an element at a width that only the
+// TypeDesc knows.
+test.start("lang: packed arrays through JSON", void () -> {
+    h.expectOutput(`
+import 'json';
+
+int8[] a8 = [-128, 127];
+uint8[] b8 = [0, 255];
+int16[] a16 = [-32768, 32767];
+uint16[] b16 = [0, 65535];
+int32[] a32 = [-2147483648, 2147483647];
+uint32[] b32 = [0, 4294967295];
+float32[] f32 = [0.5, -3.25];
+
+// No literal can name the top half of a uint64 (§1.6), so it is reached by
+// arithmetic. Packing does not change this row: a uint64 is the 8-byte unit
+// itself, so a wrong widening shows as a wrong number. That is why it is
+// here.
+uint64 d = 9223372036854775807;
+uint64[] a64 = [0, d + d + 1];
+
+print(json.toText(a8), json.toText(b8));
+print(json.toText(a16), json.toText(b16));
+print(json.toText(a32), json.toText(b32));
+print(json.toText(a64));
+print(json.toText(f32));
+
+int8[] r8 = json.parse("[-128,127]") as int8[];
+uint16[] r16 = json.parse("[0,65535]") as uint16[];
+uint64[] r64 = json.parse("[18446744073709551615]") as uint64[];
+float32[] rf = json.parse("[0.5,-3.25]") as float32[];
+print(r8[0], r8[1], r16[0], r16[1]);
+print(r64[0]);
+print(rf[0], rf[1]);
+
+// Out of range on the way in is still refused at the element's own width.
+uint8[]? bad = json.parse("[256]") as uint8[] catch e { print(e.message); };
+`, [
+        "[-128,127] [0,255]",
+        "[-32768,32767] [0,65535]",
+        "[-2147483648,2147483647] [0,4294967295]",
+        "[0,18446744073709551615]",
+        "[0.5,-3.25]",
+        "-128 127 0 65535",
+        "18446744073709551615",
+        "0.5 -3.25",
+        "cannot parse JSON: uint8 out of range at [0]",
+    ]);
+});
+
+// A byte[] and a String are the same bytes with a different header, so a
+// conversion between them is a copy. A byte stays unsigned (§2.1) in each
+// direction.
+test.start("lang: byte arrays are bytes", void () -> {
+    h.expectOutput(`
+import 'string';
+import 'array';
+
+String s = "héllo";
+byte[] b = string.toByteArray(s);
+print(b.length, b[0], b[1], b[2]);
+print(string.fromByteArray(b) == s);
+print(s[1]);
+
+// A large one, where a wrong width would run off the end rather than merely
+// read the wrong number.
+String[] parts = [];
+for (int i = 0; i < 20000; i++) { array.push(parts, "xyzzy"); }
+byte[] big = string.toByteArray(string.join(parts, ""));
+print(big.length, big[0], big[99999]);
+print(string.length(string.fromByteArray(big)));
+`, ["6 104 195 169", "true", "195", "100000 120 121", "100000"]);
+});
+
+// map.keys and map.values return arrays packed at the element width (§5.7).
+test.start("lang: map keys and values become packed arrays", void () -> {
+    h.expectOutput(`
+import 'map';
+
+Map<String, int32> m = { "a": 2147483647, "b": -2147483648 };
+int32[] vs = map.values(m);
+print(vs.length, vs[0], vs[1]);
+
+Map<byte, String> k = { 255: "hi", 0: "lo" };
+byte[] ks = map.keys(k);
+print(ks.length, ks[0], ks[1]);
+`, ["2 2147483647 -2147483648", "2 255 0"]);
+});
+
+// A record's fields have their own widths and alignments (§5.7). This order
+// puts them at 8, 10, 16, 24, 28, 32 and 40, with padding at 9 and 25..27.
+test.start("lang: packed record fields round-trip at every width", void () -> {
+    h.expectOutput(`
+type P {
+    byte a;
+    int16 b;
+    int c;
+    bool d;
+    float32 e;
+    String s;
+    uint32 u;
+
+    int sum() { return self.a + self.b; }
+}
+
+P? pick(P v) { return v; }
+
+P p = { a: 255, b: -32768, c: 1234567890123456, d: true, e: 3.25, s: "hi", u: 4294967295 };
+print(p.a, p.b, p.c, p.d);
+print(p.e, p.s, p.u);
+print(p.sum());
+
+p.a = 0; p.b = 32767; p.d = false; p.u = 0; p.e = 0.1;
+print(p.a, p.b, p.d, p.u);
+// The store *is* the rounding onto the binary32 grid: 0.1 read back is the
+// float32 0.1, not the double.
+print(p.e == 0.1, p.e == (0.1 as float32));
+
+// ++ exists only at natural width (narrow arithmetic widens), so a member
+// target is always an 8-byte field, reached through the same packed slot.
+p.c++;
+print(p.c);
+
+// An optional chain re-boxes the widened unit (flow narrowing makes a
+// directly-assigned optional non-null, so the maybe goes through a call).
+byte? oa = pick(p)?.a;
+int16? ob = pick(p)?.b;
+print(oa, ob);
+`, [
+        "255 -32768 1234567890123456 true",
+        "3.25 hi 4294967295",
+        "-32513",
+        "0 32767 false 0",
+        "false true",
+        "1234567890123457",
+        "0 32767",
+    ]);
+});
+
+// An extender puts the base's fields first, so a base-typed read uses the
+// base's offsets on the extender's block.
+test.start("lang: extends keeps a packed base's offsets", void () -> {
+    h.expectOutput(`
+import 'json';
+
+sealed type Shape {
+    byte tag;
+    int16 w;
+}
+type Circle extends Shape {
+    float32 r;
+    String name;
+}
+type Square extends Shape {
+    int side;
+}
+
+int width(Shape s) { return s.w; }
+
+Circle c = { tag: 7, w: -12345, r: 2.5, name: "round" };
+Square q = { tag: 9, w: 31000, side: 4 };
+print(width(c), width(q), c.tag, q.tag);
+
+Shape s = c;
+switch (s) {
+    case Circle cc:
+        print(cc.name, cc.r);
+    case Square qq:
+        print("wrong");
+}
+// The stamp in slot [0], not the static type, is what serializes: the
+// extender's fields survive a trip through a base-typed slot.
+print(json.toText(s));
+`, [
+        "-12345 31000 7 9",
+        "round 2.5",
+        `{"tag":7,"w":-12345,"r":2.5,"name":"round"}`,
+    ]);
+});
+
+// The JSON reader stores at the field's width (rt_rec_set), and the writer
+// loads at that width (rt_rec_get). An offset is not 8 + index*8.
+test.start("lang: packed record fields through JSON", void () -> {
+    h.expectOutput(`
+import 'json';
+
+type N {
+    int8 a;
+    uint16 b;
+    float32 e;
+    bool d;
+}
+
+N n = json.parse("{\\"a\\":-128,\\"b\\":65535,\\"e\\":-3.25,\\"d\\":true}") as N;
+print(n.a, n.b, n.e, n.d);
+print(json.toText(n));
+
+N? bad = json.parse("{\\"a\\":128,\\"b\\":0,\\"e\\":0,\\"d\\":false}") as N catch e { print(e.message); };
+
+type Cfg {
+    uint8 level;
+    Json extra 'json*';
+    int16 port;
+}
+
+Cfg cfg = json.parse("{\\"level\\":9,\\"port\\":-1000,\\"zip\\":\\"kept\\"}") as Cfg;
+print(cfg.level, cfg.port);
+print(json.toText(cfg));
+`, [
+        "-128 65535 -3.25 true",
+        `{"a":-128,"b":65535,"e":-3.25,"d":true}`,
+        "cannot parse JSON: int8 out of range at a",
+        "9 -1000",
+        // The preserved key comes out at the catch-all's declared position.
+        `{"level":9,"zip":"kept","port":-1000}`,
+    ]);
+});
+
+// A union member is a record with one field. A narrow payload is at offset 8,
+// at its own width.
+test.start("lang: a union member holds a narrow payload", void () -> {
+    h.expectOutput(`
+union Pick { byte Small, String Text }
+
+Pick p = 200 as byte;
+switch (p) {
+    case Pick.Small b:
+        print(b);
+    case Pick.Text t:
+        print("wrong");
+}
+byte? b = p as Pick.Small;
+print(b);
+Pick t = "words";
+print(t as Pick.Text);
+`, ["200", "200", "words"]);
+});
+
+// Zero values are built field by field over the packed layout.
+test.start("lang: zero values of packed records", void () -> {
+    h.expectOutput(`
+type Z {
+    byte a;
+    int16 b;
+    float32 e;
+    bool d;
+    String s;
+}
+Z[2] zs;
+print(zs[0].a, zs[0].b, zs[0].e, zs[0].d);
+print(zs[1].s == "", zs[1].a);
+`, ["0 0 0 false", "true 0"]);
+});
+
+// A map's entry blocks hold keys and values at their own widths (§5.7). The
+// 255 key and the signed value test the extension. A wrong extension loses the
+// entry.
+test.start("lang: a map's entries occupy their widths", void () -> {
+    h.expectOutput(`
+import 'map';
+import 'string';
+import 'json';
+
+Map<byte, int16> m = {};
+int i = 0;
+while (i < 20) {
+    m[(i * 3) as byte] = (-100 * i) as int16;
+    i++;
+}
+print(m.length, m[0] == 0, m[57] == -1900, map.has(m, 58));
+map.remove(m, 30);
+byte[] ks = map.keys(m);
+int16[] vs = map.values(m);
+print(ks.length, ks[9], ks[10], vs[10]);
+Map<byte, int16> mc = map.copy(m);
+mc[255] = -1;
+print(mc.length, m.length, mc[255] == -1);
+
+Map<bool, byte> flags = {};
+flags[true] = 200;
+flags[false] = 100;
+print(flags[true], flags[false]);
+
+Map<String, byte> jm = {};
+jm["x"] = 7;
+jm["y"] = 255;
+String js = json.toText(jm);
+print(js);
+Map<String, byte> back = json.parse(js) as Map<String, byte> catch {};
+print(back["x"], back["y"], back.length);
+`, [
+        "20 true true false",
+        "19 27 33 -1100",
+        "20 19 true",
+        "200 100",
+        `{"x":7,"y":255}`,
+        "7 255 2",
+    ]);
+});
+
+// An optional's box holds the inner value at its own width (§5.7). Each reader
+// extends the value by the family of the inner type.
+test.start("lang: an optional's box holds its inner at its width", void () -> {
+    h.expectOutput(`
+byte? pb(byte v) { return v; }
+int16? ps(int16 v) { return v; }
+float32? pf(float32 v) { return v; }
+bool? pt(bool v) { return v; }
+uint64? pu(uint64 v) { return v; }
+
+byte? b = pb(200);
+print(b);
+if (b != null) {
+    print(b + 1);
+}
+print(b == pb(200), b == pb(3), b == null);
+int16? s = ps(-300);
+print(s, s == ps(-300));
+float32? f = pf(1.5);
+print(f);
+bool? t = pt(true);
+print(t, t == pt(false));
+uint64? u = pu(9000000000000000000);
+print(u == pu(9000000000000000000));
+`, [
+        "200",
+        "201",
+        "true false false",
+        "-300 true",
+        "1.5",
+        "true false",
+        "true",
+    ]);
+});
+
+// A captured variable's box is packed like an optional's box (§5.7). The
+// closure and the frame must read the same cell, or the counter splits in two.
+test.start("lang: a captured variable's box is packed", void () -> {
+    h.expectOutput(`
+byte counter = 10;
+Function()<void> bump = void () -> {
+    counter = (counter + 95) as byte;
+};
+bump();
+print(counter);
+bump();
+print(counter);    // 200: still one byte, zero-extended back out
+
+float32 fs = 1.0;
+Function()<float> read = float () -> { return fs; };
+Function()<void> half = void () -> {
+    fs = (fs + 0.25) as float32;
+};
+half();
+print(fs, read());
+
+int16 low = -32768;
+Function()<void> wrap = void () -> {
+    low = ((low + 1) - 1) as int16;
+};
+wrap();
+print(low);
+`, ["105", "200", "1.25 1.25", "-32768"]);
+});
+
+test.start("lang: string interpolation and the later escapes", void () -> {
+    // The test program is in a backtick string, so its holes are escaped.
+    h.expectOutput(`
+import 'string';
+String who = "world";
+int n = 3;
+float f = 1.5;
+bool b = true;
+print(\`hello \${who}, n = \${n + 1}, f = \${f}, b = \${b}\`);
+print(\`\${n}\`);
+print(\`\${n}\${n}\`);
+type P { int x; String tag; }
+P p = { x: 7, tag: "t" };
+print(\`x=\${p.x} tag=\${p.tag} nested=\${\`<\${p.x}>\`}\`);
+print(\`brace \${ (int () -> { return n + 2; })() } done\`);
+print(\`a\\\${b} $c\`);
+String multi = \`one \${n}
+two \${who}\`;
+print(multi);
+print("\\x41\\x42" == "AB");
+print(string.length("\\r\\0\\t") == 3);
+print(string.toByteArray("\\r\\0")[0] == 13 && string.toByteArray("\\r\\0")[1] == 0);
+`, [
+        "hello world, n = 4, f = 1.5, b = true", "3", "33", "x=7 tag=t nested=<7>",
+        "brace 5 done", "a${b} $c", "one 3", "two world", "true", "true", "true",
+    ]);
+});
+
+test.start("lang: forEach over a String walks code points", void () -> {
+    h.expectOutput(`
+import 'string';
+String s = "héllo";
+forEach(s, r, i) {
+    print(string.from(i) + " " + string.from(r) + " " + string.fromRunes([r]));
+}
+int n = 0;
+forEach("😀a", r) {
+    n = n + r;
+}
+print(n);
+print(string.runeCount("café"));
+print(string.length("café"));
+print(string.runeAt("héllo", 1));
+print(string.isValidUtf8("café"));
+print(string.isValidUtf8(string.substring("café", 0, 4)));
+print(string.isValidUtf8(string.fromByteArray([0xC0, 0x80])));
+// An invalid byte is U+FFFD one byte wide, so the walk ends and skips nothing.
+String bad = string.fromByteArray([65, 0xFF, 66]);
+forEach(bad, r, i) {
+    print(string.from(i) + ":" + string.from(r));
+}
+print(string.runeCount(bad));
+print(string.fromRunes([104, 233, 0x1F600]) == "hé😀");
+print(string.length(string.fromRunes([0xD800, -1, 0x110000])));
+print(string.toUpperCaseAscii("straße") == "STRAßE");
+print(string.toLowerCaseAscii("ÀB") == "Àb");
+int total = 0;
+forEach("abc", r, i) {
+    if (r == 98) {
+        continue;
+    }
+    total = total + i;
+}
+print(total);
+`, [
+        "0 104 h", "1 233 é", "3 108 l", "4 108 l", "5 111 o", "128609", "4", "5", "233",
+        "true", "false", "false", "0:65", "1:65533", "2:66", "3", "true", "9", "true",
+        "true", "2",
+    ]);
+});

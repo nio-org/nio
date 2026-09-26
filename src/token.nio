@@ -1,0 +1,206 @@
+// The lexical tokens of the language. A token type is a plain String, and
+// the constants below are the full set.
+import 'map';
+
+// One lexical token with its source position. The line and the column are
+// both 1-based, and the column is that of the first character.
+export type Token {
+    String type;
+    String literal;
+    int line;
+    int col;
+
+    // The position one past the last character of the token. endLine differs
+    // from line only for a string or a comment. endCol is exclusive, so `int`
+    // at column 1 ends at column 4 and its underline is endCol - col wide.
+    // The literal cannot give this: a string's literal is decoded, and `\n` is
+    // two characters of source but one of text. A synthesized token, which no
+    // file contains, has both set to zero.
+    int endLine;
+    int endCol;
+
+    // Gives the cause of an ILLEGAL token when the lexer knows it, as a complete
+    // diagnostic message that the parser reports in place of its own. It is
+    // empty on every other token.
+    String note;
+
+    // The delimiter of a STRING token as written: `"`, `'` or a backtick. The
+    // literal holds the decoded text, so only this field records the form the
+    // source used. It is empty on every other token. The formatter reads it
+    // to write the string back in the same form.
+    String quote;
+}
+
+// Comment is one comment that the lexer skipped. A comment is not a token.
+// The parser never sees one, so no parse rule must allow for it. The lexer
+// collects comments separately, in source order, and they reach the tree as
+// ast.Program.comments, which hover and the formatter read.
+//
+// text holds the comment as written, with its markers: `// like this`,
+// `/* or this */`. src/lsp/doc.nio removes the markers when it shows one.
+export type Comment {
+    String text;
+    int line;       // 1-based, of the opening marker
+    int col;        // 1-based byte column of the opening marker
+    int endLine;    // 1-based, of the closing marker; the same for a `//` comment
+    // ownLine marks a comment with no code before it on its line. Such a
+    // comment documents what follows. A comment that trails code, as in
+    // `int n = 1; // how many`, documents what precedes it.
+    bool ownLine;
+}
+
+export String const ILLEGAL = "ILLEGAL";
+export String const EOF = "EOF";
+
+// Identifiers and literals.
+export String const IDENT = "IDENT";
+export String const INT = "INT";
+export String const FLOAT = "FLOAT";
+export String const STRING = "STRING";
+// An interpolated backtick string (§1.6) arrives as several tokens: the text
+// before its first `${` as TSTR_START, the text between one `}` and the next
+// `${` as TSTR_MID, and the text after the last `}` as TSTR_END, with the
+// tokens of each expression between them as they would be anywhere else. A
+// backtick string with no `${` is a STRING like the other two forms.
+export String const TSTR_START = "TSTR_START";
+export String const TSTR_MID = "TSTR_MID";
+export String const TSTR_END = "TSTR_END";
+
+// Operators.
+export String const ASSIGN = "=";
+export String const PLUS = "+";
+export String const MINUS = "-";
+export String const ASTERISK = "*";
+export String const SLASH = "/";
+export String const PERCENT = "%";
+export String const BANG = "!";
+export String const INC = "++";
+export String const DEC = "--";
+
+export String const ARROW = "->";
+
+export String const EQ = "==";
+export String const NOTEQ = "!=";
+export String const LT = "<";
+export String const GT = ">";
+export String const LTE = "<=";
+export String const GTE = ">=";
+export String const AND = "&&";
+export String const OR = "||";
+
+// Bitwise operators (§3.1). The signed and the unsigned families differ on one
+// of them, `>>`, which fills with the sign bit on a signed type and with zeros
+// on an unsigned one.
+//
+// There is no SHR constant, because the lexer does not read `>>` as one token.
+// `Map<String, Future<int>>` ends with two `>` tokens that close two type
+// arguments, and the lexer has no context to tell those from a shift. The parser
+// joins an adjacent pair in expression position instead (parseExpression), so
+// each type parse reads one `>` at a time.
+export String const BITAND = "&";
+export String const BITOR = "|";
+export String const CARET = "^";
+export String const TILDE = "~";
+export String const SHL = "<<";
+
+// Delimiters.
+export String const COMMA = ",";
+export String const SEMICOLON = ";";
+export String const COLON = ":";
+export String const DOT = ".";
+export String const ELLIPSIS = "...";
+export String const QUESTION = "?";
+export String const QDOT = "?.";
+
+export String const LPAREN = "(";
+export String const RPAREN = ")";
+export String const LBRACE = "{";
+export String const RBRACE = "}";
+export String const LBRACKET = "[";
+export String const RBRACKET = "]";
+
+// Keywords. FUNCTION is not part of the language. It stays a keyword so that
+// the parser gives a clear error for code that uses it.
+export String const FUNCTION = "FUNCTION";
+export String const FUNCTYPE = "Function";
+export String const FUTURE = "Future";
+export String const MAP = "Map";
+export String const AWAIT = "AWAIT";
+export String const CATCH = "CATCH";
+export String const VOID = "VOID";
+export String const TYPE = "TYPE";
+export String const ENUM = "ENUM";
+export String const RETURN = "RETURN";
+export String const IF = "IF";
+export String const ELSE = "ELSE";
+export String const SWITCH = "SWITCH";
+export String const CASE = "CASE";
+export String const DEFAULT = "DEFAULT";
+export String const WHILE = "WHILE";
+export String const FOR = "FOR";
+export String const FOREACH = "FOREACH";
+export String const BREAK = "BREAK";
+export String const CONTINUE = "CONTINUE";
+export String const TRUE = "TRUE";
+export String const FALSE = "FALSE";
+export String const NULL = "NULL";
+export String const IMPORT = "IMPORT";
+export String const AS = "AS";
+export String const EXPORT = "EXPORT";
+export String const CONST = "CONST";
+
+// Exported so that tools/grammar.nio generates the editor syntax highlighting
+// from this table and not from a second copy of it.
+export Map<String, String> keywords = {
+    "function": FUNCTION,
+    "Function": FUNCTYPE,
+    "Future": FUTURE,
+    "Map": MAP,
+    "await": AWAIT,
+    "catch": CATCH,
+    "void": VOID,
+    "type": TYPE,
+    "enum": ENUM,
+    "return": RETURN,
+    "if": IF,
+    "else": ELSE,
+    "switch": SWITCH,
+    "case": CASE,
+    "default": DEFAULT,
+    "while": WHILE,
+    "for": FOR,
+    "forEach": FOREACH,
+    "break": BREAK,
+    "continue": CONTINUE,
+    "true": TRUE,
+    "false": FALSE,
+    "null": NULL,
+    "import": IMPORT,
+    "as": AS,
+    "export": EXPORT,
+    "const": CONST,
+};
+
+// The set of token types that the keyword table produces, for isFieldName.
+Map<String, bool> keywordTypes = {};
+forEach(map.values(keywords), t) {
+    keywordTypes[t] = true;
+}
+
+// isFieldName tells whether t can name a record field. Keywords are permitted,
+// because a field name appears only where the grammar knows one belongs: after
+// the field type in a record body, before ':' in a record literal, and after
+// '.'. JSON documents frequently use keys such as "type".
+export bool isFieldName(String t) {
+    if (t == IDENT) { return true; }
+    return keywordTypes[t] != null;
+}
+
+// lookupIdent returns the keyword token type for ident, or IDENT. Type names
+// such as `int` are not keywords: the parser resolves them from context, so a
+// program can also use them as record names.
+export String lookupIdent(String ident) {
+    String? t = keywords[ident];
+    if (t != null) { return t; }
+    return IDENT;
+}

@@ -1,0 +1,1090 @@
+// The `http` module (§6.16): it parses HTTP messages, and serves and sends them
+// over a real socket.
+//
+// The parsing tests call the exported functions and use no socket. The other
+// tests bind port 0 and read the port that they got (`Server.port`). Thus the
+// suite needs no network and cannot collide with other programs on the
+// machine.
+import 'test';
+import 'string';
+import './harness' as h;
+
+// ---- parsing: the request line ----
+
+test.start("http: parses a request line", void () -> {
+    h.expectOutput(`
+import 'http';
+import 'string';
+
+void check() {
+    http.RequestLine a = http.parseRequestLine("GET /users/42?a=1 HTTP/1.1") catch e {
+        print("err " + e.message); return;
+    };
+    print(string.from(a.method) + " " + a.path + " " + a.query + " " + string.from(a.keepAlive));
+
+    http.RequestLine b = http.parseRequestLine("POST /a%20b HTTP/1.0") catch e {
+        print("err " + e.message); return;
+    };
+    print(string.from(b.method) + " " + b.path + " " + string.from(b.keepAlive));
+}
+check();
+`, ["GET /users/42 a=1 true", "POST /a b false"]);
+});
+
+test.start("http: rejects a malformed request line", void () -> {
+    h.expectOutput(`
+import 'http';
+import 'string';
+
+void one(String line) {
+    http.RequestLine r = http.parseRequestLine(line) catch e {
+        print(string.from(e.code));
+        return;
+    };
+    print("accepted");
+}
+
+void check() {
+    one("GET");                          // no target, no version
+    one("BREW /pot HTTP/1.1");           // not a method this version has
+    one("GET /p HTTP/9.9");              // not a version
+    one("GET  HTTP/1.1");                // empty target
+}
+check();
+`, ["100", "100", "100", "100"]);
+});
+
+// ---- parsing: headers ----
+
+test.start("http: folds repeated headers and keeps Set-Cookie apart", void () -> {
+    h.expectOutput(`
+import 'http';
+import 'string';
+
+void check() {
+    http.HeaderBlock hb = http.parseHeaders([
+        "Host: example.com",
+        "X-A: 1",
+        "X-A: 2",
+        "Set-Cookie: a=1",
+        "Set-Cookie: b=2",
+    ]) catch e { print("err " + e.message); return; };
+
+    print(string.from(hb.headers["host"]));
+    print(string.from(hb.headers["x-a"]));
+    print(string.from(hb.setCookies.length) + " " + hb.setCookies[0] + " " + hb.setCookies[1]);
+    // Lookup is case-insensitive through the accessor.
+    print(string.from(http.getHeader(hb.headers, "HOST")));
+}
+check();
+`, ["example.com", "1, 2", "2 a=1 b=2", "example.com"]);
+});
+
+test.start("http: rejects obsolete line folding", void () -> {
+    h.expectOutput(`
+import 'http';
+import 'string';
+
+void check() {
+    http.HeaderBlock hb = http.parseHeaders(["Host: a", " continued"]) catch e {
+        print("rejected " + string.from(e.code));
+        return;
+    };
+    print("accepted");
+}
+check();
+`, ["rejected 100"]);
+});
+
+test.start("http: refuses a header block with too many headers", void () -> {
+    h.expectOutput(`
+import 'http';
+import 'string';
+import 'array';
+
+void check() {
+    String[] many = [];
+    int i = 0;
+    while (i < 200) {
+        array.push(many, "X-N: 1");
+        i++;
+    }
+    http.HeaderBlock hb = http.parseHeaders(many) catch e {
+        print("rejected " + string.from(e.code));
+        return;
+    };
+    print("accepted");
+}
+check();
+`, ["rejected 102"]);
+});
+
+// ---- parsing: framing ----
+
+test.start("http: reads the framing of a message", void () -> {
+    h.expectOutput(`
+import 'http';
+import 'string';
+
+void one(Map<String, String> h) {
+    http.Framing f = http.framingOf(h) catch e {
+        print("rejected " + string.from(e.code));
+        return;
+    };
+    print(string.from(f.chunked) + " " + string.from(f.length));
+}
+
+void check() {
+    one({ "content-length": "12" });
+    one({ "transfer-encoding": "chunked" });
+    one({});
+    // Both at once is how request smuggling is written; RFC 9112 says reject.
+    one({ "content-length": "12", "transfer-encoding": "chunked" });
+    one({ "content-length": "nope" });
+}
+check();
+`, ["false 12", "true -1", "false -1", "rejected 100", "rejected 100"]);
+});
+
+test.start("http: decodes a chunked body", void () -> {
+    h.expectOutput(`
+import 'http';
+import 'string';
+
+void check() {
+    String msg = "4" + http.CRLF + "Wiki" + http.CRLF +
+                 "5" + http.CRLF + "pedia" + http.CRLF +
+                 "0" + http.CRLF + http.CRLF;
+    http.Chunked c = http.decodeChunked(msg, 0, 1000) catch e { print("err"); return; };
+    print(string.from(c.complete) + " " + c.body + " " + string.from(c.consumed));
+
+    // A chunk size may carry extensions after a ";".
+    String ext = "4;name=value" + http.CRLF + "Wiki" + http.CRLF + "0" + http.CRLF + http.CRLF;
+    http.Chunked d = http.decodeChunked(ext, 0, 1000) catch e { print("err"); return; };
+    print(string.from(d.complete) + " " + d.body);
+
+    // Half a body is not an error -- it is the caller's signal to read more.
+    http.Chunked p = http.decodeChunked("4" + http.CRLF + "Wi", 0, 1000) catch e {
+        print("err"); return;
+    };
+    print(string.from(p.complete));
+
+    // Past the cap is.
+    http.Chunked big = http.decodeChunked(msg, 0, 5) catch e {
+        print("too large " + string.from(e.code));
+        // No cap accepts the same body the cap of 5 refused.
+        http.Chunked none = http.decodeChunked(msg, 0, null) catch e2 {
+            print("err"); return;
+        };
+        print("uncapped " + none.body);
+        return;
+    };
+    print("accepted");
+}
+check();
+`, ["true Wikipedia 24", "true Wiki", "false", "too large 102", "uncapped Wikipedia"]);
+});
+
+// ---- parsing: URLs and queries ----
+
+test.start("http: splits a URL", void () -> {
+    h.expectOutput(`
+import 'http';
+import 'string';
+
+void one(String url) {
+    http.Url u = http.parseUrl(url) catch e {
+        print("rejected " + string.from(e.code));
+        return;
+    };
+    print(u.scheme + " " + u.host + " " + string.from(u.port) + " " + u.path + " " + u.query);
+}
+
+void check() {
+    one("http://example.com:8080/p/q?x=1#frag");
+    one("http://example.com");
+    one("https://example.com/a");
+    one("http://[::1]:9000/v6");
+    one("https://[fe80::1]/");
+    one("example.com/nope");
+    one("http://example.com:99999/");
+}
+check();
+`, [
+        "http example.com 8080 /p/q x=1",
+        "http example.com 80 / ",
+        "https example.com 443 /a ",
+        "http ::1 9000 /v6 ",
+        "https fe80::1 443 / ",
+        "rejected 100",
+        "rejected 100",
+    ]);
+});
+
+test.start("http: splits a query string", void () -> {
+    h.expectOutput(`
+import 'http';
+import 'string';
+
+void check() {
+    Map<String, String> q = http.parseQuery("a=1&b=hello+world&c=%C3%A9&d");
+    print(string.from(q["a"]));
+    print(string.from(q["b"]));
+    print(string.from(q["c"]));
+    print(string.from(q["d"]));
+    print(string.from(http.parseQuery("").length));
+}
+check();
+`, ["1", "hello world", "é", "", "0"]);
+});
+
+test.start("http: percent-codes round trip", void () -> {
+    h.expectOutput(`
+import 'http';
+import 'string';
+
+void check() {
+    print(http.percentDecode("/a%20b/%C3%A9"));
+    print(http.percentEncode("a b/é"));
+    // A stray % is data, not a reason to refuse the request.
+    print(http.percentDecode("100%"));
+    print(http.percentDecode("%zz"));
+    print(http.percentDecode(http.percentEncode("a b/é")));
+}
+check();
+`, ["/a b/é", "a%20b%2F%C3%A9", "100%", "%zz", "a b/é"]);
+});
+
+// ---- serving ----
+
+// `serve` is fallible, and `async.run` does not accept a fallible future
+// (§6.8). The accept loop needs this wrapper.
+String const SERVER_PRELUDE = `
+import 'http';
+import 'string';
+import 'async';
+import 'net';
+
+void async background(http.Server s) { await s.serve() catch e { }; }
+`;
+
+test.start("http: serves a request and answers it", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+http.Response showUser(http.Request req) {
+    String? id = req.params["id"];
+    if (id == null) { return http.text(400, "missing id"); }
+    return http.json(200, "{" + string.from(34) + "}");
+}
+
+http.Server s = http.server();
+s.route(http.Method.GET, "/", http.Response (http.Request r) -> http.text(200, "hello"));
+s.route(http.Method.GET, "/users/:id", http.Response (http.Request r) ->
+    http.text(200, "user " + string.from(r.params["id"])));
+s.route(http.Method.POST, "/echo", http.Response (http.Request r) -> http.bytes(200, r.body));
+s.route(http.Method.GET, "*", http.Response (http.Request r) -> http.text(404, "no route " + r.path));
+
+void async drive() {
+    int port = s.bind("127.0.0.1", 0, null);
+    async.run(background(s), void () -> { });
+    String base = "http://127.0.0.1:" + string.from(port);
+
+    http.ClientResponse a = await http.request(http.Method.GET, base + "/", null);
+    print(string.from(a.status) + " " + await a.text());
+
+    http.ClientResponse b = await http.request(http.Method.GET, base + "/users/42", null);
+    print(string.from(b.status) + " " + await b.text());
+
+    http.ClientOptions o = { headers: null, body: "ping", bodyBytes: null,
+                             timeout: 5000, followRedirects: null };
+    http.ClientResponse c = await http.request(http.Method.POST, base + "/echo", o);
+    print(string.from(c.status) + " " + await c.text());
+
+    http.ClientResponse d = await http.request(http.Method.GET, base + "/nowhere", null);
+    print(string.from(d.status) + " " + await d.text());
+
+    s.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["200 hello", "200 user 42", "200 ping", "404 no route /nowhere"]);
+});
+
+test.start("http: first matching route wins", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+http.Server s = http.server();
+s.route(http.Method.GET, "/a", http.Response (http.Request r) -> http.text(200, "first"));
+s.route(http.Method.GET, "/a", http.Response (http.Request r) -> http.text(200, "second"));
+s.route(http.Method.GET, "*", http.Response (http.Request r) -> http.text(404, "catch-all"));
+
+void async drive() {
+    int port = s.bind("127.0.0.1", 0, null);
+    async.run(background(s), void () -> { });
+    String base = "http://127.0.0.1:" + string.from(port);
+
+    http.ClientResponse a = await http.request(http.Method.GET, base + "/a", null);
+    print(await a.text());
+    // A catch-all is registered *per method*, so a DELETE matches no route at
+    // all and gets the module's own 404 rather than the GET catch-all.
+    http.ClientResponse b = await http.request(http.Method.DELETE, base + "/a", null);
+    print(string.from(b.status) + " " + await b.text());
+    s.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["first", "404 not found"]);
+});
+
+test.start("http: keeps a connection alive across requests", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+http.Server s = http.server();
+s.route(http.Method.GET, "/a", http.Response (http.Request r) -> http.text(200, "A"));
+
+void async drive() {
+    int port = s.bind("127.0.0.1", 0, null);
+    async.run(background(s), void () -> { });
+
+    Socket c = await net.tcp.connect("127.0.0.1:" + string.from(port));
+    String one = "GET /a HTTP/1.1" + http.CRLF + "Host: x" + http.CRLF + http.CRLF;
+    await net.write(c, string.toByteArray(one + one));
+
+    // Both answers come back down the one connection.
+    String seen = "";
+    while (string.length(seen) < 2) {
+        byte[] b = await net.read(c, 4096);
+        if (b.length == 0) { break; }
+        seen = seen + countOf(string.fromByteArray(b));
+    }
+    print("responses " + string.from(string.length(seen)));
+    net.close(c);
+    s.close();
+}
+
+String countOf(String t) {
+    String out = "";
+    String rest = t;
+    int at = string.find(rest, "HTTP/1.1 200");
+    while (at >= 0) {
+        out = out + "x";
+        rest = string.substring(rest, at + 12, string.length(rest));
+        at = string.find(rest, "HTTP/1.1 200");
+    }
+    return out;
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["responses 2"]);
+});
+
+test.start("http: Connection close ends the connection", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+http.Server s = http.server();
+s.route(http.Method.GET, "/a", http.Response (http.Request r) -> http.text(200, "A"));
+
+void async drive() {
+    int port = s.bind("127.0.0.1", 0, null);
+    async.run(background(s), void () -> { });
+
+    Socket c = await net.tcp.connect("127.0.0.1:" + string.from(port));
+    await net.write(c, string.toByteArray(
+        "GET /a HTTP/1.1" + http.CRLF + "Host: x" + http.CRLF +
+        "Connection: close" + http.CRLF + http.CRLF));
+    byte[] first = await net.read(c, 4096);
+    print("got " + string.from(first.length > 0));
+    // The server hung up, so the next read is the clean end of stream.
+    byte[] second = await net.read(c, 4096);
+    print("closed " + string.from(second.length == 0));
+    net.close(c);
+    s.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["got true", "closed true"]);
+});
+
+test.start("http: HEAD answers headers with no body", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+http.Server s = http.server();
+s.route(http.Method.HEAD, "/a", http.Response (http.Request r) -> http.text(200, "0123456789"));
+
+void async drive() {
+    int port = s.bind("127.0.0.1", 0, null);
+    async.run(background(s), void () -> { });
+
+    Socket c = await net.tcp.connect("127.0.0.1:" + string.from(port));
+    await net.write(c, string.toByteArray(
+        "HEAD /a HTTP/1.1" + http.CRLF + "Host: x" + http.CRLF +
+        "Connection: close" + http.CRLF + http.CRLF));
+    byte[] b = await net.read(c, 4096);
+    String t = string.fromByteArray(b);
+    int blank = string.find(t, http.CRLF2);
+    print("declared " + string.from(string.contains(t, "content-length: 10")));
+    print("body bytes " + string.from(string.length(t) - blank - 4));
+    net.close(c);
+    s.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["declared true", "body bytes 0"]);
+});
+
+test.start("http: a handler that raises becomes a 500", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+http.Response boom(http.Request req) {
+    return Error("handler exploded");
+}
+
+http.Server s = http.server();
+s.route(http.Method.GET, "/boom", http.Response (http.Request r) -> boom(r));
+
+void async drive() {
+    int port = s.bind("127.0.0.1", 0, null);
+    async.run(background(s), void () -> { });
+    http.ClientResponse a = await http.request(
+        http.Method.GET, "http://127.0.0.1:" + string.from(port) + "/boom", null);
+    // The message stays on the server: a client learns the status and no more.
+    print(string.from(a.status) + " " + await a.text());
+    s.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["500 internal server error"]);
+});
+
+test.start("http: an async handler reaches another server", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+// Two servers in one program, which is the whole reason http.server() answers
+// a value rather than there being one global.
+http.Server upstream = http.server();
+http.Server front = http.server();
+int upstreamPort = 0;
+
+http.Response async proxy(http.Request req) {
+    http.ClientResponse r = await http.request(
+        http.Method.GET, "http://127.0.0.1:" + string.from(upstreamPort) + "/data", null)
+        catch e { return http.text(502, "bad gateway"); };
+    String body = await r.text() catch e { return http.text(502, "bad gateway"); };
+    return http.text(200, "via proxy: " + body);
+}
+
+void async drive() {
+    upstream.route(http.Method.GET, "/data", http.Response (http.Request r) ->
+        http.text(200, "upstream says hi"));
+    upstreamPort = upstream.bind("127.0.0.1", 0, null);
+    async.run(background(upstream), void () -> { });
+
+    front.route(http.Method.GET, "/proxy",
+        Future<http.Response> (http.Request r) -> proxy(r));
+    int frontPort = front.bind("127.0.0.1", 0, null);
+    async.run(background(front), void () -> { });
+
+    http.ClientResponse a = await http.request(
+        http.Method.GET, "http://127.0.0.1:" + string.from(frontPort) + "/proxy", null);
+    print(string.from(a.status) + " " + await a.text());
+
+    front.close();
+    upstream.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["200 via proxy: upstream says hi"]);
+});
+
+test.start("http: reads a chunked request body", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+http.Server s = http.server();
+s.route(http.Method.POST, "/up", http.Response (http.Request r) ->
+    http.text(200, "got " + string.fromByteArray(r.body)));
+
+void async drive() {
+    int port = s.bind("127.0.0.1", 0, null);
+    async.run(background(s), void () -> { });
+
+    Socket c = await net.tcp.connect("127.0.0.1:" + string.from(port));
+    await net.write(c, string.toByteArray(
+        "POST /up HTTP/1.1" + http.CRLF + "Host: x" + http.CRLF +
+        "Transfer-Encoding: chunked" + http.CRLF + "Connection: close" + http.CRLF + http.CRLF +
+        "4" + http.CRLF + "Wiki" + http.CRLF + "5" + http.CRLF + "pedia" + http.CRLF +
+        "0" + http.CRLF + http.CRLF));
+    byte[] b = await net.read(c, 4096);
+    String t = string.fromByteArray(b);
+    int blank = string.find(t, http.CRLF2);
+    print(string.substring(t, blank + 4, string.length(t)));
+    net.close(c);
+    s.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["got Wikipedia"]);
+});
+
+test.start("http: refuses a body over the server's limit", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+http.Server s = http.server();
+s.route(http.Method.POST, "/up", http.Response (http.Request r) -> http.text(200, "ok"));
+
+void async drive() {
+    // maxBody is the one limit a server sets per instance; the rest are the
+    // module's own, because a client cannot be trusted with either.
+    int port = s.bind("127.0.0.1", 0, { timeout: null, backlog: null, maxBody: 8 });
+    async.run(background(s), void () -> { });
+
+    http.ClientOptions o = { headers: null, body: "far more than eight bytes",
+                             bodyBytes: null, timeout: 5000, followRedirects: null };
+    http.ClientResponse a = await http.request(
+        http.Method.POST, "http://127.0.0.1:" + string.from(port) + "/up", o);
+    print(string.from(a.status));
+    s.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["413"]);
+});
+
+test.start("http: refuses a response body over the client's limit", void () -> {
+    // The caller sets the client limit. There is no limit by default. When set, it is compared with the declared length before the
+    // body is read, so a refusal costs nothing. When not set, the response is
+    // read at any size.
+    h.expectOutput(SERVER_PRELUDE + `
+String thousand() {
+    String out = "";
+    int i = 0;
+    while (i < 100) {
+        out = out + "0123456789";
+        i++;
+    }
+    return out;
+}
+
+http.Server s = http.server();
+s.route(http.Method.GET, "/big", http.Response (http.Request r) ->
+    http.text(200, thousand()));
+
+void async fetch(String url, int? limit) {
+    http.ClientOptions o = { timeout: 5000, maxBody: limit };
+    http.ClientResponse res = await http.request(http.Method.GET, url, o) catch e {
+        print("refused " + string.from(e.code == http.ErrorCode.TOO_LARGE));
+        return;
+    };
+    byte[] got = await res.bytes();
+    print("read " + string.from(got.length));
+}
+
+void async drive() {
+    int port = s.bind("127.0.0.1", 0, null);
+    async.run(background(s), void () -> { });
+    String url = "http://127.0.0.1:" + string.from(port) + "/big";
+
+    await fetch(url, 100);      // under the body: refused
+    await fetch(url, 1000);     // exactly the body: read
+    await fetch(url, null);     // no limit: read
+    s.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["refused true", "read 1000", "read 1000"]);
+});
+
+test.start("http: route matches a compiled pattern", void () -> {
+    h.expectOutput(`
+import 'http';
+import 'string';
+import 'async';
+import 'net';
+import 'regexp';
+
+void async background(http.Server s) { await s.serve() catch e { }; }
+
+http.Server s = http.server();
+
+void async drive() {
+    RegExp digits = regexp.create("^/item/[0-9]+$") catch e { print("bad pattern"); return; };
+    s.route(http.Method.GET, digits, http.Response (http.Request r) -> http.text(200, "numeric"));
+    s.route(http.Method.GET, "*", http.Response (http.Request r) -> http.text(404, "no"));
+
+    int port = s.bind("127.0.0.1", 0, null);
+    async.run(background(s), void () -> { });
+    String base = "http://127.0.0.1:" + string.from(port);
+
+    http.ClientResponse a = await http.request(http.Method.GET, base + "/item/12", null);
+    print(string.from(a.status) + " " + await a.text());
+    http.ClientResponse b = await http.request(http.Method.GET, base + "/item/abc", null);
+    print(string.from(b.status) + " " + await b.text());
+    s.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["200 numeric", "404 no"]);
+});
+
+test.start("http: a malformed request gets a 400 and no route", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+http.Server s = http.server();
+s.route(http.Method.GET, "*", http.Response (http.Request r) -> http.text(200, "reached a route"));
+
+void async drive() {
+    int port = s.bind("127.0.0.1", 0, null);
+    async.run(background(s), void () -> { });
+
+    Socket c = await net.tcp.connect("127.0.0.1:" + string.from(port));
+    await net.write(c, string.toByteArray("NOT A REQUEST" + http.CRLF + http.CRLF));
+    byte[] b = await net.read(c, 4096);
+    String t = string.fromByteArray(b);
+    print(string.from(string.contains(t, "HTTP/1.1 400")));
+    print(string.from(string.contains(t, "reached a route")));
+    net.close(c);
+    s.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["true", "false"]);
+});
+
+// ---- the client ----
+
+test.start("http: refuses a scheme nobody speaks", void () -> {
+    h.expectOutput(`
+import 'http';
+import 'string';
+
+void async check() {
+    http.ClientResponse r = await http.request(http.Method.GET, "ftp://example.com/x", null)
+        catch e {
+            print(string.from(e.code));
+            return;
+        };
+    print("connected");
+}
+await check();
+`, ["103"]);
+});
+
+// ---- https ----
+//
+// The peer is `tls.testAccept`, which cannot sign. These tests cover only the
+// connection between the modules: `https://` goes through tls, the opt-out
+// reaches tls, and a redirect can change the transport in a chain. The
+// verification tests are in tests/tls_test.nio, against a real fixture PKI.
+
+// One HTTPS exchange, served by hand: read up to the blank line, send `body`,
+// close. The request fits in one record, but one read can return only part of
+// it.
+String const HTTPS_PRELUDE = `
+import 'http';
+import 'string';
+import 'async';
+import 'net';
+import 'tls';
+
+void async background(http.Server s) { await s.serve() catch e { }; }
+
+void async serveHttps(Listener l, String body) {
+    Socket c = await net.accept(l) catch e { return; };
+    tls.Conn conn = await tls.testAccept(tls.socketTransport(c, 5000), {
+        certificates: [string.toByteArray("not a certificate")], alpn: ["http/1.1"],
+    }) catch e { net.close(c); return; };
+    String req = "";
+    while (string.find(req, http.CRLF2) < 0) {
+        byte[] b = await conn.read(8192) catch e { return; };
+        if (b.length == 0) { return; }
+        req = req + string.fromByteArray(b);
+    }
+    print("server saw " + string.substring(req, 0, string.find(req, http.CRLF)));
+    await conn.write(string.toByteArray(
+        "HTTP/1.1 200 OK" + http.CRLF
+        + "content-length: " + string.from(string.length(body)) + http.CRLF
+        + "connection: close" + http.CRLF + http.CRLF + body)) catch e { return; };
+    await conn.close();
+}
+`;
+
+test.start("http: an https request completes over a TLS loopback", void () -> {
+    h.expectOutput(HTTPS_PRELUDE + `
+void async drive() {
+    Listener l = net.tcp.listen("127.0.0.1:0");
+    String addr = net.address(l);
+    async.run(serveHttps(l, "hello over tls"), void () -> { });
+
+    // The peer cannot be authenticated (testAccept cannot sign), so this
+    // loopback needs the opt-out. It goes through ClientOptions.tls to
+    // tls.connect.
+    http.ClientOptions o = { tls: { insecureSkipVerify: true } };
+    http.ClientResponse r = await http.request(
+        http.Method.GET, "https://" + addr + "/hello", o);
+    print(string.from(r.status) + " " + await r.text());
+    net.close(l);
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["server saw GET /hello HTTP/1.1", "200 hello over tls"]);
+});
+
+test.start("http: https verifies the peer by default", void () -> {
+    h.expectOutput(HTTPS_PRELUDE + `
+void async drive() {
+    Listener l = net.tcp.listen("127.0.0.1:0");
+    String addr = net.address(l);
+    async.run(serveHttps(l, "unreachable"), void () -> { });
+
+    // With no options, the exchange the test above completed must fail. The
+    // peer's certificate is not valid, and x509's error code comes back
+    // unchanged through tls and http.
+    http.ClientResponse r = await http.request(
+        http.Method.GET, "https://" + addr + "/hello", null) catch e {
+        print("refused " + string.from(e.code));
+        net.close(l);
+        return;
+    };
+    print("connected, which is wrong");
+    net.close(l);
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["refused 300"]);
+});
+
+test.start("http: a redirect crosses from http to https", void () -> {
+    h.expectOutput(HTTPS_PRELUDE + `
+http.Server front = http.server();
+
+void async drive() {
+    Listener l = net.tcp.listen("127.0.0.1:0");
+    String addr = net.address(l);
+    async.run(serveHttps(l, "arrived over tls"), void () -> { });
+
+    // The commonest redirect on the web: plain http answering "use https".
+    // The Location is a full URL, so it carries the scheme change.
+    front.route(http.Method.GET, "/from", http.Response (http.Request r) ->
+        http.redirect(301, "https://" + addr + "/to"));
+    int port = front.bind("127.0.0.1", 0, null);
+    async.run(background(front), void () -> { });
+
+    http.ClientOptions o = { followRedirects: true, tls: { insecureSkipVerify: true } };
+    http.ClientResponse r = await http.request(
+        http.Method.GET, "http://127.0.0.1:" + string.from(port) + "/from", o);
+    print(string.from(r.status) + " " + await r.text());
+    front.close();
+    net.close(l);
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["server saw GET /to HTTP/1.1", "200 arrived over tls"]);
+});
+
+test.start("http: client options carry headers and a body", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+http.Server s = http.server();
+s.route(http.Method.POST, "/see", http.Response (http.Request r) ->
+    http.text(200, string.from(r.headers["x-token"]) + "|" + string.fromByteArray(r.body)));
+
+void async drive() {
+    int port = s.bind("127.0.0.1", 0, null);
+    async.run(background(s), void () -> { });
+
+    // Every field is optional, which is what makes this literal legal at all.
+    http.ClientOptions o = { headers: { "x-token": "abc" }, body: "payload" };
+    o.setHeader("X-Extra", "1");
+    print(string.from(o.getHeader("x-extra")));
+    o.removeHeader("X-EXTRA");
+    print(string.from(o.getHeader("x-extra")));
+
+    http.ClientResponse a = await http.request(
+        http.Method.POST, "http://127.0.0.1:" + string.from(port) + "/see", o);
+    print(await a.text());
+    s.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["1", "null", "abc|payload"]);
+});
+
+test.start("http: follows a redirect only when asked", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+http.Server s = http.server();
+s.route(http.Method.GET, "/from", http.Response (http.Request r) -> http.redirect(302, "/to"));
+s.route(http.Method.GET, "/to", http.Response (http.Request r) -> http.text(200, "arrived"));
+
+void async drive() {
+    int port = s.bind("127.0.0.1", 0, null);
+    async.run(background(s), void () -> { });
+    String base = "http://127.0.0.1:" + string.from(port);
+
+    http.ClientResponse a = await http.request(http.Method.GET, base + "/from", null);
+    print(string.from(a.status) + " " + string.from(a.headers["location"]));
+
+    http.ClientOptions o = { followRedirects: true };
+    http.ClientResponse b = await http.request(http.Method.GET, base + "/from", o);
+    print(string.from(b.status) + " " + await b.text());
+    s.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["302 /to", "200 arrived"]);
+});
+
+// ---- streaming ----
+
+test.start("http: streams a response out of a handler", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+type Ticks {
+    int left;
+    byte[] async next() {
+        if (self.left == 0) { return []; }
+        self.left = self.left - 1;
+        return string.toByteArray("tick" + string.from(self.left));
+    }
+}
+
+http.Server s = http.server();
+s.route(http.Method.GET, "/events", http.Response (http.Request r) -> {
+    Ticks t = { left: 3 };
+    http.Response out = http.stream(200, Future<byte[]> () -> t.next());
+    http.setHeader(out.headers, "content-type", "text/event-stream");
+    return out;
+});
+
+void async drive() {
+    int port = s.bind("127.0.0.1", 0, null);
+    async.run(background(s), void () -> { });
+
+    http.ClientResponse r = await http.request(
+        http.Method.GET, "http://127.0.0.1:" + string.from(port) + "/events", null);
+    // No length is known when the header goes out, so the framing is chunked
+    // and any Content-Length is dropped.
+    print(string.from(r.status) + " " + string.from(r.headers["transfer-encoding"])
+        + " " + string.from(r.headers["content-length"]));
+
+    // One piece per chunk: the peer's framing decides where a piece ends, so
+    // an event written on its own arrives on its own.
+    String got = "";
+    int pieces = 0;
+    while (true) {
+        byte[] piece = await r.read();
+        if (piece.length == 0) { break; }
+        if (pieces > 0) { got = got + "|"; }
+        pieces++;
+        got = got + string.fromByteArray(piece);
+    }
+    print(got);
+    print("pieces " + string.from(pieces));
+    s.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["200 chunked null", "tick2|tick1|tick0", "pieces 3"]);
+});
+
+test.start("http: a HEAD against a streaming route costs only the headers", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+int calls = 0;
+
+type Once {
+    bool sent;
+    byte[] async next() {
+        if (self.sent) { return []; }
+        self.sent = true;
+        calls = calls + 1;
+        return string.toByteArray("data");
+    }
+}
+
+http.Server s = http.server();
+s.route(http.Method.HEAD, "/events", http.Response (http.Request r) -> {
+    Once o = { sent: false };
+    return http.stream(200, Future<byte[]> () -> o.next());
+});
+
+void async drive() {
+    int port = s.bind("127.0.0.1", 0, null);
+    async.run(background(s), void () -> { });
+
+    http.ClientResponse r = await http.request(
+        http.Method.HEAD, "http://127.0.0.1:" + string.from(port) + "/events", null);
+    print(string.from(r.status) + " " + string.from(r.headers["transfer-encoding"]));
+    print("body " + string.from(string.length(await r.text())));
+    // A HEAD answers the headers of the GET and none of its body, so the
+    // producer is never asked for one.
+    print("producer calls " + string.from(calls));
+    s.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["200 chunked", "body 0", "producer calls 0"]);
+});
+
+test.start("http: a producer that fails mid-stream truncates the body", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+type Failing {
+    int left;
+    byte[] async next() {
+        if (self.left == 0) {
+            return Error("the producer gave up", http.ErrorCode.MALFORMED_RESPONSE);
+        }
+        self.left = self.left - 1;
+        return string.toByteArray("part");
+    }
+}
+
+http.Server s = http.server();
+s.route(http.Method.GET, "/broken", http.Response (http.Request r) -> {
+    Failing f = { left: 2 };
+    return http.stream(200, Future<byte[]!> () -> f.next());
+});
+
+void async drive() {
+    int port = s.bind("127.0.0.1", 0, null);
+    async.run(background(s), void () -> { });
+
+    http.ClientResponse r = await http.request(
+        http.Method.GET, "http://127.0.0.1:" + string.from(port) + "/broken", null);
+    // The status went out before the first piece was asked for, so a failure
+    // after it has no status left to say: the body ends with no terminator and
+    // the connection closes, which is the only thing that says "not the whole
+    // body" to a peer that has already read a 200.
+    print(string.from(r.status));
+    String body = await r.text() catch e {
+        print("cut short: " + e.message);
+        s.close();
+        return;
+    };
+    print("read a whole body of " + string.from(string.length(body)));
+    s.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["200", "cut short: connection closed mid-body"]);
+});
+
+test.start("http: a streaming route reads the request body in pieces", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+http.Response async count(http.Request r) {
+    int n = 0;
+    while (true) {
+        byte[] piece = await r.read() catch e { return http.text(400, e.message); };
+        if (piece.length == 0) { break; }
+        n = n + piece.length;
+    }
+    // Request.body is what a buffered route fills, and this route is not one.
+    return http.text(200, "counted " + string.from(n) + " held " + string.from(r.body.length));
+}
+
+http.Server s = http.server();
+s.routeStream(http.Method.POST, "/count", Future<http.Response> (http.Request r) -> count(r));
+
+void async drive() {
+    int port = s.bind("127.0.0.1", 0, null);
+    async.run(background(s), void () -> { });
+
+    http.ClientOptions o = { body: "0123456789" };
+    http.ClientResponse a = await http.request(
+        http.Method.POST, "http://127.0.0.1:" + string.from(port) + "/count", o);
+    print(await a.text());
+
+    // The same, chunked, which declares no length at all.
+    Socket c = await net.tcp.connect("127.0.0.1:" + string.from(port));
+    await net.write(c, string.toByteArray(
+        "POST /count HTTP/1.1" + http.CRLF + "Host: x" + http.CRLF +
+        "Transfer-Encoding: chunked" + http.CRLF + "Connection: close" + http.CRLF + http.CRLF +
+        "4" + http.CRLF + "Wiki" + http.CRLF + "5" + http.CRLF + "pedia" + http.CRLF +
+        "0" + http.CRLF + http.CRLF));
+    byte[] b = await net.read(c, 4096);
+    String t = string.fromByteArray(b);
+    int blank = string.find(t, http.CRLF2);
+    print(string.substring(t, blank + 4, string.length(t)));
+    net.close(c);
+    s.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["counted 10 held 0", "counted 9 held 0"]);
+});
+
+test.start("http: what a streaming handler leaves decides the connection", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+http.Response async ignore(http.Request r) {
+    return http.text(200, "read nothing");
+}
+
+http.Server s = http.server();
+s.routeStream(http.Method.POST, "/drop", Future<http.Response> (http.Request r) -> ignore(r));
+
+// Doubling, so a 320 KB body costs 15 concatenations rather than 32768.
+String repeat(String unit, int doublings) {
+    String out = unit;
+    int i = 0;
+    while (i < doublings) {
+        out = out + out;
+        i++;
+    }
+    return out;
+}
+
+// The write goes out on its own, because a body the server gives up on is a
+// body the client may not finish writing.
+void async pump(Socket c, String text) {
+    await net.write(c, string.toByteArray(text)) catch e { };
+}
+
+void async ask(int port, int doublings) {
+    Socket c = await net.tcp.connect("127.0.0.1:" + string.from(port));
+    String body = repeat("0123456789", doublings);
+    async.run(pump(c, "POST /drop HTTP/1.1" + http.CRLF + "Host: x" + http.CRLF +
+        "Content-Length: " + string.from(string.length(body)) + http.CRLF +
+        "Connection: keep-alive" + http.CRLF + http.CRLF + body), void () -> { });
+
+    byte[] b = await net.read(c, 4096);
+    String t = string.fromByteArray(b);
+    String head = string.toLowerCaseAscii(string.substring(t, 0, string.find(t, http.CRLF2)));
+    print(string.from(string.length(body)) + " reusable "
+        + string.from(string.contains(head, "connection: keep-alive")));
+    net.close(c);
+}
+
+void async drive() {
+    int port = s.bind("127.0.0.1", 0, null);
+    async.run(background(s), void () -> { });
+
+    // Under DRAIN_LIMIT the server reads what the handler left and keeps the
+    // connection; over it, the connection is what it gives up instead.
+    await ask(port, 3);
+    await ask(port, 15);
+    s.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["80 reusable true", "327680 reusable false"]);
+});
+
+test.start("http: a client response streams straight into a server response", void () -> {
+    h.expectOutput(SERVER_PRELUDE + `
+http.Server upstream = http.server();
+http.Server front = http.server();
+int upstreamPort = 0;
+
+http.Response async through(http.Request r) {
+    http.ClientResponse up = await http.request(
+        http.Method.GET, "http://127.0.0.1:" + string.from(upstreamPort) + "/data", null)
+        catch e { return http.text(502, "bad gateway"); };
+    // The upstream body is never held: its reader is the producer of this
+    // response, and §2.10 rule 7 wraps it as the raising member of BodyStream.
+    return http.stream(200, up.read);
+}
+
+void async drive() {
+    upstream.route(http.Method.GET, "/data", http.Response (http.Request r) ->
+        http.text(200, "one body, two connections"));
+    upstreamPort = upstream.bind("127.0.0.1", 0, null);
+    async.run(background(upstream), void () -> { });
+
+    front.routeStream(http.Method.GET, "/through",
+        Future<http.Response> (http.Request r) -> through(r));
+    int frontPort = front.bind("127.0.0.1", 0, null);
+    async.run(background(front), void () -> { });
+
+    http.ClientResponse r = await http.request(
+        http.Method.GET, "http://127.0.0.1:" + string.from(frontPort) + "/through", null);
+    print(string.from(r.status) + " " + await r.text());
+    front.close();
+    upstream.close();
+}
+await drive() catch e { print("failed: " + e.message); };
+`, ["200 one body, two connections"]);
+});
+
+// ---- the module itself ----
+
+test.start("http: a local ./http.nio does not collide with the built-in", void () -> {
+    h.expectFilesOutput([
+        h.file("http.nio", "export String greet() { return \"local\"; }"),
+        h.file("main.nio", `
+import './http' as local;
+import 'http';
+import 'string';
+print(local.greet());
+print(string.from(http.Method.GET));
+`),
+    ], "main.nio", ["local", "GET"]);
+});
+
+test.start("http: must be imported before use", void () -> {
+    h.expectCompileError(`
+http.Server s = http.server();
+`, "http is a built-in library; import it first");
+});

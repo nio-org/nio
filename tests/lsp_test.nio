@@ -1,0 +1,1604 @@
+// Tests for the parts of the language server, called directly.
+// tests/lsp_e2e_test.nio tests the protocol.
+import 'test';
+import 'string';
+import 'array';
+import 'map';
+import 'fs';
+import 'path';
+import '../src/lsp/pos' as pos;
+import '../src/lsp/uri' as docuri;
+import '../src/lsp/rpc' as rpc;
+import '../src/lsp/server' as server;
+import '../src/lsp/find' as find;
+import '../src/lsp/hover' as hover;
+import '../src/lsp/complete' as complete;
+import '../src/lsp/def' as def;
+import '../src/lsp/doc' as doc2;
+import '../src/builtins' as builtins;
+import '../src/types' as types;
+import '../src/checker' as checker;
+import '../src/loader' as loader;
+import '../src/codegen' as codegen;
+import '../src/diag' as diag;
+import '../src/token' as token;
+
+// One character of each UTF-8 width: 2, 3 and 4 bytes.
+String const E_ACUTE = string.fromByteArray([195, 169]);
+String const EURO = string.fromByteArray([226, 130, 172]);
+String const PARTY = string.fromByteArray([240, 159, 142, 137]);
+
+// ---- positions ----
+
+test.start("lsp: lines splits a document the way an editor numbers it", void () -> {
+    String[] ls = pos.lines("one\ntwo\nthree");
+    test.expectInt(ls.length, 3);
+    test.expectString(ls[0], "one");
+    test.expectString(ls[2], "three");
+
+    // The empty last line is where a caret at the end of the file sits.
+    String[] trailing = pos.lines("one\n");
+    test.expectInt(trailing.length, 2);
+    test.expectString(trailing[1], "");
+
+    // CRLF reads as LF.
+    String[] crlf = pos.lines("a" + string.fromByteArray([13]) + "\nb");
+    test.expectString(crlf[0], "a");
+
+    // The empty document is one line. An editor still shows line 1.
+    test.expectInt(pos.lines("").length, 1);
+});
+
+test.start("lsp: lineAt is total", void () -> {
+    String[] ls = pos.lines("one\ntwo");
+    test.expectString(pos.lineAt(ls, 1), "one");
+    test.expectString(pos.lineAt(ls, 2), "two");
+    // A diagnostic may name a line past the end of a truncated file.
+    test.expectString(pos.lineAt(ls, 3), "");
+    test.expectString(pos.lineAt(ls, 0), "");
+    test.expectString(pos.lineAt(ls, -1), "");
+});
+
+test.start("lsp: an ASCII column converts to itself, one less", void () -> {
+    // The compiler counts columns from 1, the protocol from 0.
+    test.expectInt(pos.utf16Col("int a = 1;", 1), 0);
+    test.expectInt(pos.utf16Col("int a = 1;", 9), 8);
+    test.expectInt(pos.utf16Col("int a = 1;", 11), 10);
+});
+
+test.start("lsp: a multi-byte character is one column, and an emoji is two", void () -> {
+    String line = "// " + E_ACUTE + " x";
+    test.expectInt(string.length(line), 7);
+    test.expectInt(pos.utf16Col(line, 7), 5);
+
+    String euro = EURO + "ab";
+    test.expectInt(pos.utf16Col(euro, 4), 1);
+    test.expectInt(pos.utf16Col(euro, 6), 3);
+
+    // UTF-16 spells a four-byte character as a surrogate pair, so it is two
+    // columns and everything after it moves by two.
+    String party = PARTY + "ab";
+    test.expectInt(pos.utf16Col(party, 5), 2);
+    test.expectInt(pos.utf16Col(party, 7), 4);
+});
+
+test.start("lsp: an out-of-range column is clamped rather than refused", void () -> {
+    // The buffer being measured may be a keystroke ahead of the position the
+    // compiler computed.
+    test.expectInt(pos.utf16Col("abc", 99), 3);
+    test.expectInt(pos.utf16Col("abc", 0), 0);
+    test.expectInt(pos.utf16Col("", 1), 0);
+});
+
+// One line of all three UTF-8 widths. The table is written by hand.
+//
+//   byte:       1   2 3   4   5 6 7   8   9 10 11 12  13   (14)
+//   character:  a   é     b   €       c   🎉            d
+//               0   1     2   3       4   5  6      7   (8)
+String const MIXED = "a" + E_ACUTE + "b" + EURO + "c" + PARTY + "d";
+int[] const STARTS = [1, 2, 4, 5, 8, 9, 13, 14];    // byte column, 1-based
+int[] const CHARS = [0, 1, 2, 3, 4, 5, 7, 8];       // LSP character, 0-based
+
+test.start("lsp: byteCol inverts utf16Col at every character", void () -> {
+    test.expectInt(string.length(MIXED), 13);
+    forEach(STARTS, col, i) {
+        test.expectInt(pos.utf16Col(MIXED, col), CHARS[i]);
+        test.expectInt(pos.byteCol(MIXED, CHARS[i]), col);
+    }
+});
+
+test.start("lsp: a position inside a character rounds to a boundary", void () -> {
+    // Both conversions round to the boundary after the character the position
+    // is inside. No column either side can name sits within a character.
+    test.expectInt(pos.utf16Col(MIXED, 3), 2);     // é's second byte -> after the é
+    test.expectInt(pos.utf16Col(MIXED, 6), 4);     // inside € -> after the €
+    test.expectInt(pos.utf16Col(MIXED, 11), 7);    // inside the emoji -> after it
+
+    // Character 6 is the emoji's low surrogate, half of one character.
+    test.expectInt(pos.byteCol(MIXED, 6), 13);
+});
+
+test.start("lsp: byteCol past the end of a line is one past its last byte", void () -> {
+    test.expectInt(pos.byteCol("abc", 0), 1);
+    test.expectInt(pos.byteCol("abc", 3), 4);
+    test.expectInt(pos.byteCol("abc", 99), 4);
+    test.expectInt(pos.byteCol("", 0), 1);
+});
+
+test.start("lsp: a squiggle covers the word the compiler pointed at", void () -> {
+    test.expectInt(pos.wordEnd("int total = 1;", 5), 10);    // "total"
+    test.expectInt(pos.wordEnd("int total = 1;", 1), 4);     // "int"
+    test.expectInt(pos.wordEnd("x = 1234;", 5), 9);          // a number is a word too
+
+    // Punctuation is one character: a wider guess underlines the expression
+    // after it.
+    test.expectInt(pos.wordEnd("a = b;", 3), 4);    // "="
+
+    // A string literal is taken whole. Many diagnostics report at the opening
+    // quote, and a squiggle under a lone " reads as a complaint about it.
+    test.expectInt(pos.wordEnd("int a = \"text\";", 9), 15);
+    test.expectInt(pos.wordEnd("int a = 'text';", 9), 15);
+
+    // An escaped delimiter does not close the literal.
+    test.expectInt(pos.wordEnd("x = \"a\\\"b\";", 5), 11);
+
+    // An unterminated one stops at the end of the line.
+    test.expectInt(pos.wordEnd("x = \"unclosed", 5), 14);
+
+    test.expectInt(pos.wordEnd("abc", 4), 4);
+    test.expectInt(pos.wordEnd("abc", 9), 4);
+    test.expectInt(pos.wordEnd("", 1), 1);
+});
+
+test.start("lsp: a diagnostic becomes a range at the right place", void () -> {
+    // server.wire turns a byte position into a character range.
+    String[] ls = pos.lines("// " + E_ACUTE + "\nint total = \"x\";");
+    diag.Diagnostic d = diag.at(2, 5, "cannot use String as int");
+    server.Diagnostic w = server.wire(ls, d);
+    test.expectInt(w.range.start.line, 1);         // 0-based
+    test.expectInt(w.range.start.character, 4);    // "total" begins at byte 5
+    test.expectInt(w.range.end.character, 9);      // and ends after it
+    test.expectInt(w.severity, 1);
+    test.expectString(w.source, "nio");
+    test.expectString(w.message, "cannot use String as int");
+
+    // A file whose text could not be read still produces a position.
+    server.Diagnostic blind = server.wire([], diag.at(7, 3, "boom"));
+    test.expectInt(blind.range.start.line, 6);
+    test.expectInt(blind.range.start.character, 0);
+});
+
+test.start("lsp: a span squiggles exactly the source it names", void () -> {
+    // With a span, the range is the span of the diagnostic. A diagnostic with
+    // no span still gets the length of the word at its position, as above.
+    String[] ls = pos.lines("// " + E_ACUTE + "\nint total = \"x\";");
+    token.Token t = {
+        type: token.STRING, literal: "x", line: 2, col: 13,
+        note: "", quote: "\"", endLine: 2, endCol: 16,
+    };
+    server.Diagnostic w = server.wire(ls, diag.atTok(t, "cannot use String as int"));
+    test.expectInt(w.range.start.line, 1);
+    test.expectInt(w.range.start.character, 12);
+    test.expectInt(w.range.end.line, 1);
+    test.expectInt(w.range.end.character, 15);
+
+    // A span across lines ends on the line it ends on, and the character is
+    // counted in that line's own text.
+    token.Token multi = {
+        type: token.STRING, literal: "", line: 1, col: 4,
+        note: "", quote: "`", endLine: 2, endCol: 4,
+    };
+    server.Diagnostic across = server.wire(ls, diag.atTok(multi, "about the string"));
+    test.expectInt(across.range.start.line, 0);
+    test.expectInt(across.range.end.line, 1);
+    test.expectInt(across.range.end.character, 3);
+});
+
+// ---- URIs ----
+
+test.start("lsp: a file URI becomes a path and back", void () -> {
+    test.expectString(docuri.toPath("file:///Users/ada/main.nio"), "/Users/ada/main.nio");
+    test.expectString(docuri.fromPath("/Users/ada/main.nio"), "file:///Users/ada/main.nio");
+
+    test.expectString(docuri.toPath("file:///a/my%20project/x.nio"), "/a/my project/x.nio");
+    test.expectString(docuri.fromPath("/a/my project/x.nio"), "file:///a/my%20project/x.nio");
+
+    // Non-ASCII escapes as its UTF-8 bytes, one escape each.
+    String accented = "/a/caf" + E_ACUTE + ".nio";
+    test.expectString(docuri.fromPath(accented), "file:///a/caf%C3%A9.nio");
+    test.expectString(docuri.toPath(docuri.fromPath(accented)), accented);
+
+    // A client may send a lower-case escape.
+    test.expectString(docuri.toPath("file:///a/caf%c3%a9.nio"), accented);
+});
+
+test.start("lsp: a URI that is not a file answers nothing", void () -> {
+    // "" tells the server there is nothing to check: an unsaved buffer has no
+    // directory for its imports to resolve against.
+    test.expectString(docuri.toPath("untitled:Untitled-1"), "");
+    test.expectString(docuri.toPath("vscode-notebook-cell:/x.nio"), "");
+    test.expectString(docuri.toPath("file://"), "");
+    test.expectString(docuri.toPath(""), "");
+});
+
+test.start("lsp: a Windows drive URI drops the leading slash", void () -> {
+    // A drive is recognized by its shape, so this test runs on every
+    // platform.
+    test.expectString(docuri.toPath("file:///C:/dev/main.nio"), "C:/dev/main.nio");
+    test.expectString(docuri.toPath("file:///c%3A/dev/main.nio"), "c:/dev/main.nio");
+    // A POSIX path whose second character is a colon is not a drive.
+    test.expectString(docuri.toPath("file:///ab:cd"), "/ab:cd");
+});
+
+test.start("lsp: a stray percent is data, not a broken escape", void () -> {
+    // An incomplete escape stays as written. It is more probably a literal %
+    // than a bad escape.
+    test.expectString(docuri.decode("100%"), "100%");
+    test.expectString(docuri.decode("%zz"), "%zz");
+    test.expectString(docuri.decode("%2"), "%2");
+    test.expectString(docuri.decode("a%20b%zzc"), "a b%zzc");
+});
+
+// ---- framing ----
+
+test.start("lsp: a header line declares a length or it does not", void () -> {
+    test.expectInt(rpc.contentLength("Content-Length: 42"), 42);
+    test.expectInt(rpc.contentLength("Content-Length:42"), 42);
+    test.expectInt(rpc.contentLength("Content-Length:   42   "), 42);
+    // HTTP field names are case-insensitive and clients differ.
+    test.expectInt(rpc.contentLength("content-length: 42"), 42);
+    test.expectInt(rpc.contentLength("CONTENT-LENGTH: 42"), 42);
+    test.expectInt(rpc.contentLength("Content-Length: 0"), 0);
+
+    // -1 means the header declares no length.
+    test.expectInt(rpc.contentLength("Content-Type: application/vscode-jsonrpc"), -1);
+    test.expectInt(rpc.contentLength("Content-Length"), -1);
+    test.expectInt(rpc.contentLength(""), -1);
+    test.expectInt(rpc.contentLength("Content-Length: abc"), -1);
+    test.expectInt(rpc.contentLength("Content-Length: -5"), -1);
+});
+
+// ---- the loader's two additions ----
+
+test.start("lsp: checkEntry finds what compileEntry finds", void () -> {
+    // Checking and compiling must not disagree about whether a program is
+    // correct.
+    String bad = `int a = "text";
+String b = 3;
+`;
+    loader.CompileResult checked = loader.checkEntry(bad, ".", "bad.nio", {});
+    loader.CompileResult compiled = loader.compileEntry(bad, ".", "bad.nio", codegen.noOptions());
+    test.expectInt(checked.errs.length, compiled.errs.length);
+    test.assert(checked.errs.length > 0, "expected the program not to check");
+    forEach(checked.errs, e, i) {
+        test.expectString(e, compiled.errs[i]);
+    }
+
+    // On a correct program, only compileEntry generates code.
+    loader.CompileResult okChecked = loader.checkEntry("print(\"hi\");", ".", "ok.nio", {});
+    loader.CompileResult okCompiled = loader.compileEntry("print(\"hi\");", ".", "ok.nio", codegen.noOptions());
+    test.expectInt(okChecked.errs.length, 0);
+    test.expectInt(okCompiled.errs.length, 0);
+    test.expectString(okChecked.ir, "");
+    test.assert(string.length(okCompiled.ir) > 0, "compileEntry emitted no IR");
+    // A check still reports the C files a build needs.
+    test.expectInt(okChecked.cfiles.length, okCompiled.cfiles.length);
+});
+
+test.start("lsp: an open buffer stands in for a file that is not on the disk", void () -> {
+    // Without the overlay this is "cannot import": the file is never written.
+    String dir = fs.createTempDir("nio-lsp-");
+    String helper = loader.resolveImport(dir, "./helper");
+    Map<String, String> open = {};
+    open[helper] = "export int n = 7;\n";
+
+    String main = `import './helper' as hp;
+print(hp.n);
+`;
+    loader.CompileResult with = loader.checkEntry(main, dir, path.join(dir, "main.nio"), open);
+    test.expectInt(with.errs.length, 0);
+
+    loader.CompileResult without = loader.checkEntry(main, dir, path.join(dir, "main.nio"), {});
+    test.assert(without.errs.length > 0, "expected the import to fail without the buffer");
+    test.assert(string.contains(without.errs[0], "cannot import"),
+        "expected a missing-module error, got: " + without.errs[0]);
+    fs.delete(dir, { recursive: true }) catch e { };
+});
+
+test.start("lsp: an open buffer wins over the file beside it", void () -> {
+    // The diagnostics must describe the copy in the editor. The saved file
+    // can be different.
+    String dir = fs.createTempDir("nio-lsp-");
+    String helper = loader.resolveImport(dir, "./helper");
+    fs.writeFile(helper, string.toByteArray("export int n = 7;\n"));
+
+    String main = `import './helper' as hp;
+print(hp.n);
+`;
+    // As saved: nothing wrong.
+    test.expectInt(loader.checkEntry(main, dir, path.join(dir, "main.nio"), {}).errs.length, 0);
+
+    // As held in the editor: wrong, and reported against the helper's own file.
+    Map<String, String> open = {};
+    open[helper] = "export String n = 7;\n";
+    loader.CompileResult res = loader.checkEntry(main, dir, path.join(dir, "main.nio"), open);
+    test.assert(res.errs.length > 0, "expected the buffer's error to be found");
+    test.expectInt(res.diags.length, res.errs.length);
+    test.expectString(res.diags[0].file, helper);
+    test.assert(string.contains(res.diags[0].message, "cannot use int as String"),
+        "unexpected message: " + res.diags[0].message);
+    fs.delete(dir, { recursive: true }) catch e { };
+});
+
+test.start("lsp: a diagnostic names the file it is about, ready to be a URI", void () -> {
+    // diag.Diagnostic.file is a path the server turns into a document. The
+    // entry file's is "".
+    String dir = fs.createTempDir("nio-lsp-");
+    String helper = loader.resolveImport(dir, "./helper");
+    fs.writeFile(helper, string.toByteArray("export String n = 7;\n"));
+    loader.CompileResult res = loader.checkEntry(`import './helper' as hp;
+print(hp.n);
+`, dir, path.join(dir, "main.nio"), {});
+    test.assert(res.diags.length > 0, "expected an error in the imported module");
+    test.expectString(docuri.toPath(docuri.fromPath(res.diags[0].file)), helper);
+
+    loader.CompileResult own = loader.checkEntry("int a = \"x\";", dir,
+        path.join(dir, "main.nio"), {});
+    test.assert(own.diags.length > 0, "expected an error in the entry file");
+    test.expectString(own.diags[0].file, "");
+    fs.delete(dir, { recursive: true }) catch e { };
+});
+
+// ---- what is at a position ----
+//
+// No AST node has an end position. Thus the finder looks for the name that
+// contains a position.
+
+// A program with one of everything worth pointing at.
+String const PROG = `type Car {
+    String make;
+    int speed;
+
+    int faster(int by) {
+        return self.speed + by;
+    }
+}
+
+enum Status { OK: 200, MISSING: 404 }
+
+int total = 0;
+
+int add(int a, int b) {
+    int sum = a + b;
+    return sum;
+}
+
+Car c = { make: "toyota", speed: 90 };
+`;
+
+loader.Checked checkDoc(String src) {
+    loader.CompileResult res = loader.checkEntry(src, ".", "doc.nio", {});
+    test.expectInt(res.errs.length, 0);
+    test.assert(res.checked.length > 0, "nothing was checked");
+    loader.Checked? found = null;
+    forEach(res.checked, c) {
+        if (c.file == "") {
+            found = c;
+        }
+    }
+    test.assert(found != null, "the entry module was not among the checked ones");
+    if (found == null) {
+        // Unreachable after the assert, and the optional type needs the branch.
+        return Error("no entry module");
+    }
+    return found;
+}
+
+// world is every module a check produced, keyed as src/lsp/def.nio wants it.
+Map<String, loader.Checked> world(loader.Checked doc) {
+    Map<String, loader.Checked> w = {};
+    w[doc.file] = doc;
+    return w;
+}
+
+String hoverAt(loader.Checked doc, int line, int col) {
+    return hover.render(doc, world(doc), line, col);
+}
+
+test.start("lsp: a position finds the name it is inside", void () -> {
+    loader.Checked doc = checkDoc(PROG);
+    // A caret directly after a name is on that name. Completion of a name
+    // needs this.
+    for (int col = 5; col <= 10; col++) {
+        find.Hit? h = find.at(doc.prog, 12, col);
+        test.assert(h != null, "nothing found at 12:" + string.from(col));
+        if (h != null) {
+            test.expectString(h.name, "total");
+        }
+    }
+    // By the same rule the space after `int` is the end of `int`. Adjacent
+    // names never overlap.
+    find.Hit? before = find.at(doc.prog, 12, 4);
+    test.assert(before != null, "the column after a name should still be on it");
+    if (before != null) {
+        test.expectString(before.name, "int");
+    }
+});
+
+test.start("lsp: a position on punctuation finds nothing", void () -> {
+    loader.Checked doc = checkDoc(PROG);
+    // The finder does not answer the enclosing statement.
+    test.assert(find.at(doc.prog, 12, 11) == null, "= is not a name");
+    test.assert(find.at(doc.prog, 12, 13) == null, "a literal is not a name");
+    test.assert(find.at(doc.prog, 8, 1) == null, "a closing brace is not a name");
+    test.assert(find.at(doc.prog, 999, 1) == null, "a line past the end is not a name");
+});
+
+test.start("lsp: a member's property is found after its dot", void () -> {
+    loader.Checked doc = checkDoc(PROG);
+    // In `        return self.speed + by;`, `speed` begins at byte 21.
+    find.Hit? h = find.at(doc.prog, 6, 21);
+    test.assert(h != null, "the property after a dot was not found");
+    if (h != null) {
+        test.expectString(h.name, "speed");
+        test.assert(h.object != null, "a member hit should carry the object before the dot");
+    }
+    find.Hit? obj = find.at(doc.prog, 6, 16);
+    test.assert(obj != null, "the object before a dot was not found");
+    if (obj != null) {
+        test.expectString(obj.name, "self");
+    }
+});
+
+test.start("lsp: a declaration's own name is found", void () -> {
+    // `tok` on a declaration is where the statement begins, so the finder reads
+    // ast.nameTok instead.
+    loader.Checked doc = checkDoc(PROG);
+    find.Hit? typ = find.at(doc.prog, 1, 6);
+    test.assert(typ != null, "a type declaration's name was not found");
+    if (typ != null) {
+        test.expectString(typ.name, "Car");
+        test.assert(typ.decl != null, "it should carry its declaration");
+    }
+    find.Hit? fld = find.at(doc.prog, 2, 12);
+    test.assert(fld != null, "a field's name was not found");
+    if (fld != null) {
+        test.expectString(fld.name, "make");
+        test.assert(fld.declType != null, "a field should carry its written type");
+    }
+    find.Hit? prm = find.at(doc.prog, 5, 20);
+    test.assert(prm != null, "a parameter's name was not found");
+    if (prm != null) {
+        test.expectString(prm.name, "by");
+    }
+});
+
+// ---- hover ----
+
+test.start("lsp: hover says what a thing is", void () -> {
+    loader.Checked doc = checkDoc(PROG);
+    // The fence makes an editor colour the type with the file's own grammar.
+    test.expectString(hoverAt(doc, 12, 5),
+        "```nio\nint total\n```");
+    test.expectString(hoverAt(doc, 15, 9), "```nio\nint sum\n```");
+    test.expectString(hoverAt(doc, 16, 12), "```nio\nint sum\n```");
+    // A function shows as its declaration, with the parameter names from it.
+    // types.typeString writes no parameter names.
+    test.expectString(hoverAt(doc, 14, 5),
+        "```nio\nint add(int a, int b)\n```");
+    test.expectString(hoverAt(doc, 14, 13), "```nio\nint a\n```");
+    test.expectString(hoverAt(doc, 6, 21), "```nio\nint speed\n```");
+    test.expectString(hoverAt(doc, 10, 15),
+        "```nio\nStatus.OK = 200\n```");
+});
+
+test.start("lsp: hovering a type name shows the type", void () -> {
+    loader.Checked doc = checkDoc(PROG);
+    // A type name answers its declaration, at the declaration and at every use.
+    String fence = string.fromByteArray([96, 96, 96]);
+    String want = fence + "nio\ntype Car {\n    String make;\n    int speed;\n"
+        + "    int faster(int);\n}\n" + fence;
+    test.expectString(hoverAt(doc, 1, 6), want);
+    test.expectString(hoverAt(doc, 19, 1), want);
+});
+
+test.start("lsp: hovering nothing says nothing", void () -> {
+    loader.Checked doc = checkDoc(PROG);
+    test.expectString(hoverAt(doc, 12, 11), "");
+    test.expectString(hoverAt(doc, 999, 1), "");
+});
+
+// ---- completion ----
+//
+// Completion must work on a document that does not compile, because the user
+// is typing a name. The line is read as text and the answers come from the
+// tables of the compiler.
+
+// The detail offered beside a label, or "" when the label is absent.
+String detail(Map<String, String> got, String label) {
+    String? d = got[label];
+    if (d == null) {
+        return "";
+    }
+    return d;
+}
+
+Map<String, String> labels(complete.Item[] items) {
+    Map<String, String> out = {};
+    forEach(items, it) {
+        out[it.label] = it.detail;
+    }
+    return out;
+}
+
+test.start("lsp: the line says what is being completed", void () -> {
+    // The path is what precedes the last dot. The prefix is what is typed of
+    // the name, and is empty right after a dot.
+    complete.Context a = complete.contextAt("    print(string.", 18);
+    test.expectInt(a.path.length, 1);
+    test.expectString(a.path[0].name, "string");
+    test.expectString(a.prefix, "");
+
+    complete.Context b = complete.contextAt("    print(string.len", 21);
+    test.expectInt(b.path.length, 1);
+    test.expectString(b.prefix, "len");
+
+    complete.Context c = complete.contextAt("process.stdout.wr", 18);
+    test.expectInt(c.path.length, 2);
+    test.expectString(c.path[0].name, "process");
+    test.expectString(c.path[1].name, "stdout");
+    test.expectString(c.prefix, "wr");
+
+    // A bare name has no path, which selects the in-scope list.
+    complete.Context d = complete.contextAt("    tot", 8);
+    test.expectInt(d.path.length, 0);
+    test.expectString(d.prefix, "tot");
+
+    // In `x = 1.` the lexer reads `1.` as one FLOAT token, so there is no path.
+    complete.Context e = complete.contextAt("x = 1.", 7);
+    test.expectInt(e.path.length, 0);
+
+    // A keyword is a name here. The list must not vanish on the keystroke that
+    // completes a keyword's spelling.
+    complete.Context k = complete.contextAt("s = string.for", 15);
+    test.expectInt(k.path.length, 1);
+    test.expectString(k.prefix, "for");
+});
+
+test.start("lsp: what was applied to a name is part of the path", void () -> {
+    // A call is part of the path. A scan that stops at the `)` finds no path,
+    // and with no path every name in scope is offered.
+    complete.Context call = complete.contextAt("advise(Signal.FLAT).", 21);
+    test.expectInt(call.path.length, 1);
+    test.expectString(call.path[0].name, "advise");
+    test.expectInt(call.path[0].applied.length, 1);
+    test.assert(call.path[0].applied[0], "a call should be recorded as one");
+
+    // An index is the other suffix.
+    complete.Context idx = complete.contextAt("x = a[0].", 10);
+    test.expectInt(idx.path.length, 1);
+    test.expectString(idx.path[0].name, "a");
+    test.expectInt(idx.path[0].applied.length, 1);
+    test.assert(!idx.path[0].applied[0], "an index should not be recorded as a call");
+
+    // Both, in the order they were written.
+    complete.Context both = complete.contextAt("rows()[2].", 11);
+    test.expectInt(both.path.length, 1);
+    test.expectInt(both.path[0].applied.length, 2);
+    test.assert(both.path[0].applied[0], "the call came first");
+    test.assert(!both.path[0].applied[1], "the index came second");
+
+    // A call in the middle of a path. Each suffix attaches to its segment.
+    complete.Context mid = complete.contextAt("c.faster(1).", 13);
+    test.expectInt(mid.path.length, 2);
+    test.expectInt(mid.path[0].applied.length, 0);
+    test.expectInt(mid.path[1].applied.length, 1);
+
+    // A bracket inside a string is text. A quote is the same at both ends, so
+    // the lexer of the compiler reads the line from its start.
+    complete.Context quoted = complete.contextAt("f(\"a)b\").", 10);
+    test.expectInt(quoted.path.length, 1);
+    test.expectString(quoted.path[0].name, "f");
+    test.expectInt(quoted.path[0].applied.length, 1);
+
+    // A closing bracket with no opener on the line gives no path.
+    complete.Context torn = complete.contextAt("x).", 4);
+    test.expectInt(torn.path.length, 0);
+});
+
+test.start("lsp: a built-in module offers its functions", void () -> {
+    loader.Checked doc = checkDoc("import 'string';\nint n = 0;\n");
+    // The answers come from the table of the compiler, so each offered
+    // function compiles.
+    Map<String, String> got = labels(complete.at(doc.prog, doc.info, "string.", 2, 8));
+    test.expectString(detail(got, "length"), "int length(String s)");
+    test.assert(got["toUpperCaseAscii"] != null, "string.toUpperCaseAscii should be offered");
+    forEach(builtins.members("string"), name) {
+        test.assert(got[name] != null, "string." + name + " is in the table but was not offered");
+    }
+    test.expectInt(map.keys(got).length, builtins.members("string").length);
+});
+
+// The member table is a third table beside builtinSigs and builtinAvailable:
+// neither of those can answer "what may follow this dot". The tests below hold
+// it to builtinSigs in both directions, so a built-in added without a member
+// entry fails here.
+
+// lastDot splits a table key into owner and name. "time.date.addDays" is a
+// module, a namespace and a function, so the owner is everything before the
+// last dot.
+int lastDot(String key) {
+    int cut = -1;
+    for (int i = 0; i < string.length(key); i++) {
+        if (key[i] == 46) {
+            cut = i;
+        }
+    }
+    return cut;
+}
+
+test.start("lsp: every built-in signature is a member of its module", void () -> {
+    forEach(map.keys(builtins.builtinSigs), key) {
+        int cut = -1;
+        for (int i = 0; i < string.length(key); i++) {
+            if (key[i] == 46) {
+                cut = i;
+            }
+        }
+        test.assert(cut > 0, "a signature key with no dot: " + key);
+        if (cut <= 0) {
+            return;
+        }
+        String owner = string.substring(key, 0, cut);
+        String name = string.substring(key, cut + 1, string.length(key));
+        bool listed = false;
+        forEach(builtins.members(owner), m) {
+            if (m == name) {
+                listed = true;
+            }
+        }
+        test.assert(listed, key + " has a signature but is not a member of " + owner);
+    }
+});
+
+test.start("lsp: every built-in member has something to show", void () -> {
+    // Every member is a function with a signature, a function with §6's written
+    // shape in builtinShapes, or a namespace. A fourth kind is a mistake.
+    forEach(map.keys(builtins.builtinMemberNames), owner) {
+        forEach(builtins.members(owner), name) {
+            String key = owner + "." + name;
+            if (builtins.hasSig(owner, name) || builtins.isNamespace(owner, name)) {
+                continue;
+            }
+            test.assert(builtins.shape(owner, name) != "",
+                key + " is listed as a member but has no signature, no members of "
+                + "its own, and no written shape -- nothing to hover");
+        }
+    }
+    // Each row in the shapes table must be a member. This finds a row that a
+    // renamed function left behind.
+    forEach(map.keys(builtins.builtinShapes), key) {
+        int cut = lastDot(key);
+        String owner = string.substring(key, 0, cut);
+        String name = string.substring(key, cut + 1, string.length(key));
+        test.assert(!builtins.hasSig(owner, name),
+            key + " has both a signature and a written shape; only one can be shown");
+        bool listed = false;
+        forEach(builtins.members(owner), m) {
+            if (m == name) {
+                listed = true;
+            }
+        }
+        test.assert(listed, key + " has a shape but is not a member of " + owner);
+    }
+});
+
+test.start("lsp: every built-in signature names its parameters", void () -> {
+    // A types.FuncType is a list of types and has nowhere to keep a name, so
+    // the names live beside it in builtinParamNames.
+    forEach(map.keys(builtins.builtinSigs), key) {
+        int cut = lastDot(key);
+        String owner = string.substring(key, 0, cut);
+        String name = string.substring(key, cut + 1, string.length(key));
+        types.FuncType? fn = builtins.lookupSig(owner, name);
+        if (fn == null) {
+            test.assert(false, "no signature for " + key);
+            return;
+        }
+        String[] names = builtins.paramNames(owner, name);
+        test.expectInt(names.length, fn.params.length);
+        forEach(names, n) {
+            test.assert(n != "", key + " has an empty parameter name");
+        }
+    }
+});
+
+test.start("lsp: a namespace inside a module offers its own", void () -> {
+    loader.Checked doc = checkDoc("import 'process';\nint n = 0;\n");
+    Map<String, String> got = labels(
+        complete.at(doc.prog, doc.info, "process.stdout.", 2, 16));
+    test.expectString(detail(got, "write"), "void write(String s)");
+    test.expectString(detail(got, "flush"), "void flush()");
+    test.expectInt(map.keys(got).length, 2);
+
+    // The module offers the namespace as well as its functions.
+    Map<String, String> mod = labels(complete.at(doc.prog, doc.info, "process.", 2, 9));
+    test.assert(mod["stdout"] != null, "the stdout namespace should be offered");
+    test.assert(mod["exit"] != null, "process.exit should be offered");
+});
+
+test.start("lsp: a value offers its type's fields and methods", void () -> {
+    loader.Checked doc = checkDoc(PROG);
+    // `c` is a Car declared at the end of PROG.
+    Map<String, String> got = labels(complete.at(doc.prog, doc.info, "c.", 20, 3));
+    test.expectString(detail(got, "make"), "String");
+    test.expectString(detail(got, "speed"), "int");
+    test.expectString(detail(got, "faster"), "int faster(int by)");
+    test.expectInt(map.keys(got).length, 3);
+});
+
+test.start("lsp: an enum offers its members and their values", void () -> {
+    loader.Checked doc = checkDoc(PROG);
+    Map<String, String> got = labels(complete.at(doc.prog, doc.info, "Status.", 20, 8));
+    test.expectString(detail(got, "OK"), "Status = 200");
+    test.expectString(detail(got, "MISSING"), "Status = 404");
+    test.expectInt(map.keys(got).length, 2);
+});
+
+test.start("lsp: a bare name offers what is in scope, innermost first", void () -> {
+    loader.Checked doc = checkDoc(PROG);
+    // Inside add's body: the parameters, the local, and everything at module
+    // level.
+    Map<String, String> got = labels(complete.at(doc.prog, doc.info, "    return ", 16, 12));
+    test.expectString(detail(got, "a"), "int");
+    test.expectString(detail(got, "b"), "int");
+    test.expectString(detail(got, "sum"), "int");
+    test.expectString(detail(got, "total"), "int");
+    test.assert(got["add"] != null, "a module-level function should be offered");
+    test.assert(got["Car"] != null, "a type should be offered");
+    test.assert(got["Status"] != null, "an enum should be offered");
+    // The four names always in scope, and the keywords, from the compiler's
+    // own tables.
+    test.assert(got["print"] != null, "print is always in scope");
+    test.assert(got["Error"] != null, "Error is always in scope");
+    test.assert(got["return"] != null, "keywords should be offered");
+    test.assert(got["int"] != null, "built-in type names should be offered");
+});
+
+test.start("lsp: a local is not offered before it is declared", void () -> {
+    loader.Checked doc = checkDoc(PROG);
+    // On its own declaration `sum` is not yet a name.
+    Map<String, String> got = labels(complete.at(doc.prog, doc.info, "    int sum = ", 15, 15));
+    test.assert(got["a"] != null, "a parameter is in scope");
+    test.assert(got["sum"] == null, "a local should not be offered on its own declaration");
+});
+
+test.start("lsp: completing what has no members answers nothing", void () -> {
+    loader.Checked doc = checkDoc(PROG);
+    // A String has no properties: every operation on one is a module function.
+    test.expectInt(complete.at(doc.prog, doc.info, "c.make.", 20, 8).length, 0);
+    test.expectInt(complete.at(doc.prog, doc.info, "nosuchthing.", 20, 13).length, 0);
+});
+
+test.start("lsp: a call is completed on what it returns, not on itself", void () -> {
+    // advise returns a String, which has no members, so the answer is nothing.
+    loader.Checked doc = checkDoc(`enum Signal { FLAT: 0, UP: 1 }
+
+type Reading { int at; String note; }
+
+String advise(Signal s) {
+    return "hold";
+}
+
+Reading latest() {
+    Reading r = { at: 0, note: "" };
+    return r;
+}
+
+Reading[] history = [];
+`);
+    test.expectInt(complete.at(doc.prog, doc.info, "advise(Signal.FLAT).", 20, 21).length, 0);
+
+    // A call that returns something with members is completed on it.
+    Map<String, String> rec = labels(complete.at(doc.prog, doc.info, "latest().", 20, 10));
+    test.expectString(detail(rec, "at"), "int");
+    test.expectString(detail(rec, "note"), "String");
+
+    Map<String, String> idx = labels(complete.at(doc.prog, doc.info, "history[0].", 20, 12));
+    test.expectString(detail(idx, "note"), "String");
+
+    // An int has no members. A list of the result's fields would hide the
+    // mistake.
+    test.expectInt(complete.at(doc.prog, doc.info, "latest().at.", 20, 13).length, 0);
+
+    // A built-in module function is followed through to its result.
+    loader.Checked fsdoc = checkDoc("import 'fs';\nimport 'string';\nint n = 0;\n");
+    Map<String, String> st = labels(complete.at(fsdoc.prog, fsdoc.info, "fs.stat(\"x\").", 3, 14));
+    test.assert(st["size"] != null, "fs.stat's result should offer its fields");
+});
+
+test.start("lsp: a position inside a comment completes nothing", void () -> {
+    loader.Checked doc = checkDoc(`// counting the cars
+int total = 0;
+/* several
+   lines of it */
+int more = 1;
+`);
+    test.expectInt(complete.at(doc.prog, doc.info, "// counting the cars", 1, 12).length, 0);
+    test.expectInt(complete.at(doc.prog, doc.info, "   lines of it */", 4, 10).length, 0);
+    test.assert(complete.at(doc.prog, doc.info, "int more = ", 5, 12).length > 0,
+        "the line after a comment is not in it");
+});
+
+// ---- comments, and the prose above a declaration ----
+
+test.start("lsp: the lexer keeps the comments it steps over", void () -> {
+    loader.Checked doc = checkDoc(`// a file comment
+
+// what this counts
+int total = 0;   // and a remark about it
+/* a block
+   over two lines */
+int more = 1;
+`);
+    test.expectInt(doc.prog.comments.length, 4);
+    test.expectString(doc.prog.comments[0].text, "// a file comment");
+    test.expectInt(doc.prog.comments[0].line, 1);
+    test.expectInt(doc.prog.comments[0].endLine, 1);
+    test.assert(doc.prog.comments[0].ownLine, "a comment on line 1 is on its own line");
+
+    // ownLine exists to tell a comment trailing code from prose above a
+    // declaration.
+    test.expectString(doc.prog.comments[2].text, "// and a remark about it");
+    test.assert(!doc.prog.comments[2].ownLine, "a comment after code is not on its own line");
+
+    // A block comment is one comment, however many lines it spans.
+    test.expectInt(doc.prog.comments[3].line, 5);
+    test.expectInt(doc.prog.comments[3].endLine, 6);
+});
+
+test.start("lsp: a doc comment is the block directly above", void () -> {
+    // `//` lines chain upward into one block, and a blank line ends it.
+    loader.Checked doc = checkDoc(`// about the file, not about anything below it
+
+// Adds two numbers.
+// Twice, if you call it twice.
+int add(int a, int b) {
+    return a + b;
+}
+
+int loose = 0;   // trailing
+
+int after = 1;
+`);
+    String want = "Adds two numbers.\nTwice, if you call it twice.";
+    test.expectString(doc2.above(doc.prog.comments, 5), want);
+    // A blank line separates the file comment from the first declaration.
+    test.expectString(doc2.above(doc.prog.comments, 1), "");
+    // A trailing comment documents nothing below it.
+    test.expectString(doc2.above(doc.prog.comments, 11), "");
+});
+
+// `nio doc` (src/doccmd.nio) reads the prose of a module from the block on
+// line 1. It uses the same reader as hover, so both find the same prose.
+test.start("lsp: the prose at the top of a file documents the module", void () -> {
+    loader.Checked doc = checkDoc(`// About the file.
+//
+// And a second paragraph.
+
+// About the function.
+int add(int a, int b) {
+    return a + b;
+}
+`);
+    test.expectString(doc2.atTop(doc.prog.comments, 6),
+        "About the file.\n\nAnd a second paragraph.");
+
+    // A block sitting directly above the first declaration documents that
+    // declaration, and the module then has no prose of its own.
+    loader.Checked tight = checkDoc(`// About the count, and nothing else.
+int n = 0;
+`);
+    test.expectString(doc2.atTop(tight.prog.comments, 2), "");
+    test.expectString(doc2.above(tight.prog.comments, 2), "About the count, and nothing else.");
+});
+
+test.start("lsp: a block comment loses its markers and its left rail", void () -> {
+    loader.Checked doc = checkDoc(`/*
+ * What this does.
+ *
+ * And why.
+ */
+int n = 0;
+`);
+    test.expectString(doc2.above(doc.prog.comments, 6), "What this does.\n\nAnd why.");
+
+    loader.Checked bare = checkDoc(`/* one line */
+int n = 0;
+`);
+    test.expectString(doc2.above(bare.prog.comments, 2), "one line");
+});
+
+test.start("lsp: hover shows the prose above a declaration", void () -> {
+    loader.Checked doc = checkDoc(`// Adds two numbers.
+int add(int a, int b) {
+    return a + b;
+}
+
+// How many cars there are.
+int total = 0;
+
+int n = add(1, 2);
+`);
+    test.expectString(hoverAt(doc, 2, 5),
+        "```nio\nint add(int a, int b)\n```\n\n---\n\nAdds two numbers.");
+    // The doc travels with the declaration the name resolves to, so a call
+    // shows it too.
+    test.expectString(hoverAt(doc, 9, 9),
+        "```nio\nint add(int a, int b)\n```\n\n---\n\nAdds two numbers.");
+    test.expectString(hoverAt(doc, 7, 5),
+        "```nio\nint total\n```\n\n---\n\nHow many cars there are.");
+    // With no prose above it the fence carries no rule under it.
+    test.expectString(hoverAt(doc, 9, 5), "```nio\nint n\n```");
+});
+
+// §2.9 infers fallibility from the body, so no file writes the `!`. A caller
+// must still handle the error, so the signature in a hover shows it.
+test.start("lsp: a hover on a function that can fail shows the `!`", void () -> {
+    loader.Checked doc = checkDoc(`// Halves a number.
+int half(int n) {
+    if (n < 0) {
+        return Error("negative");
+    }
+    return n / 2;
+}
+
+// Nothing here fails.
+int twice(int n) {
+    return n * 2;
+}
+`);
+    test.expectString(hoverAt(doc, 2, 5),
+        "```nio\nint! half(int n)\n```\n\n---\n\nHalves a number.");
+    test.expectString(hoverAt(doc, 10, 5),
+        "```nio\nint twice(int n)\n```\n\n---\n\nNothing here fails.");
+});
+
+test.start("lsp: hovering a module shows the import that named it", void () -> {
+    loader.Checked doc = checkDoc(`import 'json';
+import 'string' as text;
+
+String s = text.from(1);
+String out = json.toText(1);
+`);
+    // The quoted path tells a built-in from a file of the program's own.
+    test.expectString(hoverAt(doc, 5, 14), "```nio\nimport 'json';\n```");
+    // The alias is shown only when the file wrote one.
+    test.expectString(hoverAt(doc, 4, 12), "```nio\nimport 'string' as text;\n```");
+});
+
+// ---- where a name was declared ----
+
+test.start("lsp: a jump finds the declaration in this file", void () -> {
+    loader.Checked doc = checkDoc(PROG);
+    Map<String, loader.Checked> w = world(doc);
+
+    // PROG has no call of `add`, so this is the declaration's own name.
+    def.Target? fn = def.at(doc, w, 14, 5);
+    test.assert(fn != null, "a function's declaration was not found");
+    if (fn != null) {
+        test.expectString(fn.file, "");
+        test.expectInt(fn.site.tok.line, 14);
+        test.expectString(fn.site.tok.literal, "add");
+    }
+
+    // `return sum;` on line 16 goes to line 15.
+    def.Target? local = def.at(doc, w, 16, 12);
+    test.assert(local != null, "a local's declaration was not found");
+    if (local != null) {
+        test.expectInt(local.site.tok.line, 15);
+        test.expectString(local.site.tok.literal, "sum");
+    }
+
+    def.Target? param = def.at(doc, w, 15, 15);
+    test.assert(param != null, "a parameter's declaration was not found");
+    if (param != null) {
+        test.expectInt(param.site.tok.line, 14);
+        test.expectString(param.site.tok.literal, "a");
+    }
+
+    // From the annotation on line 19 (`Car c = ...`).
+    def.Target? typ = def.at(doc, w, 19, 1);
+    test.assert(typ != null, "a type's declaration was not found");
+    if (typ != null) {
+        test.expectInt(typ.site.tok.line, 1);
+        test.expectString(typ.site.tok.literal, "Car");
+    }
+
+    // Through `self.speed` inside a method.
+    def.Target? field = def.at(doc, w, 6, 21);
+    test.assert(field != null, "a field's declaration was not found");
+    if (field != null) {
+        test.expectInt(field.site.tok.line, 3);
+        test.expectString(field.site.tok.literal, "speed");
+    }
+
+    // PROG uses no enum member, so this is `MISSING` inside the enum.
+    def.Target? mem = def.at(doc, w, 10, 24);
+    test.assert(mem != null, "an enum member's declaration was not found");
+    if (mem != null) {
+        test.expectInt(mem.site.tok.line, 10);
+        test.expectString(mem.site.tok.literal, "MISSING");
+    }
+});
+
+test.start("lsp: a jump answers nothing where there is nothing", void () -> {
+    loader.Checked doc = checkDoc(PROG);
+    Map<String, loader.Checked> w = world(doc);
+    test.assert(def.at(doc, w, 12, 11) == null, "= is not a name");
+    test.assert(def.at(doc, w, 999, 1) == null, "a line past the end is not a name");
+    // A built-in module has no source to open.
+    loader.Checked b = checkDoc("import 'string';\nString s = string.from(1);\n");
+    test.assert(def.at(b, world(b), 2, 19) == null, "a built-in function has no declaration to open");
+});
+
+test.start("lsp: a jump crosses into the module a name was imported from", void () -> {
+    // The declaration is in another file, and nothing about the name in this
+    // file says which.
+    String dir = fs.createTempDir("nio-lsp-def-");
+    String helper = path.join(dir, "helper.nio");
+    fs.writeFile(helper, string.toByteArray(`// What a thing is called.
+export type Named {
+    String name;
+    int uses;
+}
+
+// Greets by name.
+export String greet(Named n) {
+    return "hi " + n.name;
+}
+
+export enum Level { LOW: 1, HIGH: 2 }
+`)) catch e { };
+
+    String main = `import './helper' as hp;
+
+hp.Named n = { name: "a", uses: 0 };
+String s = hp.greet(n);
+String who = n.name;
+hp.Level lv = hp.Level.HIGH;
+`;
+    loader.CompileResult res = loader.checkEntry(main, dir, path.join(dir, "main.nio"), {});
+    test.expectInt(res.errs.length, 0);
+    loader.Checked? entryOpt = null;
+    Map<String, loader.Checked> w = {};
+    forEach(res.checked, c) {
+        w[c.file] = c;
+        if (c.file == "") {
+            entryOpt = c;
+        }
+    }
+    test.assert(entryOpt != null, "the entry module was not checked");
+    if (entryOpt != null) {
+        loader.Checked entry = entryOpt;
+
+        def.Target? fn = def.at(entry, w, 4, 15);
+        test.assert(fn != null, "an imported function's declaration was not found");
+        if (fn != null) {
+            test.expectString(fn.file, helper);
+            test.expectInt(fn.site.tok.line, 8);
+            test.expectString(fn.site.tok.literal, "greet");
+        }
+
+        def.Target? typ = def.at(entry, w, 3, 4);
+        test.assert(typ != null, "an imported type's declaration was not found");
+        if (typ != null) {
+            test.expectString(typ.file, helper);
+            test.expectInt(typ.site.tok.line, 2);
+        }
+
+        // `n.name` on line 5, whose `name` begins at byte 16.
+        def.Target? fld = def.at(entry, w, 5, 16);
+        test.assert(fld != null, "an imported record's field was not found");
+        if (fld != null) {
+            test.expectString(fld.file, helper);
+            test.expectInt(fld.site.tok.line, 3);
+            test.expectString(fld.site.tok.literal, "name");
+        }
+
+        // `hp.Level.HIGH`.
+        def.Target? mem = def.at(entry, w, 6, 24);
+        test.assert(mem != null, "an imported enum member was not found");
+        if (mem != null) {
+            test.expectString(mem.file, helper);
+            test.expectInt(mem.site.tok.line, 12);
+            test.expectString(mem.site.tok.literal, "HIGH");
+        }
+
+        // Nothing in this module types the expression. The answer comes from
+        // the declaration found through `world`.
+        String h = hover.render(entry, w, 4, 15);
+        test.assert(string.contains(h, "String greet(Named n)"),
+            "an imported function's signature should reach the hover, got: " + h);
+        test.assert(string.contains(h, "Greets by name."),
+            "an imported function's doc comment should reach the hover, got: " + h);
+        test.assert(string.contains(hover.render(entry, w, 3, 4), "type Named {"),
+            "an imported type's declaration should reach the hover");
+    }
+    fs.delete(dir, { recursive: true }) catch e { };
+});
+
+test.start("lsp: an import points at the file it names", void () -> {
+    // The statement's own token is the `import` keyword, so the parser also
+    // keeps the quoted path and the alias.
+    String dir = fs.createTempDir("nio-lsp-imp-");
+    String helper = path.join(dir, "helper.nio");
+    fs.writeFile(helper, string.toByteArray("export int limit = 10;\n")) catch e { };
+
+    String main = `import './helper' as hp;
+import 'string';
+
+int n = hp.limit;
+`;
+    loader.CompileResult res = loader.checkEntry(main, dir, path.join(dir, "main.nio"), {});
+    test.expectInt(res.errs.length, 0);
+    Map<String, loader.Checked> w = {};
+    loader.Checked? entryOpt = null;
+    forEach(res.checked, c) {
+        w[c.file] = c;
+        if (c.file == "") {
+            entryOpt = c;
+        }
+    }
+    if (entryOpt != null) {
+        loader.Checked entry = entryOpt;
+        // The quotes are part of the path: a caret on one is on the import.
+        def.Target? onPath = def.at(entry, w, 1, 10);
+        test.assert(onPath != null, "the quoted path should point at the module");
+        if (onPath != null) {
+            test.expectString(onPath.file, helper);
+            test.expectInt(onPath.site.tok.line, 1);
+        }
+        def.Target? onAlias = def.at(entry, w, 1, 22);
+        test.assert(onAlias != null, "the alias should point at the module too");
+        if (onAlias != null) {
+            test.expectString(onAlias.file, helper);
+        }
+        // A built-in has no file to open.
+        test.assert(def.at(entry, w, 2, 10) == null,
+            "a built-in module has no source to jump into");
+
+        test.expectString(hover.render(entry, w, 1, 10),
+            "```nio\nimport './helper' as hp;\n```");
+        test.expectString(hover.render(entry, w, 2, 10),
+            "```nio\nimport 'string';\n```");
+        // The alias where it is used. The finder records it as a bare name,
+        // since a module is not a type.
+        test.expectString(hover.render(entry, w, 4, 9),
+            "```nio\nimport './helper' as hp;\n```");
+        def.Target? qual = def.at(entry, w, 4, 9);
+        test.assert(qual != null, "an alias in use should point at its module");
+        if (qual != null) {
+            test.expectString(qual.file, helper);
+        }
+    }
+    fs.delete(dir, { recursive: true }) catch e { };
+});
+
+test.start("lsp: an inherited field and method point at the base", void () -> {
+    // §2.4 copies a base's fields and methods into the extending type, so the
+    // base is the only place they are written.
+    loader.Checked doc = checkDoc(`type Vehicle {
+    // Wheels touching the ground.
+    int wheels;
+
+    // How it sounds.
+    String horn() {
+        return "beep";
+    }
+}
+
+type Truck extends Vehicle {
+    int payload;
+}
+
+Truck t = { wheels: 6, payload: 12 };
+int w = t.wheels;
+String s = t.horn();
+`);
+    Map<String, loader.Checked> w = world(doc);
+
+    def.Target? fld = def.at(doc, w, 16, 11);
+    test.assert(fld != null, "an inherited field was not found");
+    if (fld != null) {
+        test.expectInt(fld.site.tok.line, 3);
+        test.expectString(fld.site.tok.literal, "wheels");
+    }
+    def.Target? meth = def.at(doc, w, 17, 14);
+    test.assert(meth != null, "an inherited method was not found");
+    if (meth != null) {
+        test.expectInt(meth.site.tok.line, 6);
+        test.expectString(meth.site.tok.literal, "horn");
+    }
+
+    // The signature names the receiver's type, since the body is compiled as a
+    // method of Truck (§2.4). The jump still lands in Vehicle.
+    String h = hoverAt(doc, 17, 14);
+    test.assert(string.contains(h, "String Truck.horn()"),
+        "the signature should name the receiver's type, got: " + h);
+    test.assert(string.contains(h, "How it sounds."),
+        "an inherited method's doc should come from the base, got: " + h);
+    test.assert(string.contains(hoverAt(doc, 16, 11), "Wheels touching the ground."),
+        "an inherited field's doc should come from the base");
+});
+
+test.start("lsp: a built-in with no signature still hovers", void () -> {
+    // json, array, map and async have no types.FuncType: no one signature
+    // describes a function generic in its element. Their shape is written out.
+    loader.Checked doc = checkDoc(`import 'json';
+import 'array';
+import 'path';
+
+String out = json.toText(1);
+int[] xs = [];
+array.push(xs, 1);
+String p = path.localize("a/b");
+`);
+    test.expectString(hoverAt(doc, 5, 19), "```nio\nString json.toText(any v)\n```");
+    test.expectString(hoverAt(doc, 7, 7), "```nio\nvoid array.push(T[] a, T v)\n```");
+    Map<String, loader.Checked> w = world(doc);
+    String parse = hover.render(doc, w, 5, 19);
+    test.assert(!string.contains(parse, "as T"), "toText has one form");
+    test.expectString(hoverAt(doc, 8, 17), "```nio\nString path.localize(String p)\n```");
+});
+
+test.start("lsp: a namespace's own function hovers, and so does the namespace", void () -> {
+    // The object of `time.date.year` is a member expression.
+    loader.Checked doc = checkDoc(`import 'time';
+
+DateTime now = time.now();
+int y = time.date.year(now);
+`);
+    test.expectString(hoverAt(doc, 4, 19), "```nio\nint time.date.year(DateTime d)\n```");
+    // A namespace shows its contents as code.
+    String ns = hoverAt(doc, 4, 14);
+    test.assert(string.contains(ns, "time.date {"),
+        "a namespace should show as what it holds, got: " + ns);
+    test.assert(string.contains(ns, "int year(DateTime d);"),
+        "a namespace should list its members' signatures, got: " + ns);
+    test.assert(!string.contains(ns, "//"),
+        "a namespace should not be described by a comment, got: " + ns);
+});
+
+test.start("lsp: a signature names its parameters", void () -> {
+    // A types.FuncType is a list of types. §6's names come from
+    // builtins.builtinParamNames and a program's own from the declaration.
+    loader.Checked doc = checkDoc(`import 'path';
+import 'string';
+
+type Car {
+    int speed;
+    int faster(int by) {
+        return self.speed + by;
+    }
+}
+
+int add(int a, int b) {
+    return a + b;
+}
+
+String p = path.join("a", "b");
+int n = add(1, 2);
+Car c = { speed: 1 };
+int f = c.faster(2);
+`);
+    // A variadic built-in shows in the declaration form of §2.3,
+    // `...String more`, with the element type.
+    test.expectString(hoverAt(doc, 15, 17),
+        "```nio\nString path.join(String first, ...String more)\n```");
+    test.expectString(hoverAt(doc, 11, 5), "```nio\nint add(int a, int b)\n```");
+    test.expectString(hoverAt(doc, 16, 9), "```nio\nint add(int a, int b)\n```");
+    test.expectString(hoverAt(doc, 18, 11), "```nio\nint Car.faster(int by)\n```");
+    // The completion list agrees, so a name reads the same in both.
+    Map<String, String> got = labels(complete.at(doc.prog, doc.info, "c.", 19, 3));
+    test.expectString(detail(got, "faster"), "int faster(int by)");
+    Map<String, String> mod = labels(complete.at(doc.prog, doc.info, "path.", 19, 6));
+    test.expectString(detail(mod, "join"), "String join(String first, ...String more)");
+});
+
+// ---- unions ----
+//
+// A union (§2.11) is a parser rewrite into a sealed base and one extender per
+// member. The generated names carry a `$` that §1.3 keeps out of every
+// identifier, so an editor must write the union back as it was declared.
+
+test.start("lsp: a union hovers as the union it was declared", void () -> {
+    loader.Checked doc = checkDoc(`import 'string';
+
+// Text, either way round.
+union Text {
+    // Already decoded.
+    String,
+    // Not yet.
+    byte[] Bytes
+}
+
+String render(Text t) {
+    switch (t) {
+        case Text.String v: return v;
+        case Text.Bytes b: return string.fromByteArray(b);
+    }
+}
+
+Text greeting = "hi";
+String? s = greeting as Text.String;
+`);
+    String fence = string.fromByteArray([96, 96, 96]);
+    // The hover shows the union as declared. The sealed type from the rewrite
+    // does not show. A member whose tag is its type name is written once.
+    String want = fence + "nio\nunion Text {\n    String,\n    uint8[] Bytes\n}\n" + fence;
+    String at4 = hoverAt(doc, 4, 7);
+    test.assert(string.contains(at4, want),
+        "hovering a union's name should show its members, got: " + at4);
+    test.assert(string.contains(at4, "Text, either way round."),
+        "a union's doc comment should reach its hover, got: " + at4);
+    // A use in type position, and the name before a member's dot, answer the
+    // same declaration.
+    test.assert(string.contains(hoverAt(doc, 11, 15), want),
+        "a union in type position should show its declaration");
+    test.assert(string.contains(hoverAt(doc, 13, 14), want),
+        "the union half of `Union.Tag` should show the union");
+
+    // A member reads as its constructor: how a value goes in, what a `case`
+    // binds, and what an `as` answers.
+    test.expectString(hoverAt(doc, 6, 5),
+        fence + "nio\nText.String(String)\n" + fence
+        + "\n\n---\n\nAlready decoded.");
+    test.expectString(hoverAt(doc, 8, 12),
+        fence + "nio\nText.Bytes(uint8[])\n" + fence
+        + "\n\n---\n\nNot yet.");
+    test.assert(string.contains(hoverAt(doc, 13, 19), "Text.String(String)"),
+        "a case label's tag should show the member");
+    test.assert(string.contains(hoverAt(doc, 14, 19), "Text.Bytes(uint8[])"),
+        "a case label's tag should show the member");
+    test.assert(string.contains(hoverAt(doc, 19, 31), "Text.String(String)"),
+        "an `as` target's tag should show the member");
+
+    // No generated name reaches a hover anywhere in the file.
+    for (int line = 1; line <= 19; line++) {
+        for (int col = 1; col <= 40; col++) {
+            String h = hoverAt(doc, line, col);
+            test.assert(!string.contains(h, "$"),
+                "a generated name reached a hover at " + string.from(line)
+                + ":" + string.from(col) + ": " + h);
+        }
+    }
+});
+
+test.start("lsp: a union's members are what may follow its name", void () -> {
+    // The tag is the only way to reach a member: the record behind one is
+    // named with a character no program can write.
+    loader.Checked doc = checkDoc(`union Distance {
+    float Meters,
+    float Feet
+}
+
+type Plain { int x }
+
+Distance d = Distance.Meters(1.0);
+`);
+    Map<String, String> mem = labels(complete.at(doc.prog, doc.info, "Distance.", 9, 10));
+    test.expectString(detail(mem, "Meters"), "float");
+    test.expectString(detail(mem, "Feet"), "float");
+    test.expectInt(map.keys(mem).length, 2);
+
+    // In scope the union appears under the keyword that declares it, and no
+    // member appears under a name nobody can write.
+    Map<String, String> scope = labels(complete.at(doc.prog, doc.info, "", 9, 1));
+    test.expectString(detail(scope, "Distance"), "union Distance");
+    test.expectString(detail(scope, "Plain"), "type Plain");
+    forEach(map.keys(scope), name) {
+        test.assert(!string.contains(name, "$"),
+            "a generated name was offered for completion: " + name);
+    }
+});
+
+test.start("lsp: a jump lands on a union's member", void () -> {
+    loader.Checked doc = checkDoc(`union Distance {
+    float Meters,
+    float Feet
+}
+
+String show(Distance d) {
+    switch (d) {
+        case Distance.Meters m: return "m";
+        case Distance.Feet f: return "ft";
+    }
+}
+
+Distance one = Distance.Meters(1.0);
+`);
+    Map<String, loader.Checked> w = world(doc);
+    // The generated extender's nameTok is the tag, so a case label lands on
+    // the member's own line.
+    def.Target? label = def.at(doc, w, 8, 24);
+    test.assert(label != null, "a case label's tag should point at its member");
+    if (label != null) {
+        test.expectInt(label.site.tok.line, 2);
+        test.expectString(label.site.tok.literal, "Meters");
+    }
+    def.Target? union = def.at(doc, w, 8, 16);
+    test.assert(union != null, "the union half should point at the union");
+    if (union != null) {
+        test.expectInt(union.site.tok.line, 1);
+        test.expectString(union.site.tok.literal, "Distance");
+    }
+    // The checker records a constructor against the call
+    // (checker.Info.unionCtors).
+    def.Target? ctor = def.at(doc, w, 13, 25);
+    test.assert(ctor != null, "a constructor should point at its member");
+    if (ctor != null) {
+        test.expectInt(ctor.site.tok.line, 2);
+        test.expectString(ctor.site.tok.literal, "Meters");
+    }
+});
+
+test.start("lsp: an imported union is reached by all three of its names", void () -> {
+    // `alias.Union.Tag` is the only name in the language with three segments
+    // (§2.11). Each segment gives a different answer.
+    String dir = fs.createTempDir("nio-lsp-union-");
+    String helper = path.join(dir, "shapes.nio");
+    fs.writeFile(helper, string.toByteArray(`export union Shape {
+    // As wide as it is tall.
+    float Circle,
+    float Square
+}
+`)) catch e { };
+
+    String main = `import './shapes' as sh;
+
+String name(sh.Shape s) {
+    switch (s) {
+        case sh.Shape.Circle r: return "circle";
+        case sh.Shape.Square w: return "square";
+    }
+}
+`;
+    loader.CompileResult res = loader.checkEntry(main, dir, path.join(dir, "main.nio"), {});
+    test.expectInt(res.errs.length, 0);
+    Map<String, loader.Checked> w = {};
+    loader.Checked? entryOpt = null;
+    forEach(res.checked, c) {
+        w[c.file] = c;
+        if (c.file == "") {
+            entryOpt = c;
+        }
+    }
+    if (entryOpt != null) {
+        loader.Checked entry = entryOpt;
+        // The alias, the union and the tag, in that order along one name.
+        test.expectString(hover.render(entry, w, 5, 14),
+            "```nio\nimport './shapes' as sh;\n```");
+        String u = hover.render(entry, w, 5, 17);
+        test.assert(string.contains(u, "union Shape {"),
+            "the middle segment should show the union, got: " + u);
+        String m = hover.render(entry, w, 5, 23);
+        test.assert(string.contains(m, ".Circle(float)"),
+            "the last segment should show the member, got: " + m);
+        test.assert(string.contains(m, "As wide as it is tall."),
+            "an imported member's doc comment should travel with it, got: " + m);
+        def.Target? to = def.at(entry, w, 5, 23);
+        test.assert(to != null, "an imported member should point at its declaration");
+        if (to != null) {
+            test.expectString(to.file, helper);
+            test.expectInt(to.site.tok.line, 3);
+            test.expectString(to.site.tok.literal, "Circle");
+        }
+        Map<String, String> mem = labels(complete.at(entry.prog, entry.info, "sh.Shape.", 8, 10));
+        test.expectString(detail(mem, "Circle"), "float");
+        test.expectString(detail(mem, "Square"), "float");
+        Map<String, String> ex = labels(complete.at(entry.prog, entry.info, "sh.", 8, 4));
+        test.expectString(detail(ex, "Shape"), "union Shape");
+        forEach(map.keys(ex), n2) {
+            test.assert(!string.contains(n2, "$"),
+                "a generated name was offered from another module: " + n2);
+        }
+    }
+    fs.delete(dir, { recursive: true }) catch e { };
+});
+
+test.start("lsp: the four names always in scope hover", void () -> {
+    // The checker types these four by hand at their call sites, so they are in
+    // no signature table. builtins.globalShapes is their written form.
+    loader.Checked doc = checkDoc(`Error? err = null;
+int n = 0;
+print(n);
+String t = getType(n);
+printInline(t);
+String f() { return Error("no"); }
+`);
+    test.expectString(hoverAt(doc, 3, 1), "```nio\nvoid print(printable v)\n```");
+    test.expectString(hoverAt(doc, 5, 1), "```nio\nvoid printInline(printable v)\n```");
+    test.expectString(hoverAt(doc, 4, 12), "```nio\nString getType(any v)\n```");
+    // One form with the omittable argument marked: two forms read as
+    // overloading, which §2.7 does not have. The `?` sits on the name, since
+    // the field is a plain int (§2.9) and `Error("x", null)` is an error.
+    test.expectString(hoverAt(doc, 6, 21),
+        "```nio\nError Error(String message, int code?)\n```");
+    // In type position the same name answers the record (§2.9).
+    String fence = string.fromByteArray([96, 96, 96]);
+    test.expectString(hoverAt(doc, 1, 3),
+        fence + "nio\ntype Error {\n    String message;\n    int code;\n}\n" + fence);
+    // The completion list shows the same form.
+    Map<String, String> scope = labels(complete.at(doc.prog, doc.info, "", 2, 1));
+    test.expectString(detail(scope, "print"), "void print(printable v)");
+    test.expectString(detail(scope, "Error"), "Error Error(String message, int code?)");
+
+    // checker.reserved and builtins.globalShapes hold each other, in both
+    // directions.
+    forEach(map.keys(checker.reserved), name) {
+        test.assert(builtins.globalShape(name) != "",
+            "reserved name " + name + " has no written shape to hover");
+    }
+    forEach(map.keys(builtins.globalShapes), name) {
+        test.assert(checker.reserved[name] != null,
+            "globalShapes names " + name + ", which is not one of the reserved names");
+    }
+});
+
+test.start("lsp: the three types spelled with a keyword hover", void () -> {
+    // `Future`, `Map` and `Function` are keywords (token.keywords), so the
+    // parser makes a node with no NamedType.
+    loader.Checked doc = checkDoc(`import 'async';
+
+String async greet(String who) {
+    return "hi " + who;
+}
+
+// The greeting, still in flight.
+Future<String> pending = greet("you");
+Map<String, int> counts = {};
+Function(int)<bool>? pred = null;
+`);
+    // The hover shows the whole type.
+    test.expectString(hoverAt(doc, 8, 1), "```nio\nFuture<String>\n```");
+    test.expectString(hoverAt(doc, 9, 1), "```nio\nMap<String, int>\n```");
+    test.expectString(hoverAt(doc, 10, 1), "```nio\nFunction(int)<bool>\n```");
+    // The parts still show their own types. Only the keyword shows the whole
+    // annotation.
+    test.expectString(hoverAt(doc, 8, 8), "```nio\nString\n```");
+    test.expectString(hoverAt(doc, 9, 13), "```nio\nint\n```");
+
+    // None of the three is declared anywhere, so the prose above the statement
+    // is not the keyword's own doc.
+    test.assert(def.at(doc, world(doc), 8, 1) == null,
+        "a keyword type should have no declaration to jump to");
+    test.assert(!string.contains(hoverAt(doc, 8, 1), "still in flight"),
+        "prose above the statement should not be shown as the keyword's own");
+    test.assert(string.contains(hoverAt(doc, 8, 16), "still in flight"),
+        "the declaration the prose is written above should still show it");
+});
+
+test.start("lsp: an argument that may be left off is marked, not written twice", void () -> {
+    // The `?` sits on the parameter's name: `options?` may be left off,
+    // `fs.DeleteOptions? options` would be one that may be null.
+    loader.Checked doc = checkDoc(`import 'fs';
+import 'regexp';
+import 'array';
+
+fs.delete("x") catch e { };
+int[] xs = [3, 1];
+int[] some = array.slice(xs, 0);
+`);
+    test.expectString(hoverAt(doc, 5, 4),
+        "```nio\nvoid! fs.delete(String p, fs.DeleteOptions options?)\n```");
+    // The completion list runs the same renderer.
+    Map<String, String> fns = labels(complete.at(doc.prog, doc.info, "fs.", 7, 4));
+    test.expectString(detail(fns, "delete"), "void! delete(String p, fs.DeleteOptions options?)");
+    // A function with no signature carries the mark in builtins.builtinShapes.
+    test.expectString(hoverAt(doc, 7, 21),
+        "```nio\nT[] array.slice(T[] a, int start, int end?)\n```");
+    // A required trailing argument keeps no mark.
+    test.assert(!string.contains(builtins.shape("array", "indexOf"), "?"),
+        "a required argument should carry no mark");
+});

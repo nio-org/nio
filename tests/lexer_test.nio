@@ -1,0 +1,444 @@
+// The lexer. Every case is a token stream written by hand from §1, so each
+// case checks the lexer against the spec.
+import 'test';
+import 'string';
+import 'array';
+import '../src/lexer' as lexer;
+import '../src/token' as token;
+
+// The carriage return and the backtick, built from their byte values. A
+// backtick string cannot hold a backtick.
+String const CR = string.fromByteArray([13]);
+String const BT = string.fromByteArray([96]);
+
+// A token as a case writes it: the type and the literal.
+type Tok {
+    String type;
+    String literal;
+}
+
+// §1.4 lets the keyword `type` name a field but not a parameter, so the two
+// arguments are spelled short.
+Tok tk(String ty, String lit) {
+    Tok t = { type: ty, literal: lit };
+    return t;
+}
+
+void assertTokens(String input, Tok[] want) {
+    lexer.Lexer l = lexer.newLexer(input);
+    for (int i = 0; i < want.length; i++) {
+        token.Token got = l.nextToken();
+        if (got.type != want[i].type || got.literal != want[i].literal) {
+            return Error("token " + string.from(i) + ": got (" + got.type + ", \""
+                + got.literal + "\"), want (" + want[i].type + ", \"" + want[i].literal + "\")");
+        }
+    }
+    token.Token last = l.nextToken();
+    if (last.type != token.EOF) {
+        return Error("expected EOF, got (" + last.type + ", \"" + last.literal + "\")");
+    }
+}
+
+test.start("lexer: operators and delimiters", void () -> {
+    assertTokens("= + - * / % ! == != < > <= >= && || , ; : . ? ( ) { } [ ]", [
+        tk(token.ASSIGN, "="), tk(token.PLUS, "+"), tk(token.MINUS, "-"),
+        tk(token.ASTERISK, "*"), tk(token.SLASH, "/"), tk(token.PERCENT, "%"),
+        tk(token.BANG, "!"), tk(token.EQ, "=="), tk(token.NOTEQ, "!="),
+        tk(token.LT, "<"), tk(token.GT, ">"), tk(token.LTE, "<="), tk(token.GTE, ">="),
+        tk(token.AND, "&&"), tk(token.OR, "||"),
+        tk(token.COMMA, ","), tk(token.SEMICOLON, ";"), tk(token.COLON, ":"),
+        tk(token.DOT, "."), tk(token.QUESTION, "?"),
+        tk(token.LPAREN, "("), tk(token.RPAREN, ")"),
+        tk(token.LBRACE, "{"), tk(token.RBRACE, "}"),
+        tk(token.LBRACKET, "["), tk(token.RBRACKET, "]"),
+    ]);
+});
+
+test.start("lexer: keywords and identifiers", void () -> {
+    assertTokens("function type return if else while true false null int car _x x9", [
+        tk(token.FUNCTION, "function"), tk(token.TYPE, "type"), tk(token.RETURN, "return"),
+        tk(token.IF, "if"), tk(token.ELSE, "else"), tk(token.WHILE, "while"),
+        tk(token.TRUE, "true"), tk(token.FALSE, "false"), tk(token.NULL, "null"),
+        tk(token.IDENT, "int"), tk(token.IDENT, "car"), tk(token.IDENT, "_x"),
+        tk(token.IDENT, "x9"),
+    ]);
+});
+
+// ++ and -- lex greedily: `x--1` is `x -- 1`, not `x - (-1)`.
+test.start("lexer: ++ and -- are greedy", void () -> {
+    assertTokens("i++ j-- a + + b - -1 x--1", [
+        tk(token.IDENT, "i"), tk(token.INC, "++"),
+        tk(token.IDENT, "j"), tk(token.DEC, "--"),
+        tk(token.IDENT, "a"), tk(token.PLUS, "+"), tk(token.PLUS, "+"), tk(token.IDENT, "b"),
+        tk(token.MINUS, "-"), tk(token.MINUS, "-"), tk(token.INT, "1"),
+        tk(token.IDENT, "x"), tk(token.DEC, "--"), tk(token.INT, "1"),
+    ]);
+});
+
+// `for` is a keyword. Identifiers that start with "for" are not.
+test.start("lexer: for keywords", void () -> {
+    assertTokens("for forEach forever", [
+        tk(token.FOR, "for"), tk(token.FOREACH, "forEach"), tk(token.IDENT, "forever"),
+    ]);
+});
+
+// A longer word that starts with `break` or `continue` is an identifier.
+test.start("lexer: jump keywords", void () -> {
+    assertTokens("break continue breakpoint continued", [
+        tk(token.BREAK, "break"), tk(token.CONTINUE, "continue"),
+        tk(token.IDENT, "breakpoint"), tk(token.IDENT, "continued"),
+    ]);
+});
+
+test.start("lexer: numbers", void () -> {
+    assertTokens("0 42 3.14 0.5 10.25", [
+        tk(token.INT, "0"), tk(token.INT, "42"), tk(token.FLOAT, "3.14"),
+        tk(token.FLOAT, "0.5"), tk(token.FLOAT, "10.25"),
+    ]);
+});
+
+// A hexadecimal literal keeps its written spelling, because a diagnostic
+// quotes it.
+test.start("lexer: hexadecimal numbers", void () -> {
+    assertTokens("0xFF 0X10 0xff 0xDEADBEEF 0x0", [
+        tk(token.INT, "0xFF"), tk(token.INT, "0X10"), tk(token.INT, "0xff"),
+        tk(token.INT, "0xDEADBEEF"), tk(token.INT, "0x0"),
+    ]);
+});
+
+// The scan stops at the first byte that is not a hexadecimal digit.
+test.start("lexer: hexadecimal boundaries", void () -> {
+    assertTokens("0xFFg 0 0.5 10x", [
+        tk(token.INT, "0xFF"), tk(token.IDENT, "g"),
+        tk(token.INT, "0"), tk(token.FLOAT, "0.5"),
+        tk(token.INT, "10"), tk(token.IDENT, "x"),
+    ]);
+});
+
+// There is no hexadecimal float, so `0x1.8` is a member access on a number.
+test.start("lexer: no hexadecimal float", void () -> {
+    assertTokens("0x1.8", [
+        tk(token.INT, "0x1"), tk(token.DOT, "."), tk(token.INT, "8"),
+    ]);
+});
+
+// A prefix with nothing after it is one ILLEGAL token with its explanation,
+// not a `0` and an identifier.
+test.start("lexer: hexadecimal with no digits", void () -> {
+    lexer.Lexer l = lexer.newLexer("0x");
+    token.Token got = l.nextToken();
+    if (got.type != token.ILLEGAL) {
+        return Error("0x: got type " + got.type + ", want ILLEGAL");
+    }
+    if (got.literal != "0x") {
+        return Error("0x: got literal \"" + got.literal + "\", want \"0x\"");
+    }
+    if (!string.contains(got.note, "hexadecimal literal with no digits")) {
+        return Error("0x: note does not name the mistake: \"" + got.note + "\"");
+    }
+    lexer.Lexer u = lexer.newLexer("0XG");
+    token.Token upper = u.nextToken();
+    if (upper.type != token.ILLEGAL || upper.literal != "0X") {
+        return Error("0XG: got (" + upper.type + ", \"" + upper.literal + "\")");
+    }
+});
+
+// intValue must read what readNumber accepts. The cases test the edges.
+test.start("lexer: intValue", void () -> {
+    String[] texts = [
+        "0xFF", "0X10", "0xff", "0x0", "0xDEADBEEF",
+        "0x7FFFFFFFFFFFFFFF", "42", "0",
+    ];
+    String[] values = [
+        "255", "16", "255", "0", "3735928559",
+        "9223372036854775807", "42", "0",
+    ];
+    forEach(texts, text, i) {
+        int got = lexer.intValue(text) catch e {
+            return Error(text + ": " + e.message);
+        };
+        if (string.from(got) != values[i]) {
+            return Error(text + ": got " + string.from(got) + ", want " + values[i]);
+        }
+    }
+    forEach(["0x8000000000000000", "0xFFFFFFFFFFFFFFFF", "9223372036854775808"], bad) {
+        lexer.intValue(bad) catch e {
+            continue;
+        };
+        return Error(bad + ": parsed, want a failure");
+    }
+});
+
+// A dot not followed by a digit is a member access, not a float.
+test.start("lexer: int dot member", void () -> {
+    assertTokens("a.b 1.x", [
+        tk(token.IDENT, "a"), tk(token.DOT, "."), tk(token.IDENT, "b"),
+        tk(token.INT, "1"), tk(token.DOT, "."), tk(token.IDENT, "x"),
+    ]);
+});
+
+// `...` lexes greedily, and only at three dots.
+test.start("lexer: ellipsis", void () -> {
+    assertTokens("...String . .. .... a...b", [
+        tk(token.ELLIPSIS, "..."), tk(token.IDENT, "String"),
+        tk(token.DOT, "."),
+        tk(token.DOT, "."), tk(token.DOT, "."),
+        tk(token.ELLIPSIS, "..."), tk(token.DOT, "."),
+        tk(token.IDENT, "a"), tk(token.ELLIPSIS, "..."), tk(token.IDENT, "b"),
+    ]);
+});
+
+test.start("lexer: double-quoted strings", void () -> {
+    assertTokens("\"hello\" \"\" \"a\\nb\" \"t\\tq\" \"q\\\"w\" \"back\\\\s\" \"un\\qknown\"", [
+        tk(token.STRING, "hello"),
+        tk(token.STRING, ""),
+        tk(token.STRING, "a\nb"),
+        tk(token.STRING, "t\tq"),
+        tk(token.STRING, "q\"w"),
+        tk(token.STRING, "back\\s"),
+        tk(token.STRING, "un\\qknown"),
+    ]);
+});
+
+test.start("lexer: single-quoted strings", void () -> {
+    assertTokens("'hello' '' 'a\\nb' 'q\\'w' 'has \"quotes\"'", [
+        tk(token.STRING, "hello"),
+        tk(token.STRING, ""),
+        tk(token.STRING, "a\nb"),
+        tk(token.STRING, "q'w"),
+        tk(token.STRING, "has \"quotes\""),
+    ]);
+});
+
+test.start("lexer: backtick strings", void () -> {
+    assertTokens(BT + "one\ntwo" + BT + " " + BT + BT + " " + BT + "a\\" + BT + "b" + BT
+        + " " + BT + "has \"both\" 'quotes'" + BT + " " + BT + "a\\nb" + BT, [
+            tk(token.STRING, "one\ntwo"),
+            tk(token.STRING, ""),
+            tk(token.STRING, "a" + BT + "b"),
+            tk(token.STRING, "has \"both\" 'quotes'"),
+            tk(token.STRING, "a\nb"),
+        ]);
+});
+
+// A backtick string keeps its line endings, but a CRLF becomes a bare newline,
+// so a file lexes the same on every platform.
+test.start("lexer: a backtick string normalizes CRLF", void () -> {
+    assertTokens(BT + "a" + CR + "\nb" + CR + "c" + BT, [tk(token.STRING, "a\nb" + CR + "c")]);
+});
+
+test.start("lexer: an unterminated backtick string is ILLEGAL", void () -> {
+    lexer.Lexer l = lexer.newLexer(BT + "abc\ndef");
+    token.Token got = l.nextToken();
+    test.expectString(got.type, token.ILLEGAL);
+});
+
+// A raw newline ends a " or ' string as unterminated, so the code after it
+// still lexes.
+test.start("lexer: quoted strings stop at the newline", void () -> {
+    // The last line ends with a backslash, which does not continue the string.
+    forEach(["\"abc\ndef\"", "'abc\ndef'", "\"abc\\\ndef\""], src) {
+        token.Token got = lexer.newLexer(src).nextToken();
+        if (got.type != token.ILLEGAL) {
+            return Error("expected ILLEGAL at the newline, got (" + got.type + ", \""
+                + got.literal + "\")");
+        }
+        if (got.line != 1) {
+            return Error("expected the error on line 1, got line " + string.from(got.line));
+        }
+        if (!string.contains(got.note, "ends at the end of its line")) {
+            return Error("note \"" + got.note + "\" does not mention the end of the line");
+        }
+    }
+    assertTokens("\"oops;\nint x = 1;", [
+        tk(token.ILLEGAL, "oops;"),
+        tk(token.IDENT, "int"), tk(token.IDENT, "x"), tk(token.ASSIGN, "="),
+        tk(token.INT, "1"), tk(token.SEMICOLON, ";"),
+    ]);
+});
+
+test.start("lexer: import keywords", void () -> {
+    assertTokens("import 'time' as d; export", [
+        tk(token.IMPORT, "import"), tk(token.STRING, "time"), tk(token.AS, "as"),
+        tk(token.IDENT, "d"), tk(token.SEMICOLON, ";"), tk(token.EXPORT, "export"),
+    ]);
+});
+
+test.start("lexer: an unterminated string is ILLEGAL", void () -> {
+    test.expectString(lexer.newLexer("\"abc").nextToken().type, token.ILLEGAL);
+    test.expectString(lexer.newLexer("\"abc\\").nextToken().type, token.ILLEGAL);
+});
+
+// An ILLEGAL token carries its explanation, which the parser reports in place
+// of "unexpected token".
+test.start("lexer: ILLEGAL tokens carry their reason", void () -> {
+    String[] srcs = ["\"abc", BT + "abc", "\"abc\ndef\"", "'abc\ndef'", "/* abc"];
+    String[] wants = [
+        "no closing \" before the end of the file",
+        "no closing " + BT + " before the end of the file",
+        "a \"...\" string ends at the end of its line",
+        "a '...' string ends at the end of its line",
+        "unterminated block comment",
+    ];
+    for (int i = 0; i < srcs.length; i++) {
+        token.Token got = lexer.newLexer(srcs[i]).nextToken();
+        if (got.type != token.ILLEGAL || !string.contains(got.note, wants[i])) {
+            return Error("got (" + got.type + ", note \"" + got.note
+                + "\"), want an ILLEGAL noting \"" + wants[i] + "\"");
+        }
+    }
+    // A character the language has no use for carries no explanation.
+    test.expectString(lexer.newLexer("@").nextToken().note, "");
+});
+
+test.start("lexer: illegal characters", void () -> {
+    // `$` is illegal because ast.unionMark uses it for names that no program
+    // may write (§2.11).
+    assertTokens("@ $", [
+        tk(token.ILLEGAL, "@"), tk(token.ILLEGAL, "$"),
+    ]);
+});
+
+test.start("lexer: bitwise operators", void () -> {
+    assertTokens("& | ^ ~ << && ||", [
+        tk(token.BITAND, "&"), tk(token.BITOR, "|"), tk(token.CARET, "^"),
+        tk(token.TILDE, "~"), tk(token.SHL, "<<"),
+        tk(token.AND, "&&"), tk(token.OR, "||"),
+    ]);
+    // `>>` stays two `>`, which keeps `Map<String, Future<int>>` parsable. The
+    // parser joins the pair in expression position.
+    assertTokens(">>", [tk(token.GT, ">"), tk(token.GT, ">")]);
+});
+
+test.start("lexer: line comments", void () -> {
+    assertTokens("a // comment\nb // to end of file", [
+        tk(token.IDENT, "a"), tk(token.IDENT, "b"),
+    ]);
+});
+
+test.start("lexer: block comments", void () -> {
+    assertTokens("a /* one line */ b /* several\nlines\n*/ c /**/ d /* * / ** */ e", [
+        tk(token.IDENT, "a"), tk(token.IDENT, "b"), tk(token.IDENT, "c"),
+        tk(token.IDENT, "d"), tk(token.IDENT, "e"),
+    ]);
+});
+
+// Block comments do not nest: the first "*/" closes the comment.
+test.start("lexer: block comments do not nest", void () -> {
+    assertTokens("a /* /* */ b", [tk(token.IDENT, "a"), tk(token.IDENT, "b")]);
+});
+
+// A "/*" inside a line comment or a string does not open a block comment.
+test.start("lexer: comments do not open inside each other", void () -> {
+    assertTokens("a /* // */ b // /* \nc \"/*\" " + BT + "/*" + BT, [
+        tk(token.IDENT, "a"), tk(token.IDENT, "b"), tk(token.IDENT, "c"),
+        tk(token.STRING, "/*"), tk(token.STRING, "/*"),
+    ]);
+});
+
+test.start("lexer: an unterminated block comment reports its opener", void () -> {
+    lexer.Lexer l = lexer.newLexer("a\n  /* runs off\nthe end");
+    test.expectString(l.nextToken().literal, "a");
+    token.Token got = l.nextToken();
+    test.expectString(got.type, token.ILLEGAL);
+    test.expectString(got.literal, "/*");
+    test.expectInt(got.line, 2);
+    test.expectInt(got.col, 3);
+    test.expectString(l.nextToken().type, token.EOF);
+});
+
+// Division is still division next to a "*" that starts a comment.
+test.start("lexer: slash-star boundary", void () -> {
+    assertTokens("a / b /* c */ / d", [
+        tk(token.IDENT, "a"), tk(token.SLASH, "/"), tk(token.IDENT, "b"),
+        tk(token.SLASH, "/"), tk(token.IDENT, "d"),
+    ]);
+});
+
+type Pos {
+    String literal;
+    int line;
+    int col;
+}
+
+Pos pos(String lit, int line, int col) {
+    Pos p = { literal: lit, line: line, col: col };
+    return p;
+}
+
+void assertPositions(lexer.Lexer l, Pos[] want) {
+    forEach(want, c) {
+        token.Token t = l.nextToken();
+        if (t.literal != c.literal || t.line != c.line || t.col != c.col) {
+            return Error("got (\"" + t.literal + "\", " + string.from(t.line) + ":"
+                + string.from(t.col) + "), want (\"" + c.literal + "\", "
+                + string.from(c.line) + ":" + string.from(c.col) + ")");
+        }
+    }
+}
+
+// Positions keep counting through the newlines inside a block comment and a
+// backtick string.
+test.start("lexer: positions after a multiline comment and string", void () -> {
+    assertPositions(lexer.newLexer("/* one\ntwo */ a = " + BT + "three\nfour" + BT + ";\nb"), [
+        pos("a", 2, 8),
+        pos("=", 2, 10),
+        pos("three\nfour", 2, 12),
+        pos(";", 3, 6),
+        pos("b", 4, 1),
+    ]);
+});
+
+test.start("lexer: positions", void () -> {
+    assertPositions(lexer.newLexer("int x\n  y == z"), [
+        pos("int", 1, 1),
+        pos("x", 1, 5),
+        pos("y", 2, 3),
+        pos("==", 2, 5),
+        pos("z", 2, 8),
+    ]);
+});
+
+test.start("lexer: EOF is sticky", void () -> {
+    lexer.Lexer l = lexer.newLexer("x");
+    l.nextToken();
+    for (int i = 0; i < 3; i++) {
+        test.expectString(l.nextToken().type, token.EOF);
+    }
+});
+
+// The escapes \r, \0, \xNN and \$ (§1.6), and the four tokens an interpolated
+// string lexes to.
+String const NUL = string.fromByteArray([0]);
+
+test.start("lexer: \\r, \\0, \\xNN and \\$ decode, and a short \\x is an error", void () -> {
+    assertTokens("\"a\\rb\\0c\\x41\\$\"", [tk(token.STRING, "a" + CR + "b" + NUL + "cA$")]);
+    assertTokens("\"\\x4\"", [tk(token.ILLEGAL, "")]);
+    // The rest of the string is still read, so the parser sees one bad token.
+    assertTokens("\"\\xzz\"", [tk(token.ILLEGAL, "zz")]);
+});
+
+test.start("lexer: a backtick string with ${ lexes to text and expression tokens", void () -> {
+    assertTokens("`x ${a} y`", [
+        tk(token.TSTR_START, "x "), tk(token.IDENT, "a"), tk(token.TSTR_END, " y"),
+    ]);
+    assertTokens("`${a}${b}`", [
+        tk(token.TSTR_START, ""), tk(token.IDENT, "a"), tk(token.TSTR_MID, ""),
+        tk(token.IDENT, "b"), tk(token.TSTR_END, ""),
+    ]);
+    // Braces inside the hole balance, so a record literal may sit in one.
+    assertTokens("`${ {a: 1}.a }`", [
+        tk(token.TSTR_START, ""), tk(token.LBRACE, "{"), tk(token.IDENT, "a"),
+        tk(token.COLON, ":"), tk(token.INT, "1"), tk(token.RBRACE, "}"), tk(token.DOT, "."),
+        tk(token.IDENT, "a"), tk(token.TSTR_END, ""),
+    ]);
+    // A hole inside a hole: the inner string's tokens sit inside the outer's.
+    assertTokens("`${`in ${x}`}`", [
+        tk(token.TSTR_START, ""), tk(token.TSTR_START, "in "), tk(token.IDENT, "x"),
+        tk(token.TSTR_END, ""), tk(token.TSTR_END, ""),
+    ]);
+    // `\${` is the two characters, and a `$` not before `{` needs no escape.
+    assertTokens("`a\\${b} $c`", [tk(token.STRING, "a${b} $c")]);
+    // The other two forms never interpolate.
+    assertTokens("\"${a}\"", [tk(token.STRING, "${a}")]);
+});

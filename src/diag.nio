@@ -1,0 +1,155 @@
+// A diagnostic as structured data. `format` below defines the text form. A
+// language server reads the numbers and does not parse that text. Each layer
+// keeps a `String[] errs` beside its `Diagnostic[] diags`, and
+// tests/diag_test.nio checks that the two agree.
+import 'string';
+import 'array';
+import './token' as token;
+
+// A range in one file, half-open at the end. The last character is the one
+// before endCol, so a span on one line covers endCol - col characters. An end
+// of 0 means a position with no range. A diagnostic built from only a line and
+// a column has that form.
+export type Span {
+    String file;
+    int line;
+    int col;
+    int endLine;
+    int endCol;
+}
+
+// The second place a diagnostic refers to. A type error is a disagreement
+// between two places, for example a value and the declaration that expects
+// a different type.
+export type Label {
+    Span at;
+    String message;
+}
+
+// An edit that resolves a diagnostic, for an editor to apply. `at` is the text
+// to replace. An insertion is a span whose end is its start. `title` is the
+// text the editor shows for the edit.
+export type Fix {
+    Span at;
+    String text;
+    String title;
+}
+
+export type Diagnostic {
+    // The file as the loader resolved it, or "" for the entry file. It holds
+    // only the path, without the "path: " prefix that `format` adds, because a
+    // language server turns it back into a document URI.
+    String file;
+    int line;    // 1-based
+    int col;     // 1-based, in bytes; the server converts to UTF-16
+    // Where the incorrect source ends, by the rule of Span. Zero when the
+    // diagnostic has a position and no range.
+    int endLine;
+    int endCol;
+    String message;    // the part of the sentence after the position
+    // The second place, if there is one. The edit that fixes the problem, if
+    // the compiler knows the full edit.
+    Label? related;
+    Fix? fix;
+    // Facts that refer to no place in a file. Each is written on its own line
+    // below the diagnostic. An example is which package required each band of
+    // a package whose types disagree.
+    String[] notes;
+}
+
+// Builds a diagnostic about the entry file, which is the file the parser and
+// the checker report on. The place is a position only. A caller with a token
+// uses `atTok`, which also records the range.
+export Diagnostic at(int line, int col, String message) {
+    Diagnostic d = {
+        file: "", line: line, col: col, endLine: 0, endCol: 0,
+        message: message, related: null, fix: null, notes: [],
+    };
+    return d;
+}
+
+// Builds a diagnostic that covers the source of one token. The parser and the
+// checker report every diagnostic through this function, so every diagnostic
+// has a range to underline.
+export Diagnostic atTok(token.Token tok, String message) {
+    Diagnostic d = {
+        file: "", line: tok.line, col: tok.col,
+        endLine: tok.endLine, endCol: tok.endCol,
+        message: message, related: null, fix: null, notes: [],
+    };
+    return d;
+}
+
+// The span of a token, for a label or a fix.
+export Span spanOf(token.Token tok) {
+    Span s = {
+        file: "", line: tok.line, col: tok.col,
+        endLine: tok.endLine, endCol: tok.endCol,
+    };
+    return s;
+}
+
+// Returns d with a second place. The message is written under that place.
+export Diagnostic related(Diagnostic d, Span at, String message) {
+    Label l = { at: at, message: message };
+    d.related = l;
+    return d;
+}
+
+// Returns d with an edit that resolves it.
+export Diagnostic suggests(Diagnostic d, Span at, String text, String title) {
+    Fix f = { at: at, text: text, title: title };
+    d.fix = f;
+    return d;
+}
+
+// Writes a diagnostic as a sentence. For an imported module the file comes
+// first. The entry file is not named, because the command line has its path.
+export String format(Diagnostic d) {
+    String rest = "line " + string.from(d.line) + ":" + string.from(d.col) + ": " + d.message;
+    forEach(d.notes, n) {
+        rest = rest + "\n  " + n;
+    }
+    if (d.file == "") {
+        return rest;
+    }
+    return d.file + ": " + rest;
+}
+
+export String[] formatAll(Diagnostic[] ds) {
+    String[] out = [];
+    forEach(ds, d) {
+        array.push(out, format(d));
+    }
+    return out;
+}
+
+// Returns ds as reported from the module in `file`. The loader calls this,
+// because the parser and the checker do not know which file they read. An empty
+// file is the entry module and leaves ds unchanged.
+export Diagnostic[] inFile(String file, Diagnostic[] ds) {
+    if (file == "") {
+        return ds;
+    }
+    Diagnostic[] out = [];
+    forEach(ds, d) {
+        Diagnostic moved = {
+            file: file, line: d.line, col: d.col,
+            endLine: d.endLine, endCol: d.endCol,
+            message: d.message, related: d.related, fix: d.fix, notes: d.notes,
+        };
+        // A related place with no file is also in this module. Only the loader
+        // knows which file the parser and the checker read.
+        Label? rel = moved.related;
+        if (rel != null && rel.at.file == "") {
+            Span moved2 = {
+                file: file, line: rel.at.line, col: rel.at.col,
+                endLine: rel.at.endLine, endCol: rel.at.endCol,
+            };
+            Label fixed = { at: moved2, message: rel.message };
+            moved.related = fixed;
+        }
+        array.push(out, moved);
+    }
+    return out;
+}

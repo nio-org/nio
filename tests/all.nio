@@ -1,0 +1,14 @@
+// The whole suite.
+//
+//      nio run tests/all.nio                  everything
+//      nio run --coverage tests/all.nio       everything, and write coverage.lcov
+//      nio run tests/unit_main.nio            the fast half: no clang, under a second
+//      nio run tests/e2e_main.nio             the slow half: one clang run per case
+//
+// The unit half drives the compiler's own modules directly. The end-to-end half
+// compiles real programs through src/driver.nio and runs them.
+import './unit' as unit;
+import './e2e' as e2e;
+import 'test';
+
+test.run();

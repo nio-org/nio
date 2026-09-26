@@ -1,0 +1,1102 @@
+// webview: a native window that shows web content with the platform's own
+// engine. macOS (WKWebView) only. It is an external library (§5.8,
+// libraries/README.md). Programs import it by path.
+//
+// C cannot call a Nio function (§7). Page messages queue on the native side,
+// and the program drains them between steps. A queued message ends a step at
+// once.
+
+import 'string';
+import 'json';
+
+native source './native/webview_native.m';
+native flags darwin '-framework Cocoa -framework WebKit -framework CoreLocation -lobjc';
+
+extern int nw_create(String title, int width, int height);
+extern int nw_navigate(int handle, String url);
+extern int nw_load_html(int handle, String html);
+extern int nw_eval_js(int handle, String js);
+extern int nw_eval_js_result(int handle, int tab, String js);
+extern int nw_find(int handle, int tab, String text, int flags, int maxCount);
+extern int nw_find_clear(int handle, int tab);
+extern int nw_set_title(int handle, String title);
+extern int nw_set_user_agent(int handle, String ua);
+extern int nw_set_ua_rule(int handle, String host, String ua);
+extern int nw_go_back(int handle);
+extern int nw_go_forward(int handle);
+extern int nw_can_back(int handle);
+extern int nw_can_forward(int handle);
+extern int nw_reload(int handle);
+extern int nw_set_inline_titlebar(int handle);
+extern int nw_start_drag(int handle);
+extern int nw_zoom(int handle);
+extern int nw_emoji_picker(int handle);
+extern int nw_dock_menu_item(String id, String title);
+extern int nw_dock_menu_separator(String id);
+extern int nw_app_menu_item(int handle, String menu, String id, String title, String key);
+extern int nw_app_menu_separator(int handle, String menu, String id);
+extern int nw_dock_menu_remove(String id);
+extern int nw_last_active();
+extern int nw_focus_window(int handle);
+extern int nw_app_step(int timeoutMs);
+extern bool nw_app_has_event();
+extern String nw_app_take_event();
+extern int nw_titlebar_buttons_right(int handle);
+extern int nw_titlebar_center_y(int handle);
+extern int nw_set_ui_html(int handle, String html);
+extern int nw_set_ui_front(int handle, int on);
+extern int nw_ui_eval(int handle, String js);
+extern int nw_set_content_insets(int handle, int top, int left, int bottom, int right);
+extern bool nw_step(int handle, int timeoutMs);
+extern bool nw_has_message(int handle);
+extern String nw_take_message(int handle);
+extern bool nw_has_ui_message(int handle);
+extern String nw_take_ui_message(int handle);
+extern int nw_set_profile(int handle, String name);
+extern int nw_set_incognito(int handle);
+extern int nw_delete_profile(int handle, String name);
+extern int nw_set_min_size(int handle, int width, int height);
+extern int nw_print_page(int handle);
+extern int nw_set_devtools(int handle, int on);
+extern int nw_set_page_bridge(int handle, int on);
+extern int nw_set_geolocation(int handle, int on);
+extern int nw_context_menu_item(int handle, String id, String title);
+extern int nw_ctx_retitle(int handle, String id, String title);
+extern int nw_ctx_hide(int handle, String id);
+extern int nw_ctx_capture(int handle, String id);
+extern int nw_set_app_menu(int handle);
+extern int nw_set_appearance(int handle, int mode);
+extern int nw_tab_new(int handle);
+extern int nw_tab_show(int handle, int tab);
+extern int nw_tab_focus(int handle);
+extern int nw_ui_focus(int handle);
+extern int nw_ui_focused(int handle);
+extern int nw_set_backspace_nav(int handle, int on);
+extern int nw_stop_loading(int handle);
+extern int nw_tab_close(int handle, int tab);
+extern String nw_tab_state(int handle, int tab);
+extern int nw_tab_set_state(int handle, int tab, String state);
+extern int nw_tab_media_state(int handle, int tab);
+extern int nw_tab_zoom(int handle, int tab, int percent);
+extern int nw_tab_audible(int handle, int tab);
+extern int nw_tab_capture_state(int handle, int tab);
+extern int nw_ext_load(int handle, String path);
+extern int nw_ext_unload(int handle, int ext);
+extern String nw_ext_list(int handle);
+extern int nw_ext_set_permission(int handle, int ext, String perm, int status);
+extern int nw_ext_action_click(int handle, int ext, int x, int y, int width, int height);
+extern int nw_ext_reply(int handle, int reqId, String answer);
+extern int nw_perm_reply(int handle, int reqId, String answer);
+extern int nw_ext_popup_close(int handle);
+extern int nw_ext_tab_new(int handle, int ext);
+extern String nw_ext_installed();
+extern String nw_pick_path();
+extern String nw_ext_icon(int handle, int ext, int size);
+extern String nw_ext_last_error();
+extern int nw_set_download_dir(int handle, String dir);
+extern String nw_download_dir(int handle);
+extern String nw_downloads(int handle);
+extern int nw_download_cancel(int handle, int id);
+extern int nw_open_path(String path);
+extern int nw_reveal_path(String path);
+extern void nw_close(int handle);
+extern String nw_resources_path();
+
+// Error.code values this library raises. The 400 range keeps them apart from
+// http (100), tls (200) and x509 (300) (§2.9).
+export enum ErrorCode {
+    UNSUPPORTED: 400,    // no native body for this platform yet
+    INVALID: 401,        // a bad argument: an unparsable URL, a closed window
+    FULL: 402            // more windows than the native side tracks
+}
+
+// A window that shows web content. Values are handles: after close every
+// operation raises INVALID, except step, which answers false.
+export type Window {
+    int handle;
+    Map<String, Function(String)<void!>> uiHandlers;
+    Map<String, Function(String)<void!>> pageHandlers;
+}
+
+// Opens a window with the given content size.
+export Window create(String title, int width, int height) {
+    int h = nw_create(title, width, height);
+    if (h == -100) {
+        return Error("webview: no native body for this platform yet (macOS only today)", ErrorCode.UNSUPPORTED);
+    }
+    if (h == -3) {
+        return Error("webview: too many open windows", ErrorCode.FULL);
+    }
+    if (h < 0) {
+        return Error("webview: cannot create a window", ErrorCode.INVALID);
+    }
+    Window w = { handle: h, uiHandlers: {}, pageHandlers: {} };
+    return w;
+}
+
+// Loads a URL: https://, http://, or file://.
+export void navigate(Window w, String url) {
+    raiseCode(nw_navigate(w.handle, url), "cannot navigate to '" + url + "'");
+}
+
+// Shows a page given as text, with no origin.
+export void loadHtml(Window w, String html) {
+    raiseCode(nw_load_html(w.handle, html), "cannot load the page");
+}
+
+// Runs JavaScript in the shown page. It answers no result; the page replies
+// through window.nio.postMessage.
+export void evalJs(Window w, String js) {
+    raiseCode(nw_eval_js(w.handle, js), "cannot evaluate the script");
+}
+
+// Runs JavaScript in one tab (0 is the shown tab) and answers an id. The
+// result arrives on the "__evalresult" channel. The script must evaluate to
+// a String. Treat that value as untrusted page output.
+export int evalJsResult(Window w, int tab, String js) {
+    int id = nw_eval_js_result(w.handle, tab, js);
+    if (id < 0) {
+        return Error("webview: cannot evaluate the script in tab " + string.from(tab),
+            ErrorCode.INVALID);
+    }
+    return id;
+}
+
+// Add the find flags with +. With no flag, find searches forward, ignores
+// letter case, and stops at the end.
+export int const FIND_BACKWARDS = 1;
+
+export int const FIND_CASE_SENSITIVE = 2;
+
+export int const FIND_WRAP = 4;
+
+// Searches one tab's page (tab 0 is the shown tab). The count arrives later
+// on the "__find" channel. The same text again moves to the next match.
+// Above maxCount the count is -1, but the engine still shows the match.
+export void find(Window w, int tab, String text, int flags, int maxCount) {
+    raiseCode(nw_find(w.handle, tab, text, flags, maxCount),
+        "cannot search tab " + string.from(tab));
+}
+
+// Removes one tab's find highlights. They stay until this call or a
+// navigation.
+export void clearFind(Window w, int tab) {
+    raiseCode(nw_find_clear(w.handle, tab), "cannot clear the search");
+}
+
+export void setTitle(Window w, String title) {
+    raiseCode(nw_set_title(w.handle, title), "cannot set the title");
+}
+
+// Replaces the User-Agent the content views send; "" restores the engine's
+// own, which names the host app and which some sites refuse. The UI page is
+// untouched.
+export void setUserAgent(Window w, String ua) {
+    raiseCode(nw_set_user_agent(w.handle, ua), "cannot set the user agent");
+}
+
+// Sets a per-host exception to setUserAgent. Main-frame navigations to `host`
+// or a subdomain send `ua` instead of the window's string. A tab restores the
+// window's string when it navigates away. The longest matching rule host wins.
+// "" as `ua` removes the rule. The rule applies from the next navigation. Use
+// it for sites that check the browser name instead of engine features.
+export void setUserAgentRule(Window w, String host, String ua) {
+    raiseCode(nw_set_ua_rule(w.handle, host, ua), "cannot set the user agent rule");
+}
+
+// Merges the title bar into the UI layer: the bar turns transparent and the
+// UI page extends under it. The page must leave room for the window buttons
+// (titlebarMetrics) and must report drags (startDrag) and title-bar
+// double-clicks (zoom) itself: a web view takes the mouse.
+export void setInlineTitlebar(Window w) {
+    raiseCode(nw_set_inline_titlebar(w.handle), "cannot inline the title bar");
+}
+
+// Where the platform drew the window buttons, in CSS pixels of a page that
+// fills the window, origin top-left. buttonsRight is the rightmost button's
+// right edge; centerY is the buttons' vertical center.
+export type TitlebarMetrics {
+    int buttonsRight;
+    int centerY;
+}
+
+// Measures where the window buttons are. Their position changes with the OS
+// version and the title bar style. Call it after setInlineTitlebar.
+export TitlebarMetrics titlebarMetrics(Window w) {
+    int right = nw_titlebar_buttons_right(w.handle);
+    if (right == -100) {
+        return Error("webview: no native body for this platform yet (macOS only today)", ErrorCode.UNSUPPORTED);
+    }
+    if (right < 0) {
+        return Error("webview: cannot measure the title bar", ErrorCode.INVALID);
+    }
+    int center = nw_titlebar_center_y(w.handle);
+    if (center < 0) {
+        return Error("webview: cannot measure the title bar", ErrorCode.INVALID);
+    }
+    TitlebarMetrics m = { buttonsRight: right, centerY: center };
+    return m;
+}
+
+// Gives the current mouse gesture to the window as a title bar drag. Call it
+// only from a handler for the UI page's mousedown.
+export void startDrag(Window w) {
+    raiseCode(nw_start_drag(w.handle), "cannot start a window drag");
+}
+
+// Toggles the window's zoomed state, as a title-bar double-click does.
+export void zoom(Window w) {
+    raiseCode(nw_zoom(w.handle), "cannot zoom");
+}
+
+// Opens the OS character palette. It inserts into the focused text field, so
+// focus the input first.
+export void emojiPicker(Window w) {
+    raiseCode(nw_emoji_picker(w.handle), "cannot open the emoji palette");
+}
+
+// Puts one entry in the Dock icon's menu. A pick reports as "dock:<id>" on
+// the app event queue (takeAppEvent). Re-adding an id replaces the title in
+// place and keeps the entry where it is.
+export void addDockMenuItem(String id, String title) {
+    raiseCode(nw_dock_menu_item(id, title), "cannot add a Dock menu item");
+}
+
+// Puts a separator line in the Dock menu, under an id removeDockMenuItem
+// takes out like any entry. Re-adding an existing id does nothing.
+export void addDockMenuSeparator(String id) {
+    raiseCode(nw_dock_menu_separator(id), "cannot add a Dock menu separator");
+}
+
+// Removes a Dock menu entry by its id. An id not in the menu is a no-op.
+export void removeDockMenuItem(String id) {
+    raiseCode(nw_dock_menu_remove(id), "cannot remove the Dock menu item '" + id + "'");
+}
+
+// Answers the Window.handle of the window the user was most recently in, or 0
+// while none is open.
+export int lastActiveWindow() {
+    return nw_last_active();
+}
+
+// Brings one window to the user: deminiaturized, ordered front, made key,
+// with the application activated. Use it to answer "reopen".
+export void focusWindow(Window w) {
+    raiseCode(nw_focus_window(w.handle), "cannot focus the window");
+}
+
+// Runs the shared event loop for at most timeoutMs, tied to no window. A loop
+// over several windows blocks here once, then polls each with a zero budget.
+// A queued message or app event ends the wait at once.
+export void pump(int timeoutMs) {
+    raiseCode(nw_app_step(timeoutMs), "cannot pump the event loop");
+}
+
+// Answers the next application-level event, or "" when there is none:
+// "dock:<id>" for a Dock menu pick, "menu:<id>" for a main-menu pick made with
+// no window open, "reopen" for a click on the Dock icon, and "open:<url>" for a
+// URL another application gives to this one. A URL arrives when the program is
+// the platform's handler for the scheme and the user clicks a link elsewhere,
+// or when a document opens onto the program. The library blocks the
+// platform's default for "reopen": answer it with focusWindow or a new window.
+// For "open:<url>" the program decides which window takes the URL. A URL that
+// arrives during startup waits in the queue, so the first window can open
+// first.
+export String takeAppEvent() {
+    if (!nw_app_has_event()) {
+        return "";
+    }
+    return nw_app_take_event();
+}
+
+// Sets the smallest content size the user may resize to, in create's CSS
+// pixels.
+export void setMinSize(Window w, int width, int height) {
+    raiseCode(nw_set_min_size(w.handle, width, height), "cannot set the minimum size");
+}
+
+// Opens the platform's print dialog for the shown page. The call returns when
+// the dialog closes, printed or cancelled alike.
+export void printPage(Window w) {
+    int r = nw_print_page(w.handle);
+    if (r == -100) {
+        return Error("webview: printing needs macOS 11 or later", ErrorCode.UNSUPPORTED);
+    }
+    raiseCode(r, "cannot print the page");
+}
+
+// Turns the engine's developer tools on or off for every content view,
+// current and future. Their "Inspect Element" item joins the content view's
+// context menu. The UI layer is untouched.
+export void setDevTools(Window w, bool on) {
+    int flag = 0;
+    if (on) {
+        flag = 1;
+    }
+    raiseCode(nw_set_devtools(w.handle, flag), "cannot set the developer tools");
+}
+
+// Decides whether window.nio exists in the content views. It is off until this
+// turns it on, and the UI layer always has the bridge. The shim goes into every
+// frame, so an on bridge hands every site and every embedded frame a channel
+// into the host. A browser must leave it off. Call it once, right after create:
+// a page picks the bridge up at its next load.
+export void setPageBridge(Window w, bool on) {
+    int flag = 0;
+    if (on) {
+        flag = 1;
+    }
+    raiseCode(nw_set_page_bridge(w.handle, flag), "cannot set the page bridge");
+}
+
+// Gives the content views a working navigator.geolocation through a page-world
+// shim. On macOS the engine has no public hook for the real one. A request
+// arrives on the "__perm" channel with kind "geolocation". There, "prompt"
+// means deny, because the engine has no popup for this kind. Call it once,
+// right after create. A packaged app needs a location usage-description key in
+// Info.plist.
+export void setGeolocation(Window w, bool on) {
+    int flag = 0;
+    if (on) {
+        flag = 1;
+    }
+    raiseCode(nw_set_geolocation(w.handle, flag), "cannot set geolocation");
+}
+
+// Appends one item to the content view's right-click menu, after the engine's
+// own entries. A pick reports on the "__ctx" channel as "<tab>,<id>". Items
+// keep the order added, apply to every tab, and cannot be removed.
+export void addContextMenuItem(Window w, String id, String title) {
+    raiseCode(nw_context_menu_item(w.handle, id, title), "cannot add the menu item '" + id + "'");
+}
+
+// Renames one of the engine's own context-menu items, found by the identifier
+// WebKit stamps on it ("WKMenuItemIdentifierOpenLinkInNewWindow" and its
+// family). An identifier the engine never stamps never matches.
+export void retitleContextMenuItem(Window w, String id, String title) {
+    raiseCode(nw_ctx_retitle(w.handle, id, title), "cannot retitle the menu item '" + id + "'");
+}
+
+// Removes one of the engine's own context-menu items, by the identifiers
+// retitleContextMenuItem matches on. A second hide has no effect.
+export void hideContextMenuItem(Window w, String id) {
+    raiseCode(nw_ctx_hide(w.handle, id), "cannot hide the menu item '" + id + "'");
+}
+
+// Takes over the pick of one of the engine's own context-menu items, by the
+// identifiers retitleContextMenuItem matches on. The pick reports on "__ctx"
+// with the identifier as the id, and the engine's action does not run. Use it
+// for an engine action that leaves the program, such as
+// "WKMenuItemIdentifierSearchWeb", which opens the default browser.
+export void captureContextMenuItem(Window w, String id) {
+    raiseCode(nw_ctx_capture(w.handle, id), "cannot capture the menu item '" + id + "'");
+}
+
+// back, forward and reload drive the shown view's session history. Going
+// where there is nothing to go is a no-op.
+export void back(Window w) {
+    raiseCode(nw_go_back(w.handle), "cannot go back");
+}
+
+export void forward(Window w) {
+    raiseCode(nw_go_forward(w.handle), "cannot go forward");
+}
+
+// canBack and canForward answer whether the shown view's history has anywhere
+// to go. Read them after a "__nav", a tab switch, or a back or forward.
+export bool canBack(Window w) {
+    // 1 means true. Only a negative result is an error.
+    int r = nw_can_back(w.handle);
+    if (r < 0) {
+        raiseCode(r, "cannot read the history");
+    }
+    return r == 1;
+}
+
+export bool canForward(Window w) {
+    int r = nw_can_forward(w.handle);
+    if (r < 0) {
+        raiseCode(r, "cannot read the history");
+    }
+    return r == 1;
+}
+
+export void reload(Window w) {
+    raiseCode(nw_reload(w.handle), "cannot reload");
+}
+
+// Pumps the window's event loop for at most timeoutMs milliseconds and
+// answers whether the window is still open. It answers false after the user
+// closes it.
+export bool step(Window w, int timeoutMs) {
+    return nw_step(w.handle, timeoutMs);
+}
+
+// Answers the oldest string the page posted through window.nio.postMessage,
+// or null when nothing waits. Drain in a loop: one pump can queue several.
+export String? takeMessage(Window w) {
+    if (!nw_has_message(w.handle)) {
+        return null;
+    }
+    return nw_take_message(w.handle);
+}
+
+// Gives the window a UI layer: one more web page under the content view. The
+// UI page leaves a hole, and setContentInsets puts the content view there.
+// The UI page is another view and another origin, so a site cannot reach it.
+export void setUi(Window w, String html) {
+    raiseCode(nw_set_ui_html(w.handle, html), "cannot load the UI");
+}
+
+// Runs JavaScript in the UI page.
+export void uiEval(Window w, String js) {
+    raiseCode(nw_ui_eval(w.handle, js), "cannot evaluate the UI script");
+}
+
+// Raises the UI layer above the content views, or sinks it back under them.
+// Raised, the UI page draws over the shown page and takes every mouse event,
+// so sink it back as soon as the popover closes. The content views also stop
+// tracking the mouse while it is raised. Needs a UI layer (setUi first).
+export void setUiFront(Window w, bool front) {
+    int flag = 0;
+    if (front) {
+        flag = 1;
+    }
+    raiseCode(nw_set_ui_front(w.handle, flag), "cannot reorder the UI layer");
+}
+
+// Places the content view inside the window, measured from the window's edges
+// as CSS does. The insets survive a resize, so call this only when the UI
+// layout changes.
+export void setContentInsets(Window w, int top, int left, int bottom, int right) {
+    raiseCode(nw_set_content_insets(w.handle, top, left, bottom, right), "cannot place the content view");
+}
+
+// Same as takeMessage, for the UI page's queue. The program supplies the UI
+// page, and the network supplies a content page. Take commands from this queue
+// only.
+export String? takeUiMessage(Window w) {
+    if (!nw_has_ui_message(w.handle)) {
+        return null;
+    }
+    return nw_take_ui_message(w.handle);
+}
+
+// The handler style: the page calls window.nio.send('chan', body), the program
+// registers onMessage(w, "chan", handler), and run(w) is the whole main loop.
+
+// The separator window.nio.send puts between channel and body. A bare
+// window.nio.postMessage has none and lands on the "message" channel.
+String const SEP = string.fromByteArray([1]);
+
+// Registers the handler for one channel of the UI page, the trusted layer
+// where commands belong. One handler per channel; registering again replaces.
+// A raise that escapes the handler is printed, and the loop keeps running.
+export void onMessage(Window w, String channel, Function(String)<void!> handler) {
+    w.uiHandlers[channel] = handler;
+}
+
+// onMessage for the content page's channels. Treat everything arriving here
+// as untrusted input.
+export void onPageMessage(Window w, String channel, Function(String)<void!> handler) {
+    w.pageHandlers[channel] = handler;
+}
+
+// Sends the messages in both queues to the registered handlers. run and poll
+// call it.
+export void dispatch(Window w) {
+    String? m = takeUiMessage(w);
+    while (m != null) {
+        deliver(w.uiHandlers, m);
+        m = takeUiMessage(w);
+    }
+    m = takeMessage(w);
+    while (m != null) {
+        deliver(w.pageHandlers, m);
+        m = takeMessage(w);
+    }
+}
+
+// One beat of the handler style: step for at most timeoutMs, then dispatch
+// what arrived. Answers false once the window has closed.
+export bool poll(Window w, int timeoutMs) {
+    bool alive = step(w, timeoutMs);
+    dispatch(w);
+    return alive;
+}
+
+// The main loop: poll and dispatch until the window closes.
+export void run(Window w) {
+    while (poll(w, 1000)) { }
+}
+
+void deliver(Map<String, Function(String)<void!>> handlers, String msg) {
+    String channel = "message";
+    String body = msg;
+    int i = string.find(msg, SEP);
+    if (i >= 0) {
+        channel = string.substring(msg, 0, i);
+        body = string.substring(msg, i + 1, string.length(msg));
+    }
+    Function(String)<void!>? h = handlers[channel];
+    if (h == null) {
+        return;
+    }
+    h(body) catch e {
+        print("webview: '" + channel + "' handler failed: " + e.message);
+    };
+}
+
+// The library's own events. The native side pushes these channels onto the UI
+// queue, which page script cannot reach, so their data comes from the engine.
+// Register them with onMessage like any channel. The "__" prefix is reserved:
+// a page message with such a name goes to the content queue.
+//
+//   "__nav"        "<tab>,<url>"    the tab committed a main-frame document.
+//                                   A reload repeats its unchanged url
+//   "__navinpage"  "<tab>,<url>"    the tab's URL changed with no document
+//                                   commit: a pushState route or a #fragment
+//                                   jump. Same-origin only, and a same-origin
+//                                   load reports here first, then on "__nav"
+//   "__http"       "<tab>,<status>" the HTTP status of the document the tab
+//                                   is about to render: pushed before its
+//                                   "__nav", main frame only, and never for
+//                                   a response that became a download. A
+//                                   commit with no "__http" carried no HTTP
+//                                   response (file://, a back or forward
+//                                   from the page cache)
+//   "__title"      "<tab>,<title>"  the tab's title, observed
+//   "__load"       "<tab>,1|0"      the tab started or stopped loading. It
+//                                   shows activity and marks no navigation
+//   "__favicon"    "<tab>,<url>"    where the page says its icon is, "" when
+//                                   it cannot say. The URL is the page's
+//                                   claim: check the scheme before loading it
+//   "__menu"       "0,<id>"         a main-menu item was picked, on the queue
+//                                   of the window holding the keyboard.
+//                                   setAppMenu's own items report "settings",
+//                                   "reload", "zoomin", "zoomout", "zoomreset"
+//   "__ctx"        "<tab>,<id>"     a context-menu item was picked
+//   "__evalresult" "<id>,ok,<v>"    an evalJsResult answer, or
+//                  "<id>,err,<m>"   why the engine could not say. The value
+//                                   is the page's: untrusted
+//   "__find"       "<tab>,<n>,<i>"  a find answer: match count and selected
+//                                   index, from zero. i is -1 for none; n is
+//                                   -1 when the page holds more than maxCount
+//   "__newtab"     "<tab>,<url>"    the engine made a tab because the page
+//                                   asked (window.open, target="_blank"). The
+//                                   view exists and is already loading the
+//                                   URL: adopt it, do not navigate it
+//   "__newtabbg"   "<tab>,<url>"    the same, asked for by a user gesture
+//                                   that means a tab behind the page: a
+//                                   middle-click or Cmd+click on a link, or
+//                                   an "Open Link in New Window" pick
+//   "__closed"     "<tab>,"         a page called window.close(). The view
+//                                   stays until the program calls closeTab
+//   "__download"   "<id>,<json>"    a download started, got its destination,
+//                                   finished, failed or was cancelled. The
+//                                   JSON is one downloads() entry; progress
+//                                   between events is the caller's poll
+//   "__perm"       "<tab>,<json>"   a page asked for a permission: JSON
+//                                   { req, origin, kind }, kind one of
+//                                   "camera", "microphone",
+//                                   "camera+microphone", "motion",
+//                                   "geolocation", "screen". The origin is
+//                                   the engine's word, which a page cannot
+//                                   spoof. Every ask must get a permReply, or
+//                                   the page's call stays pending.
+//                                   getUserMedia needs macOS 12 and the
+//                                   matching Info.plist usage-description
+//                                   keys, or no ask fires. "screen" is
+//                                   getDisplayMedia (macOS 13+): a grant
+//                                   opens the system's picker, so the user
+//                                   still chooses what to share there
+
+// Installs the application's main menu: Settings (Cmd+,), Reload (Cmd+R), a
+// View menu with Zoom In, Zoom Out and Actual Size, Quit, a standard Edit
+// menu, and an empty File menu in its conventional slot for addAppMenuItem.
+// The picks report on "__menu", through the responder chain, so the event
+// lands on the focused window: register the handlers on every window.
+export void setAppMenu(Window w) {
+    raiseCode(nw_set_app_menu(w.handle), "cannot install the app menu");
+}
+
+// Appends one item to the named top-level menu, creating that menu at the end
+// of the bar when it does not exist. The pick reports as "0,<id>" on "__menu"
+// of the focused window, or as "menu:<id>" on the app event queue when no
+// window is open. key is the Cmd shortcut: "y" is Cmd+Y, a capital adds
+// Shift, "" is none. Re-adding an id retitles the existing item. Call it
+// after setAppMenu.
+export void addAppMenuItem(Window w, String menu, String id, String title, String key) {
+    raiseCode(nw_app_menu_item(w.handle, menu, id, title, key),
+        "cannot add the menu item '" + id + "'");
+}
+
+// Appends a separator to the named top-level menu, under an id like an item.
+// Re-adding an existing id does nothing. Otherwise addAppMenuItem's contract.
+export void addAppMenuSeparator(Window w, String menu, String id) {
+    raiseCode(nw_app_menu_separator(w.handle, menu, id),
+        "cannot add the menu separator '" + id + "'");
+}
+
+// Forces the window light or dark, or hands it back to the system: "system",
+// "light" or "dark". Every web view inherits it, so the pages'
+// prefers-color-scheme follows.
+export void setAppearance(Window w, String mode) {
+    int m = 0;
+    if (mode == "light") {
+        m = 1;
+    }
+    if (mode == "dark") {
+        m = 2;
+    }
+    raiseCode(nw_set_appearance(w.handle, m), "cannot set the appearance");
+}
+
+// Decides which profile's storage (cookies, logins, site data) tabs created
+// from now on carry; "" is the platform default. A view keeps the store it
+// was born with, so switch profiles by creating fresh tabs and closing the
+// old ones. Switching also unloads every extension. Needs macOS 14.
+export void setProfile(Window w, String name) {
+    int r = nw_set_profile(w.handle, name);
+    if (r == -100) {
+        return Error("webview: profiles need macOS 14 or later", ErrorCode.UNSUPPORTED);
+    }
+    raiseCode(r, "cannot select the profile '" + name + "'");
+}
+
+// Moves the window onto the engine's non-persistent store: cookies, storage
+// and cache live in RAM and die with the window. Only tabs created from now
+// on carry it, so replace the window's first view. There is no way back on
+// this window.
+export void setIncognito(Window w) {
+    raiseCode(nw_set_incognito(w.handle), "cannot make the window incognito");
+}
+
+// Asks the engine to remove the named profile's storage. Call it only after
+// every view born on that profile is closed: the engine refuses a store still
+// in use. The removal is asynchronous: a return means only that the engine
+// has the request. The data can stay for a time. Needs macOS 14.
+export void deleteProfile(Window w, String name) {
+    int r = nw_delete_profile(w.handle, name);
+    if (r == -100) {
+        return Error("webview: profiles need macOS 14 or later", ErrorCode.UNSUPPORTED);
+    }
+    raiseCode(r, "cannot delete the profile '" + name + "'");
+}
+
+// A window holds several content views and shows one at a time. Every
+// per-content call above acts on the shown tab. The window opens on tab 1.
+
+// Creates one more content view, hidden, and answers its id. It inherits the
+// window's user agent and takes the current insets when shown.
+export int newTab(Window w) {
+    int t = nw_tab_new(w.handle);
+    if (t < 0) {
+        if (t == -3) {
+            return Error("webview: too many tabs", ErrorCode.FULL);
+        }
+        return Error("webview: cannot create a tab", ErrorCode.INVALID);
+    }
+    return t;
+}
+
+// Makes the given tab the visible one, the tab every content call then acts
+// on. Showing the tab already shown is a no-op.
+export void showTab(Window w, int tab) {
+    raiseCode(nw_tab_show(w.handle, tab), "cannot show tab " + string.from(tab));
+}
+
+// Makes the shown tab's page the window's first responder, so key events land
+// on it. showTab does not do this. The program decides whether a switch moves
+// focus.
+export void focusTab(Window w) {
+    raiseCode(nw_tab_focus(w.handle), "cannot focus the shown tab");
+}
+
+// Gives the keyboard to the UI layer. A DOM focus() in the UI page is not
+// enough: while a content view is the first responder the keys go to the site.
+export void focusUi(Window w) {
+    raiseCode(nw_ui_focus(w.handle), "cannot focus the UI layer");
+}
+
+export bool uiFocused(Window w) {
+    int r = nw_ui_focused(w.handle);
+    if (r < 0) {
+        return Error("webview: cannot read which layer has the keyboard",
+            ErrorCode.INVALID);
+    }
+    return r == 1;
+}
+
+// Decides whether Backspace goes back in history on the content views. The
+// engine's default is on, outside text fields. Views made later keep the
+// setting.
+export void setBackspaceNavigation(Window w, bool on) {
+    int flag = 0;
+    if (on) {
+        flag = 1;
+    }
+    raiseCode(nw_set_backspace_nav(w.handle, flag),
+        "cannot set backspace navigation");
+}
+
+// Stops the shown tab's load. A load that already finished is a no-op, and
+// the "__load" event is what says the load stopped.
+export void stopLoading(Window w) {
+    raiseCode(nw_stop_loading(w.handle), "cannot stop the shown tab's load");
+}
+
+// Destroys a hidden tab and releases its view. Closing the shown tab is
+// refused: show another one first, so the window always has a content view.
+export void closeTab(Window w, int tab) {
+    raiseCode(nw_tab_close(w.handle, tab), "cannot close tab " + string.from(tab));
+}
+
+// Answers an opaque snapshot of the tab's session for tabRestore: history,
+// scroll positions and form state. "" when there is nothing to give; treat
+// that as "navigate to the URL instead". The snapshot belongs to this engine
+// and to this session.
+export String tabState(Window w, int tab) {
+    return nw_tab_state(w.handle, tab);
+}
+
+// Hands a tabState snapshot to a tab that has not navigated yet, in place of
+// its first navigation. An undecodable snapshot raises INVALID; a decodable
+// one the engine no longer recognizes restores nothing, so navigate instead.
+// Needs macOS 12.
+export void tabRestore(Window w, int tab, String state) {
+    int r = nw_tab_set_state(w.handle, tab, state);
+    if (r == -100) {
+        return Error("webview: session restore needs macOS 12 or later", ErrorCode.UNSUPPORTED);
+    }
+    raiseCode(r, "cannot restore tab " + string.from(tab));
+}
+
+// Sets one tab's page zoom, in percent: 25 to 500, 100 the natural size. It
+// is layout zoom, so text reflows. A recreated view starts back at 100. Needs
+// macOS 11.
+export void tabZoom(Window w, int tab, int percent) {
+    int r = nw_tab_zoom(w.handle, tab, percent);
+    if (r == -100) {
+        return Error("webview: page zoom needs macOS 11 or later", ErrorCode.UNSUPPORTED);
+    }
+    raiseCode(r, "cannot zoom tab " + string.from(tab));
+}
+
+// Answers whether the tab makes sound now. Muted autoplay answers false here
+// and "playing" from tabMediaState. WebKit has no public API for this fact, so
+// an engine that cannot answer raises UNSUPPORTED.
+export bool tabAudible(Window w, int tab) {
+    int r = nw_tab_audible(w.handle, tab);
+    if (r == -100) {
+        return Error("webview: this engine cannot answer whether a tab is audible",
+            ErrorCode.UNSUPPORTED);
+    }
+    if (r < 0) {
+        return Error("webview: cannot read tab " + string.from(tab) + "'s audio state",
+            ErrorCode.INVALID);
+    }
+    return r == 1;
+}
+
+// Answers whether the tab holds the camera or the microphone: "none",
+// "camera", "microphone" or "both". A muted device still counts as held.
+// Needs macOS 12.
+export String tabCaptureState(Window w, int tab) {
+    int r = nw_tab_capture_state(w.handle, tab);
+    if (r == -100) {
+        return Error("webview: capture state needs macOS 12 or later", ErrorCode.UNSUPPORTED);
+    }
+    if (r < 0) {
+        return Error("webview: cannot read tab " + string.from(tab) + "'s capture state",
+            ErrorCode.INVALID);
+    }
+    if (r == 1) {
+        return "camera";
+    }
+    if (r == 2) {
+        return "microphone";
+    }
+    if (r == 3) {
+        return "both";
+    }
+    return "none";
+}
+
+// Answers what the tab's page does with media: "none", "playing", "paused" or
+// "suspended". It reports playback. Muted autoplay answers "playing" too, so
+// use tabAudible for an audio policy. Needs macOS 12.
+export String tabMediaState(Window w, int tab) {
+    int r = nw_tab_media_state(w.handle, tab);
+    if (r == -100) {
+        return Error("webview: media state needs macOS 12 or later", ErrorCode.UNSUPPORTED);
+    }
+    if (r < 0) {
+        return Error("webview: cannot read tab " + string.from(tab) + "'s media state",
+            ErrorCode.INVALID);
+    }
+    if (r == 1) {
+        return "playing";
+    }
+    if (r == 2) {
+        return "paused";
+    }
+    if (r == 3) {
+        return "suspended";
+    }
+    return "none";
+}
+
+// Web extensions, through Safari's own WKWebExtension engine (macOS 15.4+).
+// They attach to the content views only, never to the UI layer, and their
+// storage follows the window's profile, so setProfile unloads every extension.
+// extLoad grants everything the manifest requests, and extSetPermission
+// narrows it afterwards.
+//
+// Five channels join the library's events, all on the UI queue with body
+// "<ext>,<json>":
+//
+//   "__extloaded"   {name, version, error}   the extension is running; error
+//                                            is why it is not, or ""
+//   "__extaction"   {enabled, badge, label}  the toolbar button changed;
+//                                            extIcon answers the new image
+//   "__extperm"     {req, kind, items}       a run-time permission ask;
+//                                            answer it with extReply
+//   "__extpopup"    ""                       an action popup was presented
+//   "__extnewtab"   {req, url}               the extension wants a tab; make
+//                                            one and extReply its id, or ""
+
+// One loaded extension, as extensions() lists them. The id is the handle
+// every ext* call takes; ids are per window and not stable across runs. url
+// is the base of the extension's own pages, which need a tab from extNewTab.
+export type Extension {
+    int id;
+    String name;
+    String version;
+    String url;
+}
+
+// Loads an extension into the window and answers its id. The path may be an
+// unpacked directory, a .zip of one, a Safari web extension .appex, or a
+// container .app. The extension is running when its "__extloaded" event
+// arrives. Needs macOS 15.4.
+//
+// The extension gets Safari's safari-web-extension: origin, with a host stable
+// per profile and extension path, so its site data and its logins survive a
+// restart.
+export int extLoad(Window w, String path) {
+    int r = nw_ext_load(w.handle, path);
+    if (r == -100) {
+        return Error("webview: extensions need macOS 15.4 or later", ErrorCode.UNSUPPORTED);
+    }
+    if (r == -3) {
+        return Error("webview: too many extensions", ErrorCode.FULL);
+    }
+    if (r < 0) {
+        return Error("webview: cannot load the extension '" + path + "': " + nw_ext_last_error(),
+            ErrorCode.INVALID);
+    }
+    return r;
+}
+
+// Stops an extension: content scripts stop injecting and background content
+// winds down. Its storage stays, so a later extLoad finds it again.
+export void extUnload(Window w, int ext) {
+    raiseCode(nw_ext_unload(w.handle, ext), "cannot unload extension " + string.from(ext));
+}
+
+// Answers the loaded extensions, oldest first.
+export Extension[] extensions(Window w) {
+    Json v = json.parse(nw_ext_list(w.handle)) catch e {
+        return [];
+    };
+    Extension[] out = v as Extension[] catch e {
+        return [];
+    };
+    return out;
+}
+
+// Grants or revokes one permission ("storage", "tabs") or one host match
+// pattern ("<all_urls>"), told apart by the text itself. The profile's
+// extension storage keeps the change.
+export void extSetPermission(Window w, int ext, String perm, bool granted) {
+    int status = -1;
+    if (granted) {
+        status = 1;
+    }
+    raiseCode(nw_ext_set_permission(w.handle, ext, perm, status),
+        "cannot set the permission '" + perm + "'");
+}
+
+// Reports a click on the extension's toolbar button, at the given rect of the
+// UI page in CSS pixels, origin top-left. A popup extension presents its
+// popup anchored there and reports "__extpopup"; a background-only one gets
+// its click event. A second click while the popup is up dismisses it.
+export void extActionClick(Window w, int ext, int x, int y, int width, int height) {
+    raiseCode(nw_ext_action_click(w.handle, ext, x, y, width, height),
+        "cannot click extension " + string.from(ext));
+}
+
+// Creates a hidden tab able to show the extension's own pages, which a plain
+// tab's view refuses to load. The answer is an ordinary tab handle. Use
+// newTab for ordinary web URLs.
+export int extNewTab(Window w, int ext) {
+    int t = nw_ext_tab_new(w.handle, ext);
+    if (t == -100) {
+        return Error("webview: extensions need macOS 15.4 or later", ErrorCode.UNSUPPORTED);
+    }
+    if (t == -3) {
+        return Error("webview: too many tabs", ErrorCode.FULL);
+    }
+    if (t < 0) {
+        return Error("webview: cannot create an extension tab", ErrorCode.INVALID);
+    }
+    return t;
+}
+
+// Answers a parked extension decision ("__extperm", "__extnewtab") by its
+// request id. A second reply to the same id raises INVALID.
+export void extReply(Window w, int reqId, String answer) {
+    raiseCode(nw_ext_reply(w.handle, reqId, answer), "cannot reply to request " + string.from(reqId));
+}
+
+// Answers a parked "__perm" ask by its request id: "grant", "deny" or
+// "prompt". "prompt" hands the decision to the engine's own popup, whose
+// answer the program never learns. A second reply raises INVALID. The engine
+// asks again at every page load, so the program remembers the decision.
+export void permReply(Window w, int reqId, String answer) {
+    raiseCode(nw_perm_reply(w.handle, reqId, answer),
+        "cannot reply to permission request " + string.from(reqId));
+}
+
+// Dismisses the presented popup. A click away from it does the same.
+export void extPopupClose(Window w) {
+    raiseCode(nw_ext_popup_close(w.handle), "cannot close the popup");
+}
+
+// Answers the extension's toolbar icon at the given size, as a data: URI, or
+// "" when the extension ships none. Pull it when "__extaction" arrives.
+export String extIcon(Window w, int ext, int size) {
+    return nw_ext_icon(w.handle, ext, size);
+}
+
+// A Safari web extension found on this machine: the container .app (the
+// path extLoad takes whole) and the app's display name.
+export type InstalledExt {
+    String path;
+    String name;
+}
+
+// Scans /Applications and ~/Applications for apps carrying a Safari web
+// extension. The list is empty where the platform cannot scan.
+export InstalledExt[] installedExtensions() {
+    Json v = json.parse(nw_ext_installed()) catch e {
+        return [];
+    };
+    InstalledExt[] out = v as InstalledExt[] catch e {
+        return [];
+    };
+    return out;
+}
+
+// Opens the platform's file panel and answers the chosen path, or "" when the
+// user cancels. The call blocks until the panel closes.
+export String pickPath() {
+    return nw_pick_path();
+}
+
+// Downloads. The engine decides when a load is a download. The file lands in
+// the download directory under the server's suggested name, as "name (2).ext"
+// when the name is taken. The window keeps every download it has seen as the
+// session's history. The "__download" channel reports state changes. For
+// progress between them, the caller polls. A download survives its tab. Needs
+// macOS 11.3. On older versions nothing becomes a download.
+
+// One download, as downloads() lists them.
+export type Download {
+    int id;          // per window, never reused; events name it
+    String state;    // "active" | "done" | "failed" | "cancelled"
+    String file;     // the leaf name on disk; "" until the path is decided
+    String path;     // the full destination path; "" until then
+    String url;      // what was asked for
+    int received;    // bytes on disk so far (final once settled)
+    int total;       // expected bytes; -1 while the server has not said
+    String error;    // the reason, for failed downloads only
+}
+
+// Decides where downloads land from now on: an absolute directory, or "" for
+// the platform's Downloads folder. The call does not check the path. A
+// download into a directory that cannot be written fails.
+export void setDownloadDir(Window w, String dir) {
+    raiseCode(nw_set_download_dir(w.handle, dir), "cannot set the download directory");
+}
+
+// Answers the directory downloads land in: the set one, else the platform's
+// Downloads folder.
+export String downloadDir(Window w) {
+    return nw_download_dir(w.handle);
+}
+
+// Answers every download the window has seen, oldest first.
+export Download[] downloads(Window w) {
+    Json v = json.parse(nw_downloads(w.handle)) catch e {
+        return [];
+    };
+    Download[] out = v as Download[] catch e {
+        return [];
+    };
+    return out;
+}
+
+// Stops an active download. What already reached the disk stays there, marked
+// "cancelled". Cancelling a settled download is a no-op.
+export void cancelDownload(Window w, int id) {
+    int r = nw_download_cancel(w.handle, id);
+    if (r == -100) {
+        return Error("webview: downloads need macOS 11.3 or later", ErrorCode.UNSUPPORTED);
+    }
+    raiseCode(r, "cannot cancel download " + string.from(id));
+}
+
+// Opens a path the way a double-click does: a file launches in its default
+// app, a directory opens as a folder window.
+export void openPath(String p) {
+    int r = nw_open_path(p);
+    if (r == -100) {
+        return Error("webview: no native body for this platform yet (macOS only today)",
+            ErrorCode.UNSUPPORTED);
+    }
+    raiseCode(r, "cannot open '" + p + "'");
+}
+
+// Shows a path in the platform's file browser: a directory opens as a folder
+// window, a file is selected in its own folder.
+export void revealPath(String p) {
+    int r = nw_reveal_path(p);
+    if (r == -100) {
+        return Error("webview: no native body for this platform yet (macOS only today)",
+            ErrorCode.UNSUPPORTED);
+    }
+    raiseCode(r, "cannot reveal '" + p + "'");
+}
+
+// Closes the window. step answers false from then on; every other operation
+// raises INVALID.
+export void close(Window w) {
+    nw_close(w.handle);
+}
+
+// Answers the bundle's Contents/Resources directory when the program runs
+// from a packaged .app, and "" when it runs outside one.
+export String resourcesPath() {
+    return nw_resources_path();
+}
+
+// Turns a nonzero native return code into an INVALID Error. All functions
+// above use it, so the codes and messages stay consistent.
+void raiseCode(int code, String what) {
+    if (code == 0) {
+        return;
+    }
+    return Error("webview: " + what, ErrorCode.INVALID);
+}

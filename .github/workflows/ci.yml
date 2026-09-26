@@ -1,0 +1,69 @@
+name: CI
+
+# Builds the compiler from the checked-in IR with clang alone, lets it build
+# itself, and runs the full test suite on each host.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        # Git Bash on Windows, so every step is the same shell line on all hosts.
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: clang version
+        run: clang --version
+
+      - name: Build the compiler from bootstrap/nio.ll
+        run: sh bootstrap/build.sh ./nio0
+
+      - name: Build the compiler with itself
+        run: ./nio0 build src/nio.nio -o ./nio
+
+      - name: Test
+        run: ./nio run tests/all.nio
+
+      # A short run that catches a parser crash introduced by a refactor.
+      # Longer runs are done by hand.
+      - name: Fuzz the x509 and tls parsers
+        run: ./nio run tools/fuzz.nio 60
+
+  # BoringSSL's TLS test suite, run against the tls module. It needs a Go
+  # toolchain and a BoringSSL checkout, so it is a job of its own.
+  bogo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Build the compiler from bootstrap/nio.ll
+        run: sh bootstrap/build.sh ./nio0
+
+      - name: Build the compiler with itself
+        run: ./nio0 build src/nio.nio -o ./nio
+
+      - name: BoGo
+        run: sh tools/bogo.sh

@@ -1,0 +1,383 @@
+// Statement coverage, end to end.
+//
+// `nio --coverage` is off by default. When it is off, the compiler emits no
+// instrumentation. These tests check the LCOV that a real instrumented program
+// writes.
+import 'test';
+import 'string';
+import 'array';
+import 'map';
+import 'path';
+import 'fs';
+import './harness' as h;
+import '../src/loader' as loader;
+import '../src/codegen' as codegen;
+
+// ---- reading a report back ----
+
+// Report is a parsed LCOV file. It maps a file name to a map from source line
+// to run count, in the order of the records.
+type Report {
+    String[] files;
+    Map<String, Map<int, int>> lines;
+}
+
+// The two record kinds that the reporter writes: SF: names a file, and DA:
+// gives a line and its count.
+Report parseLCOV(String text) {
+    Report r = { files: [], lines: {} };
+    String cur = "";
+    forEach(string.split(text, "\n"), line) {
+        if (string.length(line) > 3 && string.substring(line, 0, 3) == "SF:") {
+            cur = string.substring(line, 3, string.length(line));
+            array.push(r.files, cur);
+            r.lines[cur] = {};
+            continue;
+        }
+        if (string.length(line) > 3 && string.substring(line, 0, 3) == "DA:") {
+            String[] parts = string.split(string.substring(line, 3, string.length(line)), ",");
+            if (parts.length != 2) {
+                return Error("malformed DA line \"" + line + "\"");
+            }
+            Map<int, int>? counts = r.lines[cur];
+            if (counts == null) {
+                return Error("a DA line before any SF line: \"" + line + "\"");
+            }
+            counts[string.toInt(parts[0])] = string.toInt(parts[1]);
+        }
+    }
+    return r;
+}
+
+// The record whose SF: path ends in name. A test names a file without its
+// temporary directory.
+Map<int, int> fileLines(Report r, String name) {
+    forEach(r.files, p) {
+        if (endsWith(p, name)) {
+            Map<int, int>? counts = r.lines[p];
+            if (counts != null) {
+                return counts;
+            }
+        }
+    }
+    return Error("no coverage record for \"" + name + "\"; have "
+        + string.join(r.files, ", "));
+}
+
+bool has(Report r, String name) {
+    forEach(r.files, p) {
+        if (endsWith(p, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool endsWith(String s, String suffix) {
+    if (string.length(suffix) > string.length(s)) {
+        return false;
+    }
+    return string.substring(s, string.length(s) - string.length(suffix),
+        string.length(s)) == suffix;
+}
+
+// ---- running an instrumented program ----
+
+type Covered {
+    Report report;
+    h.Run run;
+}
+
+// Builds files with coverage on, runs the entry program, and returns its report
+// and its output. The program gets its own directory and NIO_COVERAGE_FILE,
+// because otherwise the report goes to the working directory.
+Covered runCovered(h.File[] files, String entry) {
+    String dir = h.writeFiles(files);
+    String bin = h.buildEntry(path.join(dir, path.localize(entry)), true);
+    String covPath = path.join(dir, "out.lcov");
+    Map<String, String> env = { "NIO_COVERAGE_FILE": covPath };
+    h.Run run = h.runBinaryIn(bin, [], dir, env);
+    byte[] data = fs.readFile(covPath) catch e {
+        return Error("no coverage report written: " + e.message + "\nstderr: " + run.err);
+    };
+    Covered out = { report: parseLCOV(string.fromByteArray(data)), run: run };
+    return out;
+}
+
+// A line and the number of times it must have run.
+type Count {
+    int line;
+    int want;
+}
+
+Count at(int line, int want) {
+    Count c = { line: line, want: want };
+    return c;
+}
+
+void expectCounts(Map<int, int> lines, Count[] want) {
+    forEach(want, c) {
+        int? got = lines[c.line];
+        if (got == null) {
+            return Error("line " + string.from(c.line) + " is not instrumented");
+        }
+        if (got != c.want) {
+            return Error("line " + string.from(c.line) + " ran " + string.from(got)
+                + " times, want " + string.from(c.want));
+        }
+    }
+}
+
+h.File[] one(String text) {
+    return [h.file("main.nio", text)];
+}
+
+// A function that is not called reports zero counts. A function that is called
+// reports how many times it ran.
+test.start("coverage: reports what ran", void () -> {
+    Covered c = runCovered(one(`
+int add(int a, int b) {
+    return a + b;
+}
+
+int unused() {
+    return 99;
+}
+
+print(add(2, 2));
+`), "main.nio");
+    test.expectInt(c.run.code, 0);
+    expectCounts(fileLines(c.report, "main.nio"), [
+        at(3, 1),     // return a + b
+        at(7, 0),     // return 99, in the function that is not called
+        at(10, 1),    // print(add(2, 2))
+    ]);
+});
+
+// The count of a loop body is the number of iterations.
+test.start("coverage: counts repeated lines", void () -> {
+    Covered c = runCovered(one(`
+int sum = 0;
+for (int i = 0; i < 4; i++) {
+    sum = sum + i;
+}
+print(sum);
+`), "main.nio");
+    expectCounts(fileLines(c.report, "main.nio"), [
+        at(4, 4),    // the body, once per iteration
+        at(6, 1),
+    ]);
+});
+
+// A raised Error (§2.9) ends the block that a counter covers: the statement
+// after a call that raised did not run. Codegen reads the block boundary from
+// the emitted IR. A split at control-flow statements only would put both lines
+// under one counter.
+test.start("coverage: a block ends at a raise", void () -> {
+    Covered c = runCovered(one(`
+import 'string';
+
+int parse(String s) {
+    int n = string.toInt(s);
+    print("parsed");
+    return n;
+}
+
+int safe(String s) {
+    int r = parse(s) catch e {
+        return 0;
+    };
+    return r;
+}
+
+print(safe("nope"));
+print(safe("42"));
+`), "main.nio");
+    expectCounts(fileLines(c.report, "main.nio"), [
+        at(5, 2),    // both calls reach the parse
+        at(6, 1),    // only the one that did not raise gets past it
+        at(7, 1),
+        at(12, 1),    // the catch handler, for the call that raised
+        at(14, 1),    // the ordinary return, for the call that did not
+    ]);
+});
+
+// The await normalizer rewrites an async body before codegen. The report must
+// show only the lines of the source.
+test.start("coverage: an async body", void () -> {
+    Covered c = runCovered(one(`
+import 'async';
+
+int async twice(int x) {
+    int y = await identity(x);
+    return y + y;
+}
+int async identity(int x) { return x; }
+
+async.run(twice(21), void (int v) -> {
+    print(v);
+});
+`), "main.nio");
+    Map<int, int> lines = fileLines(c.report, "main.nio");
+    expectCounts(lines, [at(5, 1), at(6, 1), at(8, 1), at(10, 1), at(11, 1)]);
+    // A synthetic statement counted in error appears outside the file's lines.
+    forEach(map.keys(lines), ln) {
+        if (ln < 1 || ln > 12) {
+            return Error("the report has line " + string.from(ln) + ", outside the source");
+        }
+    }
+});
+
+// The count of a line is the number of times the line was reached, not the
+// number of statements on it. Code on the line in a different block adds to
+// the count, for example a closure body on the line that calls it.
+test.start("coverage: a line counts once per block", void () -> {
+    Covered c = runCovered(one(`
+int a = 1; int b = 2;
+print(a + b);
+Function()<void> f = void () -> { print("in"); }; f();
+`), "main.nio");
+    expectCounts(fileLines(c.report, "main.nio"), [
+        at(2, 1),    // two declarations, one block, reached once
+        at(3, 1),
+        at(4, 2),    // the top-level block, plus the closure body it calls
+    ]);
+});
+
+// An inherited method (§2.4) is compiled once for each extending type but
+// written once. Every copy reports against the file of the base, and the
+// counts add.
+test.start("coverage: inherited bodies attribute to their own file", void () -> {
+    Covered c = runCovered([
+        h.file("base.nio", `
+export type Animal {
+    String name;
+
+    String speak() {
+        return self.name + " makes a sound";
+    }
+}
+`),
+        h.file("main.nio", `
+import './base.nio' as base;
+
+type Cat extends base.Animal {}
+type Cow extends base.Animal {}
+
+Cat c = { name: "Tom" };
+Cow w = { name: "Bess" };
+print(c.speak());
+print(w.speak());
+`),
+    ], "main.nio");
+    // Line 6 of base.nio is the body. The copies of Cat and Cow each ran once.
+    expectCounts(fileLines(c.report, "base.nio"), [at(6, 2)]);
+    expectCounts(fileLines(c.report, "main.nio"), [at(9, 1), at(10, 1)]);
+});
+
+// A standard library module written in Nio (§6.13) is compiled from source
+// like any other module. The report must not include it.
+test.start("coverage: excludes the standard library", void () -> {
+    Covered c = runCovered(one(`
+import 'test';
+test.start("adds", void () -> {
+    test.expectInt(2 + 2, 4);
+});
+test.run();
+`), "main.nio");
+    test.assert(!has(c.report, "test.nio") && !has(c.report, "stdlib/test.nio"),
+        "the standard library's test module is in the report: "
+        + string.join(c.report.files, ", "));
+    expectCounts(fileLines(c.report, "main.nio"), [at(3, 1), at(4, 1), at(6, 1)]);
+});
+
+// An atexit handler writes the report, so a run that does not reach the end of
+// main still writes one. A failing suite ends in process.exit(1), and a panic
+// also exits.
+test.start("coverage: written when the program exits early", void () -> {
+    Covered c = runCovered(one(`
+import 'process';
+print("before");
+process.exit(3);
+print("after");
+`), "main.nio");
+    test.expectInt(c.run.code, 3);
+    expectCounts(fileLines(c.report, "main.nio"), [at(3, 1), at(4, 1)]);
+
+    Covered p = runCovered(one(`
+int div(int a, int b) { return a / b; }
+print("before");
+print(div(1, 0));
+`), "main.nio");
+    test.assert(p.run.code != 0, "expected the panic to fail the program");
+    test.assert(string.contains(p.run.err, "division by zero"),
+        "stderr \"" + p.run.err + "\" does not mention the panic");
+    expectCounts(fileLines(p.report, "main.nio"), [at(3, 1), at(4, 1)]);
+});
+
+// The summary lets a person read the result in a CI log without the file.
+test.start("coverage: prints a summary", void () -> {
+    Covered c = runCovered(one("\nint unused() { return 1; }\nprint(\"hi\");\n"), "main.nio");
+    test.assert(string.contains(c.run.err, "coverage:") && string.contains(c.run.err, "%"),
+        "stderr \"" + c.run.err + "\" has no coverage summary");
+    test.assert(string.contains(c.run.err, "(1/2)"),
+        "stderr \"" + c.run.err + "\" does not report 1 of 2 lines covered");
+});
+
+// Without the flag, no instrumentation is emitted in the IR or linked.
+test.start("coverage: off changes nothing", void () -> {
+    String src = "\nint add(int a, int b) { return a + b; }\nprint(add(1, 2));\n";
+    String dir = h.scratch();
+    String entry = h.writeTo(dir, "main.nio", src);
+
+    loader.CompileResult plain = loader.compileEntry(src, dir, entry, codegen.noOptions());
+    test.assert(plain.errs.length == 0, "unexpected errors: " + string.join(plain.errs, "\n"));
+    test.assert(!string.contains(plain.ir, "nio.cov")
+        && !string.contains(plain.ir, "rt_cov_init"),
+        "an ordinary build emitted coverage symbols");
+    forEach(plain.cfiles, f) {
+        if (f == "coverage.c") {
+            return Error("an ordinary build linked coverage.c");
+        }
+    }
+
+    loader.CompileResult covered = loader.compileEntry(src, dir, entry, { coverage: true, debug: false, release: false, targetAttrs: "" });
+    test.assert(covered.errs.length == 0,
+        "unexpected errors: " + string.join(covered.errs, "\n"));
+    forEach(["@nio.cov.counts", "@nio.cov.lines", "rt_cov_init"], want) {
+        if (!string.contains(covered.ir, want)) {
+            return Error("an instrumented build is missing " + want);
+        }
+    }
+    bool found = false;
+    forEach(covered.cfiles, f) {
+        if (f == "coverage.c") {
+            found = true;
+        }
+    }
+    test.assert(found, "an instrumented build did not link coverage.c, got "
+        + string.join(covered.cfiles, ", "));
+});
+
+// A program with no statement to instrument still writes an empty file, so a
+// CI step that always uploads it does not fail.
+test.start("coverage: a program with no statements", void () -> {
+    Covered c = runCovered(one("type T { int x; }\n"), "main.nio");
+    test.expectInt(c.run.code, 0);
+    test.expectInt(c.report.files.length, 0);
+    test.assert(string.contains(c.run.err, "no instrumented lines"),
+        "stderr = \"" + c.run.err + "\"");
+});
+
+// A statement that can never be reached is instrumented like any other and
+// reports zero. It stays in the total.
+test.start("coverage: reports unreachable statements", void () -> {
+    Covered c = runCovered(one(`
+int f() {
+    return 1;
+    print("never");
+}
+print(f());
+`), "main.nio");
+    expectCounts(fileLines(c.report, "main.nio"), [at(3, 1), at(4, 0), at(6, 1)]);
+});

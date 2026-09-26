@@ -1,0 +1,61 @@
+// A -g build through clang. The unit tests check the shape of the metadata.
+// This test checks that LLVM accepts it. A malformed DISubprogram, a call with
+// no location, or a scope that belongs to no function is a verifier error, and
+// a verifier error makes the build fail.
+import 'test';
+import 'string';
+import './harness' as h;
+
+String const program = `import 'time';
+
+type Counter {
+    int n;
+    int bump(int by) {
+        self.n = self.n + by;
+        return self.n;
+    }
+}
+
+int total = 0;
+
+int async later(int n) {
+    int doubled = n * 2;
+    await time.sleep(1);
+    return doubled + 1;
+}
+
+void run() {
+    Counter c = { n: 0 };
+    int seen = 0;
+    Function(int)<void> add = void (int v) -> { seen = seen + v; };
+    add(c.bump(4));
+    add(c.bump(6));
+    total = seen;
+}
+
+run();
+print(total);
+print(await later(20));
+`;
+
+test.start("debug: a -g build compiles, links and runs", void () -> {
+    String dir = h.scratch();
+    String entry = h.writeTo(dir, "prog.nio", program);
+    String bin = h.buildEntryDebug(entry);
+    h.Run r = h.runBinaryIn(bin, [], dir, {});
+    if (r.code != 0) {
+        return Error("a -g build failed to run: " + r.err + r.out);
+    }
+    test.expectString(string.trim(r.out), "14\n41");
+});
+
+// The same program without -g. The two builds must give the same output,
+// because debug information must not change a program.
+test.start("debug: -g does not change what a program prints", void () -> {
+    String dir = h.scratch();
+    String entry = h.writeTo(dir, "prog.nio", program);
+    h.Run plain = h.runBinaryIn(h.buildEntry(entry, false), [], dir, {});
+    h.Run debugged = h.runBinaryIn(h.buildEntryDebug(entry), [], dir, {});
+    test.expectString(debugged.out, plain.out);
+    test.expectInt(debugged.code, plain.code);
+});

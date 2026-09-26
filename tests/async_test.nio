@@ -1,0 +1,867 @@
+// Async functions, futures and the scheduler, end to end.
+import 'test';
+import 'string';
+import 'process';
+import './harness' as h;
+
+test.start("async: async await", void () -> {
+    h.expectOutput(`
+int async sum(int a) {
+    return a;
+}
+
+int mySum = await sum(5);
+print(mySum);
+
+// A future is a value: store it and await it later. A second await reuses
+// the stored result, and the body runs once.
+int calls = 0;
+int async counted() {
+    calls++;
+    return 21;
+}
+Future<int> f = counted();
+print(await f + await f);
+print(calls);
+
+// await binds like a unary operator: (await f) + 1.
+print(await sum(41) + 1);
+`, [
+        "5", "42", "1", "42",
+    ]);
+});
+
+test.start("async: async deferred execution", void () -> {
+    h.expectOutput(`
+void async announce(String m) {
+    print(m);
+}
+
+announce("first");
+announce("second");
+print("top-level");
+`, [
+        "top-level", "first", "second",
+    ]);
+});
+
+test.start("async: async run callbacks", void () -> {
+    h.expectOutput(`
+import 'async';
+
+int async sum(int a) {
+    return a;
+}
+
+Future<int> mySum = sum(5);
+async.run(mySum, void (int i) -> print(i));
+print("registered");
+`, [
+        "registered", "5",
+    ]);
+    h.expectOutput(`
+import 'async';
+
+int async val() {
+    return 7;
+}
+
+Future<int> f = val();
+async.run(f, void (int a) -> print(a + 1));
+async.run(f, void (int a) -> print(a + 2));
+print(await f);
+async.run(f, void (int a) -> print(a + 3));
+print("end");
+`, [
+        "8", "9", "7", "10", "end",
+    ]);
+    h.expectOutput(`
+import 'async';
+
+void async announce(String m) {
+    print(m);
+}
+
+int async val() {
+    return 1;
+}
+
+async.run(val(), void (int a) -> {
+    announce("from-callback");
+    print(a);
+});
+print("top-level");
+`, [
+        "top-level", "1", "from-callback",
+    ]);
+});
+
+test.start("async: async void and scalars", void () -> {
+    h.expectOutput(`
+import 'async';
+
+void async log(String m) {
+    print(m);
+}
+
+Future<void> t = log("ran");
+await t;
+async.run(t, void () -> print("done"));
+
+float async half(float x) {
+    return x / 2.0;
+}
+print(await half(5.0));
+async.run(half(1.0), void (float f) -> print(f));
+
+String async greet(String who) {
+    return "hi " + who;
+}
+// Awaiting greet drives the scheduler, which is FIFO: the half(1.0) task
+// queued above runs (and prints via its callback) before greet does.
+print(await greet("you"));
+`, [
+        "ran", "done", "2.5", "0.5", "hi you",
+    ]);
+});
+
+test.start("async: async futures are values", void () -> {
+    h.expectOutput(`
+import 'array';
+
+int async sum(int a) {
+    return a;
+}
+
+// In arrays and record fields, through functions, and optional.
+type Job {
+    String name;
+    Future<int> result;
+}
+Job j = { name: "a", result: sum(10) };
+print(await j.result);
+
+Future<int>[] batch = [];
+for (int i = 1; i <= 3; i++) {
+    array.push(batch, sum(i * 100));
+}
+int total = 0;
+forEach(batch, f) {
+    total = total + await f;
+}
+print(total);
+
+int settle(Future<int> f) {
+    return await f;
+}
+print(settle(sum(9)));
+
+Future<int>? maybe = null;
+if (maybe == null) {
+    print("empty");
+}
+maybe = sum(3);
+if (maybe != null) {
+    print(await maybe);
+}
+
+// An async function may itself await, including recursively.
+int async fib(int n) {
+    if (n < 2) {
+        return n;
+    }
+    return await fib(n - 1) + await fib(n - 2);
+}
+print(await fib(10));
+`, [
+        "10", "600", "9", "empty", "3", "55",
+    ]);
+});
+
+test.start("async: async arguments capture at call", void () -> {
+    h.expectOutput(`
+int base = 10;
+
+int async addBase(int x) {
+    return x + base;
+}
+
+Future<int> f = addBase(1);
+base = 100;
+print(await f);
+`, [
+        "101",
+    ]);
+});
+
+test.start("async: async runtime errors", void () -> {
+    h.expectRuntimeError(`
+int async one() { return 1; }
+Future<int> f;
+print(await f);
+`, "awaited a future that was never assigned");
+    h.expectRuntimeError(`
+import 'async';
+int async one() { return 1; }
+Future<int> f;
+async.run(f, void (int n) -> print(n));
+`, "async.run on a future that was never assigned");
+    h.expectRuntimeError(`
+import 'async';
+int async one() { return 1; }
+Function(int)<void> cb;
+async.run(one(), cb);
+`, "called a function value that was never assigned");
+    h.expectRuntimeError(`
+Future<int>? self;
+
+int async spin() {
+    if (self != null) {
+        return await self;
+    }
+    return 0;
+}
+
+self = spin();
+print(await self);
+`, "deadlock: every pending future is awaiting another");
+    h.expectRuntimeError(`
+Future<int>? a;
+Future<int>? b;
+
+int async left() {
+    if (b != null) {
+        return await b;
+    }
+    return 0;
+}
+
+int async right() {
+    if (a != null) {
+        return await a;
+    }
+    return 0;
+}
+
+a = left();
+b = right();
+print("spawned");
+`, "deadlock: every pending future is awaiting another");
+});
+
+// Timer futures complete in deadline order, not creation order, and the drain
+// waits for a pending timer. The scheduler takes the minimum deadline each
+// turn, so the output does not depend on how slow the machine is.
+test.start("async: time sleep", void () -> {
+    h.expectOutput(`
+import 'async';
+import 'time';
+
+async.run(time.sleep(60), void () -> print("c"));
+async.run(time.sleep(20), void () -> print("a"));
+async.run(time.sleep(40), void () -> print("b"));
+print("start");
+
+void async racer(String name, Duration ms) {
+    await time.sleep(ms);
+    print(name + " woke");
+}
+racer("slow", 80);
+racer("fast", 10);
+`, [
+        "start", "fast woke", "a", "b", "c", "slow woke",
+    ]);
+    h.expectOutput(`
+import 'async';
+import 'time';
+
+Future<void> tick = time.sleep(0);
+await tick;
+async.run(tick, void () -> print("already done"));
+await time.sleep(-5);
+print("end");
+`, [
+        "already done", "end",
+    ]);
+});
+
+// `time.date.fn(await x)` is the only call shape whose callee is a member of a
+// member. The await normalizer must recognize the namespace and leave the
+// callee as it is. It must not hoist `time.date` as a function value.
+test.start("async: time namespace call across await", void () -> {
+    h.expectOutput(`
+import 'time';
+
+DateTime async when(String text) {
+    await time.sleep(1);
+    return time.date.fromText(text);
+}
+
+int async report() {
+    // The awaited argument is evaluated after the callee would have been:
+    // hoisting the callee here is what the namespace check prevents.
+    print(time.date.year(await when("2026-07-25")));
+    print(time.date.toText(time.date.addDays(await when("2026-01-02"), 31)));
+    return time.date.month(await when("2026-03-04"));
+}
+
+print(await report());
+`, [
+        "2026", "2026-02-02T00:00:00Z", "3",
+    ]);
+});
+
+// An await suspends the task instead of running the future inline, so
+// independent tasks interleave at their await points, FIFO.
+test.start("async: async interleaving", void () -> {
+    h.expectOutput(`
+void async announce(String m) {
+    print(m);
+}
+
+void async task(String name) {
+    print(name + ": step 1");
+    Future<void> h = announce(name + ": helper");
+    await h;
+    print(name + ": step 2");
+}
+
+task("A");
+task("B");
+print("top");
+`, [
+        "top", "A: step 1", "B: step 1", "A: helper", "B: helper", "A: step 2",
+        "B: step 2",
+    ]);
+});
+
+// The dispatch switch re-enters the middle of a loop or a branch, with every
+// live value in the heap frame.
+test.start("async: async suspend in control flow", void () -> {
+    h.expectOutput(`
+int async echo(int x) {
+    return x;
+}
+
+bool async below(int i, int n) {
+    return i < n;
+}
+
+// awaits in a for body: locals and the loop counter cross suspensions.
+int async sumAll(int n) {
+    int total = 0;
+    for (int i = 1; i <= n; i++) {
+        total = total + await echo(i);
+    }
+    return total;
+}
+print(await sumAll(10));
+
+// await in a while condition (rewritten to re-evaluate each iteration).
+int async count() {
+    int k = 0;
+    while (await below(k, 3)) {
+        k = k + 1;
+    }
+    return k;
+}
+print(await count());
+
+// awaits in a forEach body, and in && / || with the short circuit kept.
+bool async yes() {
+    return true;
+}
+int async pick(int[] xs) {
+    int hits = 0;
+    forEach(xs, e) {
+        if (e > 1 && await yes()) {
+            hits = hits + e;
+        }
+    }
+    if (false && await echo(99) == 99) {
+        return -1;
+    }
+    return hits;
+}
+print(await pick([1, 2, 3]));
+
+// awaits nested in expressions: operands evaluated before a suspension
+// are captured first, left to right.
+int async compose(int a) {
+    return await echo(a) + await echo(a * 10) + a;
+}
+print(await compose(2));
+`, [
+        "55", "3", "5", "24",
+    ]);
+});
+
+// An await in a while condition or in a for post clause moves that clause into
+// the loop's tail. A continue must jump there, or it skips the counter bump
+// and spins forever.
+test.start("async: async break and continue", void () -> {
+    h.expectOutput(`
+bool async below(int i, int n) {
+    return i < n;
+}
+
+int async bump(int i) {
+    return i + 1;
+}
+
+// await in the condition: continue must re-evaluate it.
+int async whileAwaitCond() {
+    int i = 0;
+    while (await below(i, 8)) {
+        i++;
+        if (i == 3) { continue; }
+        if (i == 6) { break; }
+        print(i);
+    }
+    return i;
+}
+print(await whileAwaitCond());
+
+// await in the post clause: continue must still run it.
+void async forAwaitPost() {
+    for (int j = 0; j < 6; j = await bump(j)) {
+        if (j % 2 == 0) { continue; }
+        if (j == 5) { break; }
+        print(100 + j);
+    }
+}
+await forAwaitPost();
+
+// awaits only in the body: the loop keeps its shape.
+int async awaitInBody(int[] xs) {
+    int total = 0;
+    forEach(xs, e) {
+        int v = await bump(e);
+        if (v == 3) { continue; }
+        if (v == 5) { break; }
+        total = total + v;
+    }
+    return total;
+}
+print(await awaitInBody([1, 2, 3, 4]));
+
+// an outer loop's continue alongside an inner loop the rewrite reshapes:
+// each binds to its own loop across the transform.
+int async nested(int[] xs) {
+    int total = 0;
+    forEach(xs, e) {
+        for (int k = 0; k < e; k = await bump(k)) {
+            if (k == 2) { break; }
+            total = total + 1;
+        }
+        if (e < 3) { continue; }
+        total = total + 100;
+    }
+    return total;
+}
+print(await nested([1, 3, 5]));
+`, [
+        "1", "2", "4", "5", "6", "101", "103", "6", "205",
+    ]);
+});
+
+// Locals captured by closures keep working across suspensions: the capture
+// box lives in the heap frame, shared with the function value.
+test.start("async: async closure across suspend", void () -> {
+    h.expectOutput(`
+void async announce(String m) {
+    print(m);
+}
+
+int async worker(int seed) {
+    int acc = seed;
+    Function()<void> bump = void () -> { acc = acc + 1; };
+    await announce("mid");
+    bump();
+    bump();
+    return acc;
+}
+print(await worker(40));
+`, [
+        "mid", "42",
+    ]);
+});
+
+// Locals live in the state-machine frame, not on a stack, so a library result
+// survives a suspension.
+test.start("async: async string library", void () -> {
+    h.expectOutput(`
+import 'string';
+
+String async upper(String s) {
+    return string.toUpperCaseAscii(s);
+}
+
+String async both(String s) {
+    String[] parts = string.split(s, "-");
+    String a = await upper(parts[0]);
+    String b = await upper(parts[1]);
+    return string.append(a, b);
+}
+
+print(await both("ab-cd"));
+`, [
+        "ABCD",
+    ]);
+});
+
+// An async function imported from another module is the .spawn wrapper the
+// declaring module emitted. The scheduler is core, so both modules share one.
+test.start("async: async across modules", void () -> {
+    h.expectFilesOutput([
+        h.file("main.nio", `
+import 'jobs';
+import 'async';
+
+print(await jobs.twice(21));
+async.run(jobs.twice(5), void (int n) -> print(n));
+print("main");
+`),
+        h.file("jobs.nio", `
+export int async twice(int x) {
+    return x * 2;
+}
+`),
+    ], "main.nio", ["42", "main", "10"]);
+});
+
+// An async frame carries TD_SLOTS, not TD_RECORD, because slot [0] is the
+// resume state. A parked task is reached through its future, so its frame must
+// stay traced while it sits in the run queue.
+test.start("async: GC stress async", void () -> {
+    h.expectContains(h.sameUnderStress(`
+import 'async';
+import 'array';
+
+String async tag(String base, int n) {
+    String s = base + "-";
+    if (n % 2 == 0) {
+        s = s + "even";
+    } else {
+        s = s + "odd";
+    }
+    return s;
+}
+
+int matched = 0;
+Future<String>[] futures = [];
+for (int i = 0; i < 30; i++) {
+    array.push(futures, tag("t" + "ag", i));
+}
+forEach(futures, f, i) {
+    String want = "tag-even";
+    if (i % 2 != 0) {
+        want = "tag-odd";
+    }
+    if (await f == want) {
+        matched++;
+    }
+}
+print(matched);
+
+// Futures that only the run queue keeps alive, with callbacks capturing.
+int fired = 0;
+for (int i = 0; i < 20; i++) {
+    async.run(tag("q", i), void (String s) -> { fired++; });
+}
+
+// Suspended tasks: their frames (locals, capture boxes, awaited futures)
+// are traced through the future while parked.
+String async slow(String s) {
+    String body = s + "!";
+    Future<String> inner = tag("in" + "ner", 1);
+    String got = await inner;
+    return body + got;
+}
+int okCount = 0;
+Future<String>[] slows = [];
+for (int i = 0; i < 10; i++) {
+    array.push(slows, slow("s"));
+}
+forEach(slows, sf) {
+    if (await sf == "s!inner-odd") {
+        okCount++;
+    }
+}
+print(okCount);
+print("draining");
+`), "30");
+});
+
+// ---- what the scheduler must not retain ----
+
+// An async program that allocates far more than it keeps alive, with what it
+// prints. The four things only the scheduler can leak are frames, futures,
+// waiter links, and the timer list.
+type Bounded {
+    String name;
+    String want;
+    String src;
+}
+
+Bounded prog(String name, String want, String src) {
+    Bounded b = { name: name, want: want, src: src };
+    return b;
+}
+
+Bounded[] asyncBounded = [
+    // One task at a time, 400,000 times: spawn, await, drop.
+    // Sum of i+1 for i in [0,400000) = 80000200000, mod 1000000.
+    prog("sequential", "200000\n", `
+int async inc(int x) {
+    return x + 1;
+}
+int total = 0;
+int i = 0;
+while (i < 400000) {
+    total = (total + await inc(i)) % 1000000;
+    i = i + 1;
+}
+print(total);
+`),
+    // Waves of 2,000 concurrent tasks; the wave's futures die together.
+    // Sum over w<200, i<2000 of w+i+1 = 440000000, mod 1000000.
+    prog("fanout", "0\n", `
+import 'array';
+int async inc(int x) {
+    return x + 1;
+}
+int total = 0;
+int w = 0;
+while (w < 200) {
+    Future<int>[] futures = [];
+    int i = 0;
+    while (i < 2000) {
+        array.push(futures, inc(w + i));
+        i = i + 1;
+    }
+    forEach(futures, f) {
+        total = (total + await f) % 1000000;
+    }
+    w = w + 1;
+}
+print(total);
+`),
+    // Suspended tasks: every worker parks on a helper, so frames and waiter
+    // links pile up mid-wave and must all come back after it.
+    // 100 waves of sum(2i+2 for i in [0,1000)) = 100*1001000, mod 1000000.
+    prog("suspended", "100000\n", `
+import 'array';
+int async helper(int x) {
+    return x * 2;
+}
+int async worker(int x) {
+    String pad = "x" + "y";
+    int got = await helper(x);
+    if (pad == "xy") {
+        got = got + 2;
+    }
+    return got;
+}
+int total = 0;
+int w = 0;
+while (w < 100) {
+    Future<int>[] futures = [];
+    int i = 0;
+    while (i < 1000) {
+        array.push(futures, worker(i));
+        i = i + 1;
+    }
+    forEach(futures, f) {
+        total = (total + await f) % 1000000;
+    }
+    w = w + 1;
+}
+print(total);
+`),
+    // Callback nodes and their capture closures, 300,000 of them.
+    // (i+1)%3 cycles 1,2,0 summed over 300000 iterations.
+    prog("callbacks", "300000\n", `
+import 'async';
+int async inc(int x) {
+    return x + 1;
+}
+int seen = 0;
+int i = 0;
+while (i < 300000) {
+    Future<int> f = inc(i);
+    async.run(f, void (int v) -> { seen = seen + v % 3; });
+    await f;
+    i = i + 1;
+}
+print(seen);
+`),
+    // Timer futures, already expired: the timer list must not retain.
+    prog("timers", "200000\n", `
+import 'time';
+int i = 0;
+while (i < 200000) {
+    await time.sleep(0);
+    i = i + 1;
+}
+print(i);
+`),
+];
+
+// Every await allocates a frame, a future and a callback closure, then drops
+// all three. A scheduler structure that kept them would grow these programs
+// to hundreds of megabytes. The peak comes from §6.12's usage.
+test.start("async: async memory bounded", void () -> {
+    int const LIMIT = 32 * 1024 * 1024;
+    forEach(asyncBounded, b) {
+        h.Run r = h.runBinary(h.buildSource(b.src), []);
+        if (r.out != b.want) {
+            return Error(b.name + ": output = \"" + r.out + "\", want \"" + b.want + "\"");
+        }
+        process.ChildUsage? u = r.usage;
+        if (u == null) {
+            // Windows reports no usage, so the bound is not checked there.
+            continue;
+        }
+        if (u.peakMemory > LIMIT) {
+            return Error(b.name + ": peak memory " + string.from(u.peakMemory / 1048576)
+                + " MB exceeds " + string.from(LIMIT / 1048576)
+                + " MB: async garbage is not being reclaimed");
+        }
+    }
+});
+
+// ---- async.race (§6.8) ----
+//
+// race answers the index of the first argument to finish, because the
+// arguments need not share a type.
+
+test.start("async: race answers the index of the first to finish", void () -> {
+    h.expectOutput(`
+import 'async';
+import 'time';
+
+void async main() {
+    // Two timers, so which one wins is decided by the scheduler's clock and
+    // not by the order they were written.
+    Future<void> slow = time.sleep(400);
+    Future<void> quick = time.sleep(20);
+    print(await async.race(slow, quick));
+
+    // And the other way round, to say the answer is the winner's position
+    // rather than a constant.
+    Future<void> a = time.sleep(20);
+    Future<void> b = time.sleep(400);
+    print(await async.race(a, b));
+
+    await slow;
+    await b;
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["1", "0", "done"]);
+});
+
+test.start("async: race over a value, and over one already finished", void () -> {
+    h.expectOutput(`
+import 'async';
+import 'time';
+
+int async answer() {
+    await time.sleep(10);
+    return 42;
+}
+
+void async main() {
+    Future<int> f = answer();
+    Future<void> t = time.sleep(2000);
+    int who = await async.race(f, t);
+    print(who);
+    // Awaiting the winner is what gets its value, and costs nothing: the
+    // fast path never suspends on a future that is already done.
+    print(await f);
+
+    // An argument that has already finished settles it before any callback
+    // is registered, and ties go to the earliest argument.
+    Future<int> done = answer();
+    await done;
+    print(await async.race(done, f));
+
+    await t;
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["0", "42", "0", "done"]);
+});
+
+test.start("async: race leaves the losers running", void () -> {
+    // race cancels nothing. An operation that must stop when it loses takes a
+    // timeout of its own, as every net call does (§6.15).
+    h.expectOutput(`
+import 'async';
+import 'time';
+
+int ran = 0;
+
+void async later(Duration ms) {
+    await time.sleep(ms);
+    ran++;
+}
+
+void async main() {
+    Future<void> quick = later(10);
+    Future<void> slow = later(120);
+    print(await async.race(quick, slow));
+    print(ran);
+    await slow;
+    print(ran);
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["0", "1", "2", "done"]);
+});
+
+test.start("async: race takes futures, and at least one", void () -> {
+    h.expectCompileError("import 'async';\nasync.race();",
+        "async.race takes at least 1 argument, got 0");
+    h.expectCompileError("import 'async';\nprint(await async.race(1, 2));",
+        "argument 1 of async.race must be a future, got int");
+    h.expectCompileError(`
+import 'async';
+import 'time';
+Future<void> t = time.sleep(1);
+print(await async.race(t, "no"));
+`, "argument 2 of async.race must be a future, got String");
+});
+
+test.start("async: a fallible future may be raced", void () -> {
+    // async.run refuses a fallible future, because a callback has nowhere to
+    // put an error. A race leaves every argument as it was, so the error still
+    // waits at the await that collects it.
+    h.expectOutput(`
+import 'async';
+import 'time';
+import 'string';
+
+int async fails() {
+    await time.sleep(10);
+    return Error("nope", 7);
+}
+
+void async main() {
+    Future<int!> f = fails();
+    Future<void> t = time.sleep(2000);
+    print(await async.race(f, t));
+    int code = 0;
+    String msg = "";
+    await f catch e {
+        msg = e.message;
+        code = e.code;
+    };
+    print(msg + " " + string.from(code));
+    await t;
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["0", "nope 7", "done"]);
+});

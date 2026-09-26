@@ -1,0 +1,69 @@
+// The diagnostic formatter. It has two verbs: %s takes the next argument, and %%
+// is a percent sign. A wrong argument count gives "%!s(MISSING)" or
+// "%!(EXTRA string=...)". The result of a % before any other character is not
+// defined. Every argument is a String.
+import 'string';
+import 'array';
+
+// Appends the formatted pieces to `out` and does not join them. The generator
+// emits one instruction per call and joins all of a function's instructions
+// once. A join here would copy each instruction twice.
+export void fmtInto(String[] out, String format, String[] args) {
+    // The loop scans the format in place. A conversion to byte[] would copy
+    // the constant on each call.
+    int n = string.length(format);
+    int start = 0;    // byte index where the pending literal run began
+    int i = 0;
+    int k = 0;
+    while (i < n) {
+        if (format[i] == 37 && i + 1 < n) {    // '%'
+            int c = format[i + 1];
+            if (c == 115) {    // "%s"
+                if (i > start) {
+                    array.push(out, string.substring(format, start, i));
+                }
+                if (k < args.length) {
+                    array.push(out, args[k]);
+                } else {
+                    array.push(out, "%!s(MISSING)");
+                }
+                k++;
+                i = i + 2;
+                start = i;
+                continue;
+            }
+            if (c == 37) {    // "%%"
+                if (i > start) {
+                    array.push(out, string.substring(format, start, i));
+                }
+                array.push(out, "%");
+                i = i + 2;
+                start = i;
+                continue;
+            }
+        }
+        i++;
+    }
+    if (i > start) {
+        array.push(out, string.substring(format, start, i));
+    }
+    if (k < args.length) {
+        String[] extras = [];
+        int j = k;
+        while (j < args.length) {
+            array.push(extras, "string=" + args[j]);
+            j++;
+        }
+        array.push(out, "%!(EXTRA " + string.join(extras, ", ") + ")");
+    }
+}
+
+export String fmtArr(String format, String[] args) {
+    String[] out = [];
+    fmtInto(out, format, args);
+    return string.join(out, "");
+}
+
+export String fmt(String format, ...String args) {
+    return fmtArr(format, args);
+}

@@ -1,0 +1,25 @@
+// Checks that the release documents name the version the compiler reports.
+// A release must not appear in one document and not in the others.
+import 'test';
+import 'string';
+import './repo' as repo;
+import '../src/version' as version;
+
+// The first `## ` heading of a changelog is its newest entry.
+String newestEntry(String text) {
+    String found = "";
+    forEach(string.split(text, "\n"), l) {
+        if (found == "" && string.find(l, "## ") == 0) {
+            found = l;
+        }
+    }
+    return found;
+}
+
+test.start("version: CHANGELOG.md's newest entry names the version the compiler reports", void () -> {
+    String newest = newestEntry(repo.readText("CHANGELOG.md"));
+    test.assert(newest != "", "CHANGELOG.md holds no `## ` entry");
+    test.assert(string.contains(newest, version.VERSION),
+        "CHANGELOG.md's newest entry is \"" + newest + "\" and the compiler reports "
+        + version.VERSION);
+});

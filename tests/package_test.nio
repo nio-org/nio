@@ -1,0 +1,192 @@
+// `nio package`, end to end. It drives the compiler as a process
+// through the shared h.compiler(), and asserts the artifact: the bundle's
+// layout, its plist, its signature, and that the binary inside still runs.
+//
+// The platform's own tools are the implementation, so everything is
+// macOS-gated. Off macOS the command answers "macOS only".
+//
+// Every manifest signs as "-", codesign's ad-hoc identity. A developer who ran
+// `nio package --setup` has a config naming a real certificate, and this suite
+// must not stamp their identity on scratch bundles.
+import 'test';
+import 'os';
+import 'fs';
+import 'path';
+import 'string';
+import './harness' as h;
+
+// A 1x1 transparent PNG. sips scales it onto the ten iconset sizes.
+byte[] const TINY_PNG = [
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72,
+    68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0,
+    13, 73, 68, 65, 84, 120, 218, 99, 252, 207, 192, 80, 15, 0, 4, 133, 1,
+    128, 132, 169, 140, 33, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
+
+String readText(String p) {
+    return string.fromByteArray(fs.readFile(p));
+}
+
+if (os.getPlatform() != "darwin") {
+    test.start("package: refused off macOS", void () -> {
+        String dir = h.scratch();
+        String prog = h.writeTo(dir, "prog.nio", "print(1);");
+        h.Run r = h.nio(["package", prog]);
+        test.expectInt(r.code, 1);
+        test.assert(string.contains(r.err, "macOS only"), "stderr = \"" + r.err + "\"");
+    });
+}
+
+if (os.getPlatform() == "darwin") {
+
+    test.start("package: a bundle from a manifest", void () -> {
+        String dir = h.scratch();
+        String prog = h.writeTo(dir, "app.nio", "print(\"from the bundle\");");
+        h.writeTo(dir, "page.html", "<h1>hi</h1>");
+        h.writeTo(dir, "assets/style.css", "body {}");
+        h.writeTo(dir, "app.pkg.json", "{\n"
+            + "  \"name\": \"Demo App\",\n"
+            + "  \"identifier\": \"com.example.demo\",\n"
+            + "  \"version\": \"1.2.3\",\n"
+            + "  \"resources\": [\"page.html\", \"assets\"],\n"
+            + "  \"macos\": { \"sign\": \"-\",\n"
+            + "    \"plistExtra\": \"<key>LSUIElement</key><true/>\" }\n"
+            + "}\n");
+        String out = path.join(dir, "dist");
+        h.Run r = h.nio(["package", prog, "-o", out]);
+        test.assert(r.code == 0, "exit " + string.from(r.code) + ", stderr: " + r.err);
+
+        String app = path.join(out, "Demo App.app");
+        String contents = path.join(app, "Contents");
+        test.assert(fs.exists(app), "no bundle at " + app);
+
+        String plist = readText(path.join(contents, "Info.plist"));
+        test.assert(string.contains(plist, "<string>com.example.demo</string>"),
+            "identifier missing from plist");
+        test.assert(string.contains(plist, "<string>1.2.3</string>"), "version missing");
+        test.assert(string.contains(plist, "<string>Demo App</string>"), "name missing");
+        test.assert(string.contains(plist, "<key>LSUIElement</key><true/>"),
+            "plistExtra not spliced");
+
+        h.Run ran = h.runBinary(path.join(path.join(contents, "MacOS"), "Demo App"), []);
+        test.expectString(ran.out, "from the bundle\n");
+
+        String res = path.join(contents, "Resources");
+        test.assert(fs.exists(path.join(res, "page.html")), "file resource missing");
+        test.assert(fs.exists(path.join(path.join(res, "assets"), "style.css")),
+            "directory resource missing");
+
+        h.Run verify = h.runBinary("/usr/bin/codesign", ["--verify", "--strict", app]);
+        test.assert(verify.code == 0, "codesign --verify: " + verify.err);
+    });
+
+    test.start("package: a Mach-O resource is re-signed with the bundle", void () -> {
+        String dir = h.scratch();
+        String prog = h.writeTo(dir, "m.nio", "print(1);");
+        // A real dylib, because codesign refuses anything else. clang leaves it
+        // linker-signed, which notarization rejects. The outer signature seals
+        // Resources/ as data and re-signs nothing inside it.
+        h.writeTo(dir, "shim.c", "int nio_pkg_shim(void) { return 7; }\n");
+        h.Run cc = h.runBinary("/usr/bin/clang", [
+            "-dynamiclib",
+            path.join(dir, "shim.c"), "-o", path.join(dir, "libshim.dylib"),
+        ]);
+        test.assert(cc.code == 0, "clang: " + cc.err);
+        h.writeTo(dir, "m.pkg.json", "{ \"resources\": [\"libshim.dylib\"],\n"
+            + "  \"macos\": { \"sign\": \"-\" } }\n");
+        String out = path.join(dir, "dist");
+        h.Run r = h.nio(["package", prog, "-o", out]);
+        test.assert(r.code == 0, "exit " + string.from(r.code) + ", stderr: " + r.err);
+
+        String app = path.join(out, "m.app");
+        String lib = path.join(path.join(path.join(app, "Contents"), "Resources"),
+            "libshim.dylib");
+        // The copy is signed anew, so the linker's mark is gone.
+        h.Run d = h.runBinary("/usr/bin/codesign", ["-d", "--verbose", lib]);
+        test.assert(d.code == 0, "codesign -d: " + d.err);
+        test.assert(!string.contains(d.err, "linker-signed"),
+            "dylib kept the linker signature:\n" + d.err);
+        // The outer seal is computed after, and still verifies strictly.
+        h.Run verify = h.runBinary("/usr/bin/codesign", ["--verify", "--strict", app]);
+        test.assert(verify.code == 0, "codesign --verify: " + verify.err);
+    });
+
+    test.start("package: defaults with no manifest at all", void () -> {
+        String dir = h.scratch();
+        String prog = h.writeTo(dir, "plain.nio", "print(1);");
+        String out = path.join(dir, "dist");
+        h.Run r = h.nio(["package", prog, "-o", out]);
+        test.assert(r.code == 0, "exit " + string.from(r.code) + ", stderr: " + r.err);
+        String plist = readText(path.join(path.join(path.join(out, "plain.app"),
+            "Contents"), "Info.plist"));
+        test.assert(string.contains(plist, "<string>com.nio.plain</string>"),
+            "default identifier missing");
+        test.assert(string.contains(plist, "<string>plain</string>"), "default name missing");
+    });
+
+    test.start("package: --dmg with an icon", void () -> {
+        String dir = h.scratch();
+        String prog = h.writeTo(dir, "iconic.nio", "print(1);");
+        fs.writeFile(path.join(dir, "icon.png"), TINY_PNG);
+        h.writeTo(dir, "iconic.pkg.json", "{\n"
+            + "  \"icon\": \"icon.png\",\n"
+            + "  \"macos\": { \"sign\": \"-\" }\n"
+            + "}\n");
+        String out = path.join(dir, "dist");
+        h.Run r = h.nio(["package", "--dmg", prog, "-o", out]);
+        test.assert(r.code == 0, "exit " + string.from(r.code) + ", stderr: " + r.err);
+
+        String contents = path.join(path.join(out, "iconic.app"), "Contents");
+        test.assert(fs.exists(path.join(path.join(contents, "Resources"), "app.icns")),
+            "app.icns missing");
+        test.assert(string.contains(readText(path.join(contents, "Info.plist")),
+            "CFBundleIconFile"), "CFBundleIconFile missing from plist");
+
+        // hdiutil reads a real compressed image without mounting it.
+        String dmg = path.join(out, "iconic.dmg");
+        test.assert(fs.exists(dmg), "no dmg at " + dmg);
+        h.Run info = h.runBinary("/usr/bin/hdiutil", ["imageinfo", dmg]);
+        test.assert(info.code == 0, "hdiutil imageinfo: " + info.err);
+        test.assert(string.contains(info.out, "ULMO"), "not ULMO:\n" + info.out);
+    });
+
+    test.start("package: notarization without an identity is refused", void () -> {
+        String dir = h.scratch();
+        String prog = h.writeTo(dir, "n.nio", "print(1);");
+        h.writeTo(dir, "n.pkg.json",
+            "{ \"dmg\": true, \"macos\": { \"sign\": \"-\", \"notarize\": \"p\" } }\n");
+        h.Run r = h.nio(["package", prog, "-o", path.join(dir, "dist")]);
+        test.expectInt(r.code, 1);
+        test.assert(string.contains(r.err, "ad-hoc"), "stderr = \"" + r.err + "\"");
+    });
+
+    // A successful run needs a real certificate and a profile Apple issued for
+    // it, so the suite asserts only the refusal. A profile pairs with the
+    // identity it names, and the ad-hoc signature names none.
+    test.start("package: a provisioning profile without an identity is refused", void () -> {
+        String dir = h.scratch();
+        String prog = h.writeTo(dir, "p.nio", "print(1);");
+        h.writeTo(dir, "app.provisionprofile", "not read before the identity check");
+        h.writeTo(dir, "p.pkg.json", "{ \"macos\": { \"sign\": \"-\",\n"
+            + "  \"provisioningProfile\": \"app.provisionprofile\" } }\n");
+        h.Run r = h.nio(["package", prog, "-o", path.join(dir, "dist")]);
+        test.expectInt(r.code, 1);
+        test.assert(string.contains(r.err, "provisioning profile"),
+            "stderr = \"" + r.err + "\"");
+    });
+}
+
+test.start("package: usage and flag errors", void () -> {
+    // The argument check comes before the platform gate, on every platform.
+    h.Run none = h.nio(["package"]);
+    test.expectInt(none.code, 2);
+    test.assert(string.contains(none.err, "usage: nio package"), "no usage text");
+
+    h.Run bad = h.nio(["package", "--frobnicate", "x.nio"]);
+    test.expectInt(bad.code, 2);
+    test.assert(string.contains(bad.err, "unknown flag"), "no flag diagnostic");
+
+    h.Run help = h.nio(["package", "--help"]);
+    test.expectInt(help.code, 0);
+    test.assert(string.contains(help.err, "--setup"), "no --setup in help");
+});

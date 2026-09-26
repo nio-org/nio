@@ -1,0 +1,2171 @@
+// The `tls` module (§6.18): a TLS 1.3 client with key schedule, record layer
+// and handshake. Every operation on a secret is a call into `crypto`. No code
+// here compares a secret directly: the Finished MAC comparison uses
+// `string.bytesEqualConstantTime` at its call site.
+//
+// No code here owns a socket. The key schedule and `RecordProtection` do not
+// depend on each other, so QUIC (RFC 9001) can use the schedule with its own
+// packet protection.
+//
+// Both cipher suites use SHA-256, so it is the only hash.
+//
+// Error codes have the names of the TLS alerts that they become (RFC 8446 §6).
+// A record that fails authentication passes `crypto.ErrorCode.AUTHENTICATION`
+// through unchanged. That code becomes `bad_record_mac`.
+import 'crypto';
+import 'string';
+import 'array';
+import 'map';
+import 'net';
+import 'x509';
+
+// The error codes of tls. They start at 200, above the NIO_ERR_* set and the
+// 100s of http, so the three sets do not overlap. The names are the alert names
+// of RFC 8446 §6, and `alertFor` maps a caught code to the alert to send. This
+// end never sends PEER_ALERT: it means that the peer sent an alert.
+export enum ErrorCode {
+    ILLEGAL_PARAMETER: 200,
+    DECODE_ERROR: 201,
+    RECORD_OVERFLOW: 202,
+    UNEXPECTED_MESSAGE: 203,
+    PEER_ALERT: 204,
+    HANDSHAKE_FAILURE: 205,
+    DECRYPT_ERROR: 206,
+    UNSUPPORTED_CERTIFICATE: 207,
+    UNSUPPORTED_EXTENSION: 208,
+    TOO_MANY_MESSAGES: 209,
+    // The chain verified and no certificate in it carries a pinned key.
+    PIN_MISMATCH: 210,
+    // The options contradict each other. The fault is at this end, so it is
+    // raised before any byte is sent.
+    MISCONFIGURED: 211
+}
+
+// The record-layer content types (RFC 8446 §5.1). A 1.3 endpoint drops
+// CHANGE_CIPHER_SPEC, and the record layer recognizes the byte to report it.
+export enum ContentType {
+    CHANGE_CIPHER_SPEC: 20,
+    ALERT: 21,
+    HANDSHAKE: 22,
+    APPLICATION_DATA: 23
+}
+
+// RFC 8446 §5.1 and §5.2 make both limits hard: a receiver must enforce them.
+// A protected record adds up to 255 padding bytes plus the 16-byte tag.
+int const MAX_PLAINTEXT = 16384;
+int const MAX_CIPHERTEXT = 16640;    // 2^14 + 256
+
+byte[] const EMPTY = string.toByteArray("");
+
+// Transcript-Hash of zero messages. The two "derived" steps of the key schedule
+// use it as their context (RFC 8446 §7.1).
+byte[] const EMPTY_HASH = crypto.sha256(EMPTY);
+
+// Concatenates through the packed string form. That is one memcpy in each
+// direction (§6.6) and not a loop per element.
+byte[] cat(byte[] a, byte[] b) {
+    return string.toByteArray(string.fromByteArray(a) + string.fromByteArray(b));
+}
+
+byte[] zeros32() {
+    byte[] out = [];
+    int i = 0;
+    while (i < 32) {
+        array.push(out, 0);
+        i++;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// HKDF-Expand-Label (RFC 8446 §7.1)
+// ---------------------------------------------------------------------------
+
+// The body without checks. Each caller in this file passes a label and context
+// that the protocol fixes, so the length bytes cannot wrap. The exported
+// function validates.
+byte[] expandLabel(byte[] secret, String label, byte[] context, int length) {
+    String full = "tls13 " + label;
+    byte[] head = [
+        (length / 256) as byte,
+        (length % 256) as byte,
+        string.length(full) as byte,
+    ];
+    String info = string.fromByteArray(head) + full
+        + string.fromByteArray([context.length as byte])
+        + string.fromByteArray(context);
+    return crypto.hkdfExpandSha256(secret, string.toByteArray(info), length);
+}
+
+// HKDF-Expand-Label of RFC 8446. Raises ILLEGAL_PARAMETER when a length byte
+// would wrap. The label follows the six bytes of "tls13 " on the wire, so 249
+// and 255 are the limits of the encoding. A `length` above the 8160-byte limit
+// of HKDF stops the program in `crypto.hkdfExpandSha256` (§6.17).
+export byte[] hkdfExpandLabel(byte[] secret, String label, byte[] context, int length) {
+    int n = string.length(label);
+    if (n < 1 || n > 249) {
+        return Error(`label must be 1..249 bytes, have ${n}`,
+            ErrorCode.ILLEGAL_PARAMETER);
+    }
+    if (context.length > 255) {
+        return Error(`context must be at most 255 bytes, have ${context.length}`,
+            ErrorCode.ILLEGAL_PARAMETER);
+    }
+    if (length < 1) {
+        return Error(`length must be positive, is ${length}`,
+            ErrorCode.ILLEGAL_PARAMETER);
+    }
+    return expandLabel(secret, label, context, length);
+}
+
+// Derive-Secret of RFC 8446. It takes the transcript hash and not the
+// messages, so a caller hashes once per flight.
+export byte[] deriveSecret(byte[] secret, String label, byte[] transcriptHash) {
+    return hkdfExpandLabel(secret, label, transcriptHash, 32);
+}
+
+// ---------------------------------------------------------------------------
+// The key schedule (RFC 8446 §7.1)
+// ---------------------------------------------------------------------------
+
+// The schedule is three extractions. Each uses a "derived" expansion of the
+// previous secret as its salt. The three functions below do the transitions
+// and do not export the raw extract, so a caller cannot skip the "derived"
+// step.
+
+// Begins the schedule: HKDF-Extract of the pre-shared key, or of 32 zeros when
+// there is none. The module has no resumption, so every connection uses the
+// zeros.
+export byte[] earlySecret(byte[]? psk) {
+    byte[] ikm = zeros32();
+    byte[]? p = psk;
+    if (p != null) {
+        ikm = p;
+    }
+    return crypto.hkdfExtractSha256(EMPTY, ikm);
+}
+
+// Adds the ECDHE shared secret. `shared` comes from
+// `crypto.x25519SharedSecret`, which already rejected a small-order point
+// (§6.17).
+export byte[] handshakeSecret(byte[] early, byte[] shared) {
+    return crypto.hkdfExtractSha256(expandLabel(early, "derived", EMPTY_HASH, 32), shared);
+}
+
+// Ends the schedule. Application traffic, exporter and resumption secrets are
+// derived from this secret, not extracted.
+export byte[] masterSecret(byte[] handshake) {
+    return crypto.hkdfExtractSha256(expandLabel(handshake, "derived", EMPTY_HASH, 32), zeros32());
+}
+
+// ---------------------------------------------------------------------------
+// Transcript hash (RFC 8446 §4.4.1)
+// ---------------------------------------------------------------------------
+
+// The running hash of every handshake message, header included, in order.
+// The messages are kept and hashed when needed, because the HelloRetryRequest
+// rewrite (§4.4.1) later replaces the first ClientHello.
+export type Transcript {
+    String[] parts;
+
+    // Appends one message as it appears on the wire, from its 4-byte header on.
+    // Record framing never enters the transcript.
+    void push(byte[] message) {
+        array.push(self.parts, string.fromByteArray(message));
+    }
+
+    byte[] hash() {
+        return crypto.sha256(string.toByteArray(string.join(self.parts, "")));
+    }
+}
+
+export Transcript transcript() {
+    return { parts: [] };
+}
+
+// ---------------------------------------------------------------------------
+// Traffic keys (RFC 8446 §7.3) and Finished (§4.4.4)
+// ---------------------------------------------------------------------------
+
+// The record protection material for one direction. The key length depends on
+// the AEAD: 32 bytes for ChaCha20-Poly1305, 16 for AES-128-GCM. The IV is 12
+// bytes for both.
+export type TrafficKeys {
+    byte[] key;
+    byte[] iv;
+}
+
+// The write key and IV for one direction. Each direction has its own secret,
+// its own keys and its own record sequence.
+export TrafficKeys trafficKeys(byte[] trafficSecret, int keyLength) {
+    return {
+        key: expandLabel(trafficSecret, "key", EMPTY, keyLength),
+        iv: expandLabel(trafficSecret, "iv", EMPTY, 12),
+    };
+}
+
+// The verify_data of a Finished message (§4.4.4). The receiver computes it
+// again and compares with `string.bytesEqualConstantTime`. `==` would leak the
+// position of the first difference (§6.17).
+export byte[] finishedVerifyData(byte[] trafficSecret, byte[] transcriptHash) {
+    byte[] finishedKey = expandLabel(trafficSecret, "finished", EMPTY, 32);
+    return crypto.hmacSha256(finishedKey, transcriptHash);
+}
+
+// ---------------------------------------------------------------------------
+// Record framing (RFC 8446 §5.1)
+// ---------------------------------------------------------------------------
+
+// The 5-byte header: type, the frozen legacy version 0x0303, and a two-byte
+// length. §5.1 makes a receiver ignore the version field.
+byte[] recordHeader(int contentType, int length) {
+    return [
+        contentType as byte,
+        3,
+        3,
+        (length / 256) as byte,
+        (length % 256) as byte,
+    ];
+}
+
+// Frames a payload that is sent without protection. A payload over 2^14 bytes
+// raises RECORD_OVERFLOW, because §5.1 forbids sending it as well as receiving
+// it.
+export byte[] plaintextRecord(int contentType, byte[] payload) {
+    if (payload.length > MAX_PLAINTEXT) {
+        return Error(`record payload of ${payload.length} bytes exceeds ${MAX_PLAINTEXT}`,
+            ErrorCode.RECORD_OVERFLOW);
+    }
+    return cat(recordHeader(contentType, payload.length), payload);
+}
+
+// `length` is what follows the header on the wire. For a protected record it
+// includes the tag.
+export type RecordHeader {
+    int contentType;
+    int length;
+}
+
+// Reads the first five bytes of `data`. The length is checked against the
+// protected limit, the larger of the two, because the header does not say
+// whether the record is protected. `RecordProtection.open` checks again after
+// it decrypts.
+export RecordHeader parseRecordHeader(byte[] data) {
+    if (data.length < 5) {
+        return Error(`record header needs 5 bytes, have ${data.length}`,
+            ErrorCode.DECODE_ERROR);
+    }
+    int t = data[0];
+    if (t != ContentType.CHANGE_CIPHER_SPEC && t != ContentType.ALERT
+        && t != ContentType.HANDSHAKE && t != ContentType.APPLICATION_DATA) {
+        return Error(`unknown content type ${t}`, ErrorCode.UNEXPECTED_MESSAGE);
+    }
+    int len = data[3] * 256 + data[4];
+    if (len > MAX_CIPHERTEXT) {
+        return Error(`record of ${len} bytes exceeds ${MAX_CIPHERTEXT}`,
+            ErrorCode.RECORD_OVERFLOW);
+    }
+    return { contentType: t, length: len };
+}
+
+// ---------------------------------------------------------------------------
+// Record protection (RFC 8446 §5.2, §5.3)
+// ---------------------------------------------------------------------------
+
+// The true content type from inside the encryption, and the payload without
+// padding.
+export type InnerPlaintext {
+    int contentType;
+    byte[] data;
+}
+
+// A `RecordProtection` covers one direction of one connection, never both. Its
+// sequence number starts at zero when the keys are installed, advances by one
+// per record, and is never transmitted. A record lost or reordered therefore
+// fails authentication.
+//
+// ChaCha20-Poly1305 is always available. AES-128-GCM is available only where
+// the CPU can run it in constant time (§6.17). Thus the suite is a property of
+// the connection and not a constant.
+export int const TLS_AES_128_GCM_SHA256 = 4865;          // 0x1301
+export int const TLS_CHACHA20_POLY1305_SHA256 = 4867;    // 0x1303
+
+// The suite's AEAD key length. The IV is 12 bytes for both.
+int keyLengthFor(int suite) {
+    if (suite == TLS_AES_128_GCM_SHA256) {
+        return 16;
+    }
+    return 32;
+}
+
+// The suites that this host supports, in order of preference. AES-128-GCM is
+// offered only when `crypto.aesGcmAvailable()`. The server can choose any
+// offered suite, and this host must not use a suite that leaks through cache
+// timing.
+export int[] offeredSuites() {
+    int[] out = [TLS_CHACHA20_POLY1305_SHA256];
+    if (crypto.aesGcmAvailable()) {
+        array.push(out, TLS_AES_128_GCM_SHA256);
+    }
+    return out;
+}
+
+export type RecordProtection {
+    byte[] key;
+    byte[] iv;
+    int seq;
+    int suite;
+
+    // Protects one record. The header says APPLICATION_DATA for any true
+    // content type (§5.2) and is authenticated as additional data. No padding
+    // is written. `open` removes padding in either case.
+    byte[] seal(int contentType, byte[] payload) {
+        if (payload.length > MAX_PLAINTEXT) {
+            return Error(`record payload of ${payload.length} bytes exceeds ${MAX_PLAINTEXT}`,
+                ErrorCode.RECORD_OVERFLOW);
+        }
+        byte[] inner = cat(payload, [contentType as byte]);
+        byte[] header = recordHeader(ContentType.APPLICATION_DATA, inner.length + 16);
+        byte[] nonce = nonceFor(self.iv, self.seq);
+        byte[] sealed = [];
+        if (self.suite == TLS_AES_128_GCM_SHA256) {
+            sealed = crypto.aes128GcmSeal(self.key, nonce, inner, header);
+        } else {
+            sealed = crypto.chacha20Poly1305Seal(self.key, nonce, inner, header);
+        }
+        self.seq = self.seq + 1;
+        return cat(header, sealed);
+    }
+
+    // Verifies and unwraps one whole record, with its header. A tag that does
+    // not verify passes `crypto.ErrorCode.AUTHENTICATION` from the AEAD through
+    // (§6.17). All other errors that this function raises are for a frame that
+    // is malformed in the clear.
+    InnerPlaintext open(byte[] record) {
+        RecordHeader h = parseRecordHeader(record);
+        if (h.contentType != ContentType.APPLICATION_DATA) {
+            return Error(`protected record must claim application_data, claims ${h.contentType}`,
+                ErrorCode.UNEXPECTED_MESSAGE);
+        }
+        if (h.length != record.length - 5) {
+            return Error(`record length field says ${h.length}, record carries ${record.length - 5}`,
+                ErrorCode.DECODE_ERROR);
+        }
+        byte[] nonce = nonceFor(self.iv, self.seq);
+        byte[] body = array.slice(record, 5);
+        byte[] aad = array.slice(record, 0, 5);
+        byte[] inner = [];
+        if (self.suite == TLS_AES_128_GCM_SHA256) {
+            inner = crypto.aes128GcmOpen(self.key, nonce, body, aad);
+        } else {
+            inner = crypto.chacha20Poly1305Open(self.key, nonce, body, aad);
+        }
+        self.seq = self.seq + 1;
+
+        // §5.2 limits the whole TLSInnerPlaintext (content, type byte and
+        // padding) to 2^14 + 1. A check on the content only would let a peer
+        // hide a message of legal size inside a record with any amount of
+        // padding.
+        if (inner.length > MAX_PLAINTEXT + 1) {
+            return Error(`inner plaintext of ${inner.length} bytes exceeds ${MAX_PLAINTEXT + 1}`,
+                ErrorCode.RECORD_OVERFLOW);
+        }
+
+        // The true content type is the last non-zero byte, and all bytes after
+        // it are padding (§5.4). A record of all zeros has no type, which is a
+        // decode_error.
+        int i = inner.length - 1;
+        while (i >= 0 && inner[i] == 0) {
+            i = i - 1;
+        }
+        if (i < 0) {
+            return Error("protected record holds no content type", ErrorCode.DECODE_ERROR);
+        }
+        if (i > MAX_PLAINTEXT) {
+            return Error(`inner plaintext of ${i} bytes exceeds ${MAX_PLAINTEXT}`,
+                ErrorCode.RECORD_OVERFLOW);
+        }
+        int t = inner[i];
+        // A protected CHANGE_CIPHER_SPEC, or any type the protocol does not
+        // name, gets unexpected_message (§5).
+        if (t != ContentType.ALERT && t != ContentType.HANDSHAKE
+            && t != ContentType.APPLICATION_DATA) {
+            return Error(`protected record carries content type ${t}`,
+                ErrorCode.UNEXPECTED_MESSAGE);
+        }
+        return { contentType: t, data: array.slice(inner, 0, i) };
+    }
+}
+
+// Makes the state for one direction from its traffic secret. A caller holds
+// two, one for each direction, and each has its own sequence.
+export RecordProtection protectionKeys(byte[] trafficSecret, int suite) {
+    TrafficKeys tk = trafficKeys(trafficSecret, keyLengthFor(suite));
+    return { key: tk.key, iv: tk.iv, seq: 0, suite: suite };
+}
+
+// The per-record nonce of §5.3: the 64-bit sequence number, big endian, padded
+// on the left to the 12 bytes of the IV and XORed into it. While the sequence
+// increases, no nonce is used twice, as §6.17 requires.
+byte[] nonceFor(byte[] iv, int seq) {
+    byte[] nonce = array.slice(iv, 0);
+    int i = 0;
+    while (i < 8) {
+        int b = nonce[4 + i];
+        int s = (seq >> (8 * (7 - i))) & 255;
+        nonce[4 + i] = (b ^ s) as byte;
+        i++;
+    }
+    return nonce;
+}
+
+// ===========================================================================
+// The handshake (RFC 8446 §4)
+// ===========================================================================
+//
+// The parser is the attack surface. Every read of an incoming byte goes through
+// `Reader`, which raises DECODE_ERROR and does not index past the end. An
+// out-of-range index is a runtime error (§5.5), and in a network parser that is
+// a denial of service. No code below indexes a received array directly.
+//
+// The state machine takes one message at a time and refuses all messages
+// except the next one that the protocol names.
+//
+// `checkPeer` builds the chain and checks the CertificateVerify together.
+// Certificates are public, so a chain check alone authenticates nobody.
+// `Options.insecureSkipVerify` turns off both checks or neither.
+
+// Handshake message types (§4).
+export enum HandshakeType {
+    CLIENT_HELLO: 1,
+    SERVER_HELLO: 2,
+    NEW_SESSION_TICKET: 4,
+    ENCRYPTED_EXTENSIONS: 8,
+    CERTIFICATE: 11,
+    CERTIFICATE_REQUEST: 13,
+    CERTIFICATE_VERIFY: 15,
+    FINISHED: 20,
+    KEY_UPDATE: 24
+}
+
+// The extensions that this client sends or reads, with their IANA numbers.
+int const EXT_SERVER_NAME = 0;
+int const EXT_SUPPORTED_GROUPS = 10;
+int const EXT_SIGNATURE_ALGORITHMS = 13;
+int const EXT_ALPN = 16;
+int const EXT_SUPPORTED_VERSIONS = 43;
+int const EXT_KEY_SHARE = 51;
+
+// The only group that this client supports. A server can choose only from what
+// was offered, so any other group is refused.
+int const GROUP_X25519 = 29;      // 0x001d
+int const VERSION_TLS12 = 771;    // 0x0303, the frozen legacy value
+int const VERSION_TLS13 = 772;    // 0x0304, what supported_versions says
+
+// The signature schemes offered in signature_algorithms. The list holds only
+// the schemes that this client can verify.
+//
+// The PKCS#1 v1.5 pair is offered but is not accepted in a CertificateVerify,
+// because RFC 8446 §4.4.3 forbids it. It is in the list because the extension
+// also names what a client accepts in the certificate chain, where most CAs
+// sign with PKCS#1 v1.5.
+int const SIG_ECDSA_SECP256R1_SHA256 = 1027;    // 0x0403
+int const SIG_RSA_PSS_RSAE_SHA256 = 2052;       // 0x0804
+int const SIG_RSA_PSS_RSAE_SHA384 = 2053;       // 0x0805
+int const SIG_ECDSA_SECP384R1_SHA384 = 1283;    // 0x0503
+int const SIG_RSA_PKCS1_SHA256 = 1025;          // 0x0401
+int const SIG_RSA_PKCS1_SHA384 = 1281;          // 0x0501
+
+// A HelloRetryRequest is a ServerHello whose random is this fixed value
+// (§4.1.3). This client offers only x25519, so it cannot retry and reports a
+// handshake failure.
+String const HELLO_RETRY_RANDOM =
+    "cf21ad74e59a6111be1d8c021e65b891c2a21167abb8c5e079e09e2c8a8339c2";
+
+// The maximum size of a handshake message. The length field of RFC 8446 is 24
+// bits, but a peer that declares 16 MB is broken or hostile.
+int const MAX_HANDSHAKE = 262144;
+
+// Each message that a peer can send without limit and at no cost has a
+// counter. RFC 8446 sets no limit for them, so the receiver sets one.
+// change_cipher_spec records carry nothing (§D.4).
+int const MAX_CCS = 8;
+
+// A record with an empty plaintext is legal padding, so the first one cannot be
+// refused. A series of them makes this end decrypt forever with no progress.
+// The counter resets on any record that is not empty.
+int const MAX_EMPTY_RECORDS = 32;
+
+// A KeyUpdate costs the receiver a key schedule step, and a reply when the
+// peer asks for one. A peer changes keys after a number of bytes or records,
+// not in a burst.
+int const MAX_KEY_UPDATES = 32;
+
+// TLS 1.3 removed warning alerts except `user_canceled`, which JDK11 sends as a
+// full-duplex signal. This end ignores it and counts it.
+int const MAX_USER_CANCELED = 4;
+int const ALERT_USER_CANCELED = 90;
+
+// The number of bytes to read from the transport at one time. The 8184-byte
+// size class of the collector holds a header plus this payload. With 8192, the
+// block would use the next, larger cell.
+int const READ_CHUNK = 8128;
+
+// ---------------------------------------------------------------------------
+// Reading the wire format
+// ---------------------------------------------------------------------------
+
+// A bounds-checked cursor over received bytes. Every accessor raises
+// DECODE_ERROR and does not read past the end. Received bytes are read through
+// this type and never indexed directly.
+export type Reader {
+    byte[] data;
+    int pos;
+
+    int left() {
+        return self.data.length - self.pos;
+    }
+
+    bool done() {
+        return self.pos >= self.data.length;
+    }
+
+    int u8() {
+        if (self.left() < 1) {
+            return Error(`truncated: wanted 1 byte, ${self.left()} left`,
+                ErrorCode.DECODE_ERROR);
+        }
+        int v = self.data[self.pos];
+        self.pos = self.pos + 1;
+        return v;
+    }
+
+    int u16() {
+        if (self.left() < 2) {
+            return Error(`truncated: wanted 2 bytes, ${self.left()} left`,
+                ErrorCode.DECODE_ERROR);
+        }
+        int v = self.data[self.pos] * 256 + self.data[self.pos + 1];
+        self.pos = self.pos + 2;
+        return v;
+    }
+
+    int u24() {
+        if (self.left() < 3) {
+            return Error(`truncated: wanted 3 bytes, ${self.left()} left`,
+                ErrorCode.DECODE_ERROR);
+        }
+        int v = self.data[self.pos] * 65536 + self.data[self.pos + 1] * 256 + self.data[self.pos + 2];
+        self.pos = self.pos + 3;
+        return v;
+    }
+
+    byte[] take(int n) {
+        if (n < 0 || self.left() < n) {
+            return Error(`truncated: wanted ${n} bytes, ${self.left()} left`,
+                ErrorCode.DECODE_ERROR);
+        }
+        byte[] out = array.slice(self.data, self.pos, self.pos + n);
+        self.pos = self.pos + n;
+        return out;
+    }
+
+    // A length-prefixed vector, the form of every variable-length TLS field.
+    byte[] vector8() {
+        return self.take(self.u8());
+    }
+
+    byte[] vector16() {
+        return self.take(self.u16());
+    }
+
+    byte[] vector24() {
+        return self.take(self.u24());
+    }
+
+    // A Reader over the contents of a vector. A nested structure gets its own
+    // cursor, so an inner length cannot reach past the outer one.
+    Reader sub(byte[] body) {
+        return { data: body, pos: 0 };
+    }
+}
+
+export Reader reader(byte[] data) {
+    return { data: data, pos: 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Writing the wire format
+// ---------------------------------------------------------------------------
+
+// The opposite of Reader. Lengths are written after the body: `open16` writes a
+// placeholder and returns a mark, and `close16` fills in the length of what was
+// written since. Each `close` checks the length, so no message that this module
+// sends can overflow a length field.
+export type Writer {
+    byte[] out;
+
+    void u8(int v) {
+        array.push(self.out, (v & 255) as byte);
+    }
+
+    void u16(int v) {
+        array.push(self.out, ((v >> 8) & 255) as byte);
+        array.push(self.out, (v & 255) as byte);
+    }
+
+    void u24(int v) {
+        array.push(self.out, ((v >> 16) & 255) as byte);
+        array.push(self.out, ((v >> 8) & 255) as byte);
+        array.push(self.out, (v & 255) as byte);
+    }
+
+    void raw(byte[] b) {
+        forEach(b, x) {
+            array.push(self.out, x);
+        }
+    }
+
+    int open8() {
+        array.push(self.out, 0);
+        return self.out.length;
+    }
+
+    void close8(int mark) {
+        int n = self.out.length - mark;
+        if (n > 255) {
+            return Error(`vector of ${n} bytes needs more than one length byte`,
+                ErrorCode.ILLEGAL_PARAMETER);
+        }
+        self.out[mark - 1] = n as byte;
+    }
+
+    int open16() {
+        array.push(self.out, 0);
+        array.push(self.out, 0);
+        return self.out.length;
+    }
+
+    void close16(int mark) {
+        int n = self.out.length - mark;
+        if (n > 65535) {
+            return Error(`vector of ${n} bytes overflows a 16-bit length`,
+                ErrorCode.ILLEGAL_PARAMETER);
+        }
+        self.out[mark - 2] = ((n >> 8) & 255) as byte;
+        self.out[mark - 1] = (n & 255) as byte;
+    }
+
+    int open24() {
+        array.push(self.out, 0);
+        array.push(self.out, 0);
+        array.push(self.out, 0);
+        return self.out.length;
+    }
+
+    void close24(int mark) {
+        int n = self.out.length - mark;
+        self.out[mark - 3] = ((n >> 16) & 255) as byte;
+        self.out[mark - 2] = ((n >> 8) & 255) as byte;
+        self.out[mark - 1] = (n & 255) as byte;
+    }
+}
+
+export Writer writer() {
+    return { out: [] };
+}
+
+// Wraps a body in its 4-byte header. The transcript and the wire both use this
+// form.
+export byte[] handshakeMessage(int msgType, byte[] body) {
+    Writer w = writer();
+    w.u8(msgType);
+    w.u24(body.length);
+    w.raw(body);
+    return w.out;
+}
+
+// ---------------------------------------------------------------------------
+// Extensions
+// ---------------------------------------------------------------------------
+
+// Reads an extension block into a map from type to body. A repeated extension
+// is refused (§4.2), because with two copies a peer could choose which copy
+// each reader keeps.
+export Map<int, byte[]> parseExtensions(byte[] block) {
+    Map<int, byte[]> out = {};
+    Reader r = reader(block);
+    while (!r.done()) {
+        int t = r.u16();
+        byte[] ext = r.vector16();
+        if (out[t] != null) {
+            // §4.2 names no alert for this. The defect is in the framing and not
+            // in the value of a field, so the alert is decode_error.
+            return Error(`extension ${t} appears twice`,
+                ErrorCode.DECODE_ERROR);
+        }
+        out[t] = ext;
+    }
+    return out;
+}
+
+// RFC 8446 §4.2: a server extension that the ClientHello did not offer is
+// fatal, and the alert is unsupported_extension.
+//
+// `allowed` is the set for the message being read. Every caller builds it from
+// the ClientHello that was sent, and the set is different for each message
+// kind.
+void checkSolicited(Map<int, byte[]> exts, int[] allowed, String where) {
+    forEach(map.keys(exts), t) {
+        if (array.indexOf(allowed, t) < 0) {
+            return Error("server sent extension " + string.from(t) + " in the "
+                + where + ", which this client did not offer",
+                ErrorCode.UNSUPPORTED_EXTENSION);
+        }
+    }
+}
+
+void writeExtension(Writer w, int t, byte[] body) {
+    w.u16(t);
+    w.u16(body.length);
+    w.raw(body);
+}
+
+// SNI (RFC 6066): a list that holds one host_name. An IP address is not a
+// legal SNI value, so the caller does not send it.
+byte[] serverNameExtension(String host) {
+    Writer w = writer();
+    int list = w.open16();
+    w.u8(0);    // NameType.host_name
+    int name = w.open16();
+    w.raw(string.toByteArray(host));
+    w.close16(name);
+    w.close16(list);
+    return w.out;
+}
+
+byte[] supportedVersionsClient() {
+    Writer w = writer();
+    int list = w.open8();
+    w.u16(VERSION_TLS13);
+    w.close8(list);
+    return w.out;
+}
+
+byte[] supportedGroupsExtension() {
+    Writer w = writer();
+    int list = w.open16();
+    w.u16(GROUP_X25519);
+    w.close16(list);
+    return w.out;
+}
+
+byte[] signatureAlgorithmsExtension() {
+    Writer w = writer();
+    int list = w.open16();
+    w.u16(SIG_ECDSA_SECP256R1_SHA256);
+    w.u16(SIG_RSA_PSS_RSAE_SHA256);
+    w.u16(SIG_ECDSA_SECP384R1_SHA384);
+    w.u16(SIG_RSA_PSS_RSAE_SHA384);
+    w.u16(SIG_RSA_PKCS1_SHA256);
+    w.u16(SIG_RSA_PKCS1_SHA384);
+    w.close16(list);
+    return w.out;
+}
+
+byte[] keyShareClient(byte[] publicKey) {
+    Writer w = writer();
+    int list = w.open16();
+    w.u16(GROUP_X25519);
+    int share = w.open16();
+    w.raw(publicKey);
+    w.close16(share);
+    w.close16(list);
+    return w.out;
+}
+
+byte[] keyShareServer(byte[] publicKey) {
+    Writer w = writer();
+    w.u16(GROUP_X25519);
+    int share = w.open16();
+    w.raw(publicKey);
+    w.close16(share);
+    return w.out;
+}
+
+byte[] alpnExtension(String[] protocols) {
+    Writer w = writer();
+    int list = w.open16();
+    forEach(protocols, p) {
+        int one = w.open8();
+        w.raw(string.toByteArray(p));
+        w.close8(one);
+    }
+    w.close16(list);
+    return w.out;
+}
+
+// Reads the protocol that a server selected. RFC 7301 §4.2.1 requires a
+// list of exactly one name.
+String parseAlpn(byte[] body) {
+    Reader r = reader(body);
+    Reader list = r.sub(r.vector16());
+    byte[] name = list.vector8();
+    if (!list.done()) {
+        return Error("server selected more than one ALPN protocol",
+            ErrorCode.ILLEGAL_PARAMETER);
+    }
+    if (name.length == 0) {
+        return Error("server selected an empty ALPN protocol", ErrorCode.ILLEGAL_PARAMETER);
+    }
+    return string.fromByteArray(name);
+}
+
+// ---------------------------------------------------------------------------
+// ClientHello and ServerHello
+// ---------------------------------------------------------------------------
+
+export type ClientHello {
+    byte[] random;
+    byte[] sessionId;
+    int[] cipherSuites;
+    byte[] keyShare;    // the x25519 share, empty if none was offered
+    String[] alpn;
+    String serverName;
+}
+
+export type ServerHello {
+    byte[] random;
+    byte[] sessionId;
+    int cipherSuite;
+    byte[] keyShare;
+    bool helloRetryRequest;
+}
+
+// SNI holds a host name, never an address literal, which RFC 6066 §3 forbids.
+// Both the message writer and the check on the reply call this function, so
+// the offer and the solicited set always agree.
+bool sendsServerName(String serverName) {
+    return string.length(serverName) > 0 && !looksNumeric(serverName);
+}
+
+// Writes the ClientHello that this client sends. §4.1.2 fixes the legacy
+// fields: version 0x0303, a 32-byte session id, and one null compression
+// method. The real version is in supported_versions.
+export byte[] buildClientHello(byte[] random, byte[] sessionId, byte[] publicKey,
+    String serverName, String[] alpn) {
+    Writer w = writer();
+    w.u16(VERSION_TLS12);
+    w.raw(random);
+    int sid = w.open8();
+    w.raw(sessionId);
+    w.close8(sid);
+
+    int suites = w.open16();
+    forEach(offeredSuites(), s) {
+        w.u16(s);
+    }
+    w.close16(suites);
+
+    int comp = w.open8();
+    w.u8(0);
+    w.close8(comp);
+
+    int exts = w.open16();
+    if (sendsServerName(serverName)) {
+        writeExtension(w, EXT_SERVER_NAME, serverNameExtension(serverName));
+    }
+    writeExtension(w, EXT_SUPPORTED_GROUPS, supportedGroupsExtension());
+    writeExtension(w, EXT_SIGNATURE_ALGORITHMS, signatureAlgorithmsExtension());
+    writeExtension(w, EXT_SUPPORTED_VERSIONS, supportedVersionsClient());
+    writeExtension(w, EXT_KEY_SHARE, keyShareClient(publicKey));
+    if (alpn.length > 0) {
+        writeExtension(w, EXT_ALPN, alpnExtension(alpn));
+    }
+    w.close16(exts);
+
+    return handshakeMessage(HandshakeType.CLIENT_HELLO, w.out);
+}
+
+// True for an IPv4 address or an IPv6 literal. It does not parse the address,
+// because a name that could be an address must not be sent as a host.
+bool looksNumeric(String host) {
+    if (string.contains(host, ":")) { return true; }
+    String[] parts = string.split(host, ".");
+    if (parts.length != 4) { return false; }
+    forEach(parts, p) {
+        int v = string.toInt(p) catch -1;
+        if (v < 0 || v > 255) { return false; }
+    }
+    return true;
+}
+
+// Reads a ClientHello body, the message without its 4-byte header.
+export ClientHello parseClientHello(byte[] body) {
+    Reader r = reader(body);
+    int version = r.u16();
+    if (version != VERSION_TLS12) {
+        return Error(`ClientHello legacy_version is ${version}, not 0x0303`,
+            ErrorCode.ILLEGAL_PARAMETER);
+    }
+    byte[] random = r.take(32);
+    byte[] sessionId = r.vector8();
+
+    Reader suites = r.sub(r.vector16());
+    int[] offered = [];
+    while (!suites.done()) {
+        array.push(offered, suites.u16());
+    }
+    byte[] comp = r.vector8();
+    if (comp.length != 1 || comp[0] != 0) {
+        return Error("ClientHello offers a compression method", ErrorCode.ILLEGAL_PARAMETER);
+    }
+
+    Map<int, byte[]> exts = parseExtensions(r.vector16());
+    byte[] share = string.toByteArray("");
+    byte[]? ks = exts[EXT_KEY_SHARE];
+    if (ks != null) {
+        Reader kr = reader(ks);
+        Reader list = kr.sub(kr.vector16());
+        while (!list.done()) {
+            int group = list.u16();
+            byte[] key = list.vector16();
+            if (group == GROUP_X25519) {
+                share = key;
+            }
+        }
+    }
+
+    String[] names = [];
+    byte[]? ap = exts[EXT_ALPN];
+    if (ap != null) {
+        Reader ar = reader(ap);
+        Reader list = ar.sub(ar.vector16());
+        while (!list.done()) {
+            array.push(names, string.fromByteArray(list.vector8()));
+        }
+    }
+
+    String host = "";
+    byte[]? sni = exts[EXT_SERVER_NAME];
+    if (sni != null) {
+        Reader sr = reader(sni);
+        Reader list = sr.sub(sr.vector16());
+        while (!list.done()) {
+            int nameType = list.u8();
+            byte[] name = list.vector16();
+            if (nameType == 0) {
+                host = string.fromByteArray(name);
+            }
+        }
+    }
+
+    return {
+        random: random,
+        sessionId: sessionId,
+        cipherSuites: offered,
+        keyShare: share,
+        alpn: names,
+        serverName: host,
+    };
+}
+
+// Reads a ServerHello body and does all the checks that §4.1.3 requires of a
+// receiver. A server can choose only from what was offered, so a group that
+// was not offered is refused here.
+export ServerHello parseServerHello(byte[] body) {
+    Reader r = reader(body);
+    int version = r.u16();
+    if (version != VERSION_TLS12) {
+        return Error(`ServerHello legacy_version is ${version}, not 0x0303`,
+            ErrorCode.ILLEGAL_PARAMETER);
+    }
+    byte[] random = r.take(32);
+    bool hrr = crypto.hexEncode(random) == HELLO_RETRY_RANDOM;
+    byte[] sessionId = r.vector8();
+    int suite = r.u16();
+    int comp = r.u8();
+    if (comp != 0) {
+        return Error("ServerHello selects a compression method", ErrorCode.ILLEGAL_PARAMETER);
+    }
+
+    Map<int, byte[]> exts = parseExtensions(r.vector16());
+
+    // §4.1.3 lets a ServerHello carry only the two extensions that make it a
+    // TLS 1.3 ServerHello, plus pre_shared_key, which this client never offers.
+    // Any other extension would be a negotiated value that no key protects.
+    checkSolicited(exts, [EXT_SUPPORTED_VERSIONS, EXT_KEY_SHARE], "ServerHello");
+
+    // supported_versions makes this TLS 1.3. This client supports one version
+    // and never negotiates a lower one.
+    byte[]? sv = exts[EXT_SUPPORTED_VERSIONS];
+    if (sv == null) {
+        return Error("ServerHello has no supported_versions: the peer is not TLS 1.3",
+            ErrorCode.ILLEGAL_PARAMETER);
+    }
+    Reader svr = reader(sv);
+    int chosen = svr.u16();
+    if (chosen != VERSION_TLS13) {
+        return Error(`server selected version ${chosen}, not TLS 1.3`,
+            ErrorCode.ILLEGAL_PARAMETER);
+    }
+
+    byte[] share = string.toByteArray("");
+    byte[]? ks = exts[EXT_KEY_SHARE];
+    if (ks != null && !hrr) {
+        Reader kr = reader(ks);
+        int group = kr.u16();
+        if (group != GROUP_X25519) {
+            return Error(`server chose group ${group}, which was not offered`,
+                ErrorCode.ILLEGAL_PARAMETER);
+        }
+        share = kr.vector16();
+    }
+
+    // §4.1.3 ends the ServerHello at its extension block. The check for
+    // trailing bytes is here. Otherwise the transcript finds them three
+    // messages later as a decryption failure.
+    if (!r.done()) {
+        return Error("trailing bytes after the ServerHello", ErrorCode.DECODE_ERROR);
+    }
+
+    return {
+        random: random,
+        sessionId: sessionId,
+        cipherSuite: suite,
+        keyShare: share,
+        helloRetryRequest: hrr,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Certificate, CertificateVerify, Finished
+// ---------------------------------------------------------------------------
+
+// The chain, end-entity certificate first, as the DER of each entry. This
+// function does not read inside a certificate. `x509` does that.
+export byte[][] parseCertificate(byte[] body) {
+    Reader r = reader(body);
+    byte[] context = r.vector8();
+    if (context.length != 0) {
+        return Error("server sent a certificate_request_context", ErrorCode.ILLEGAL_PARAMETER);
+    }
+    Reader list = r.sub(r.vector24());
+    byte[][] chain = [];
+    while (!list.done()) {
+        byte[] der = list.vector24();
+        if (der.length == 0) {
+            return Error("certificate entry is empty", ErrorCode.ILLEGAL_PARAMETER);
+        }
+        array.push(chain, der);
+        // §4.4.2 gives every certificate entry its own extension block, and
+        // the rule of §4.2 applies to it. This client asks for neither
+        // status_request nor signed_certificate_timestamp, so the block must be
+        // empty.
+        checkSolicited(parseExtensions(list.vector16()), [], "Certificate");
+    }
+    if (chain.length == 0) {
+        return Error("server sent an empty certificate chain", ErrorCode.ILLEGAL_PARAMETER);
+    }
+    if (!r.done()) {
+        return Error("trailing bytes after the Certificate", ErrorCode.DECODE_ERROR);
+    }
+    return chain;
+}
+
+// The "no certificate" reply of §4.4.2: the certificate_request_context sent
+// back, and a zero-length certificate list.
+byte[] emptyCertificateBody(byte[] context) {
+    Writer w = writer();
+    int c = w.open8();
+    w.raw(context);
+    w.close8(c);
+    int list = w.open24();
+    w.close24(list);
+    return w.out;
+}
+
+// Validates the structure of §4.6.1 and keeps nothing. This client does not
+// resume, but it must still check the frame of a message that it ignores.
+void checkNewSessionTicket(byte[] body) {
+    Reader r = reader(body);
+    r.u16();        // ticket_lifetime, high half
+    r.u16();        // ticket_lifetime, low half
+    r.u16();        // ticket_age_add, high half
+    r.u16();        // ticket_age_add, low half
+    r.vector8();    // ticket_nonce
+    byte[] ticket = r.vector16();
+    if (ticket.length == 0) {
+        return Error("NewSessionTicket carries an empty ticket", ErrorCode.DECODE_ERROR);
+    }
+    parseExtensions(r.vector16());
+    if (!r.done()) {
+        return Error("trailing bytes after NewSessionTicket", ErrorCode.DECODE_ERROR);
+    }
+}
+
+// The signature is kept here and not checked. `checkPeer` does the check.
+export type CertificateVerify {
+    int algorithm;
+    byte[] signature;
+}
+
+export CertificateVerify parseCertificateVerify(byte[] body) {
+    Reader r = reader(body);
+    int alg = r.u16();
+    byte[] sig = r.vector16();
+    if (!r.done()) {
+        return Error("trailing bytes after CertificateVerify", ErrorCode.DECODE_ERROR);
+    }
+    return { algorithm: alg, signature: sig };
+}
+
+// The content that a CertificateVerify signs (§4.4.3): 64 spaces, a context
+// string, a zero byte, and the transcript hash. The 64 spaces prevent the
+// replay of a signature made for one purpose as a signature for another.
+export byte[] certificateVerifyContent(String context, byte[] transcriptHash) {
+    Writer w = writer();
+    int i = 0;
+    while (i < 64) {
+        w.u8(32);
+        i++;
+    }
+    w.raw(string.toByteArray(context));
+    w.u8(0);
+    w.raw(transcriptHash);
+    return w.out;
+}
+
+String const SERVER_CV_CONTEXT = "TLS 1.3, server CertificateVerify";
+
+// ---------------------------------------------------------------------------
+// Alerts (RFC 8446 §6)
+// ---------------------------------------------------------------------------
+
+int const ALERT_WARNING = 1;
+int const ALERT_FATAL = 2;
+
+int const ALERT_CLOSE_NOTIFY = 0;
+int const ALERT_UNEXPECTED_MESSAGE = 10;
+int const ALERT_BAD_RECORD_MAC = 20;
+int const ALERT_RECORD_OVERFLOW = 22;
+int const ALERT_HANDSHAKE_FAILURE = 40;
+int const ALERT_BAD_CERTIFICATE = 42;
+int const ALERT_UNSUPPORTED_CERTIFICATE = 43;
+int const ALERT_CERTIFICATE_EXPIRED = 45;
+int const ALERT_UNKNOWN_CA = 48;
+int const ALERT_ILLEGAL_PARAMETER = 47;
+int const ALERT_DECODE_ERROR = 50;
+int const ALERT_DECRYPT_ERROR = 51;
+int const ALERT_INTERNAL_ERROR = 80;
+int const ALERT_UNSUPPORTED_EXTENSION = 110;
+
+// The alert that this end sends when it stops for this reason. It is one
+// function, so a new code cannot become internal_error at some call sites
+// without notice.
+export int alertFor(int code) {
+    if (code == ErrorCode.ILLEGAL_PARAMETER) { return ALERT_ILLEGAL_PARAMETER; }
+    if (code == ErrorCode.DECODE_ERROR) { return ALERT_DECODE_ERROR; }
+    if (code == ErrorCode.RECORD_OVERFLOW) { return ALERT_RECORD_OVERFLOW; }
+    if (code == ErrorCode.UNEXPECTED_MESSAGE) { return ALERT_UNEXPECTED_MESSAGE; }
+    if (code == ErrorCode.HANDSHAKE_FAILURE) { return ALERT_HANDSHAKE_FAILURE; }
+    if (code == ErrorCode.DECRYPT_ERROR) { return ALERT_DECRYPT_ERROR; }
+    if (code == ErrorCode.UNSUPPORTED_CERTIFICATE) { return ALERT_UNSUPPORTED_CERTIFICATE; }
+    if (code == ErrorCode.UNSUPPORTED_EXTENSION) { return ALERT_UNSUPPORTED_EXTENSION; }
+    // §6.2 uses unexpected_message for a message that is not permitted in that
+    // quantity or at that point. Every counter in this file refuses that.
+    if (code == ErrorCode.TOO_MANY_MESSAGES) { return ALERT_UNEXPECTED_MESSAGE; }
+    // The certificate of the peer is valid but is not one that this end
+    // accepts.
+    if (code == ErrorCode.PIN_MISMATCH) { return ALERT_BAD_CERTIFICATE; }
+    if (code == crypto.ErrorCode.AUTHENTICATION) { return ALERT_BAD_RECORD_MAC; }
+    // The codes of x509 arrive here unchanged, so a caller that catches a
+    // failed `connect` sees "expired" or "wrong hostname", not one general
+    // error.
+    if (code == x509.ErrorCode.EXPIRED) { return ALERT_CERTIFICATE_EXPIRED; }
+    if (code == x509.ErrorCode.NOT_YET_VALID) { return ALERT_CERTIFICATE_EXPIRED; }
+    if (code == x509.ErrorCode.UNTRUSTED_ROOT) { return ALERT_UNKNOWN_CA; }
+    if (code == x509.ErrorCode.HOSTNAME_MISMATCH) { return ALERT_BAD_CERTIFICATE; }
+    if (code == x509.ErrorCode.BAD_CERTIFICATE) { return ALERT_BAD_CERTIFICATE; }
+    if (code == x509.ErrorCode.BAD_SIGNATURE) { return ALERT_DECRYPT_ERROR; }
+    if (code == x509.ErrorCode.CONSTRAINT_VIOLATION) { return ALERT_BAD_CERTIFICATE; }
+    if (code == x509.ErrorCode.UNSUPPORTED_ALGORITHM) { return ALERT_UNSUPPORTED_CERTIFICATE; }
+    return ALERT_INTERNAL_ERROR;
+}
+
+// The name of a received alert, for the error message. An alert without a name
+// is written as its number.
+String alertName(int description) {
+    if (description == 0) { return "close_notify"; }
+    if (description == 10) { return "unexpected_message"; }
+    if (description == 20) { return "bad_record_mac"; }
+    if (description == 22) { return "record_overflow"; }
+    if (description == 30) { return "decompression_failure"; }
+    if (description == 40) { return "handshake_failure"; }
+    if (description == 42) { return "bad_certificate"; }
+    if (description == 43) { return "unsupported_certificate"; }
+    if (description == 44) { return "certificate_revoked"; }
+    if (description == 45) { return "certificate_expired"; }
+    if (description == 46) { return "certificate_unknown"; }
+    if (description == 47) { return "illegal_parameter"; }
+    if (description == 48) { return "unknown_ca"; }
+    if (description == 49) { return "access_denied"; }
+    if (description == 50) { return "decode_error"; }
+    if (description == 51) { return "decrypt_error"; }
+    if (description == 70) { return "protocol_version"; }
+    if (description == 71) { return "insufficient_security"; }
+    if (description == 80) { return "internal_error"; }
+    if (description == 109) { return "missing_extension"; }
+    if (description == 110) { return "unsupported_extension"; }
+    if (description == 112) { return "unrecognized_name"; }
+    if (description == 120) { return "no_application_protocol"; }
+    return "alert " + string.from(description);
+}
+
+// ---------------------------------------------------------------------------
+// Transport: the byte stream under the record layer
+// ---------------------------------------------------------------------------
+
+// A byte stream as a record of closures, because built-ins are not first-class
+// values (§3.4). All code below reads and writes through these three closures
+// and never uses `net`, so this file owns no socket.
+export type Transport {
+    Function(int)<Future<byte[]!>> read;
+    Function(byte[])<Future<void!>> write;
+    Function()<void> close;
+}
+
+export Transport socketTransport(Socket s, Duration? timeout) {
+    return {
+        read: Future<byte[]!> (int n) -> net.read(s, n, { timeout: timeout }),
+        write: Future<void!> (byte[] b) -> net.write(s, b, { timeout: timeout }),
+        close: void () -> net.close(s),
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Framer: records in, handshake messages and application data out
+// ---------------------------------------------------------------------------
+
+// The read half of a connection. It has three buffers, because a record and a
+// message are independent units. Bytes arrive in the sizes that the network
+// chooses (`buf`). One record can hold several handshake messages or part of
+// one (`hs`), or application data that the caller has not read yet (`app`).
+export type Framer {
+    Transport io;
+    String buf;
+    String hs;
+    String app;
+    RecordProtection? rp;
+    bool handshaking;
+    int ccs;
+    bool closed;         // a close_notify arrived: EOF, not an error
+    bool eof;            // the transport ended
+    int empties;         // consecutive records that carried nothing
+    int keyUpdates;      // KeyUpdates applied on this connection
+    int userCanceled;    // user_canceled alerts ignored on this connection
+
+    void async fill() {
+        byte[] b = await self.io.read(READ_CHUNK);
+        if (b.length == 0) {
+            self.eof = true;
+            return Error("connection closed", net.ErrorCode.END_OF_FILE);
+        }
+        self.buf = self.buf + string.fromByteArray(b);
+    }
+
+    // One whole record, with its header.
+    byte[] async record() {
+        while (string.length(self.buf) < 5) {
+            await self.fill();
+        }
+        RecordHeader h = parseRecordHeader(
+            string.toByteArray(string.substring(self.buf, 0, 5)));
+        int total = 5 + h.length;
+        while (string.length(self.buf) < total) {
+            await self.fill();
+        }
+        String rec = string.substring(self.buf, 0, total);
+        self.buf = string.substring(self.buf, total, string.length(self.buf));
+        return string.toByteArray(rec);
+    }
+
+    // Reads one record and puts its contents in the correct buffer. All rules
+    // about which records are acceptable at which time are here.
+    void async pump() {
+        byte[] rec = await self.record();
+        int outer = rec[0];
+
+        // change_cipher_spec is always plaintext and can be ignored, but only
+        // during the handshake and only in limited numbers (§D.4).
+        if (outer == ContentType.CHANGE_CIPHER_SPEC) {
+            if (!self.handshaking) {
+                return Error("change_cipher_spec after the handshake",
+                    ErrorCode.UNEXPECTED_MESSAGE);
+            }
+            self.ccs = self.ccs + 1;
+            if (self.ccs > MAX_CCS) {
+                return Error(`more than ${MAX_CCS} change_cipher_spec records`,
+                    ErrorCode.TOO_MANY_MESSAGES);
+            }
+            byte[] payload = array.slice(rec, 5);
+            if (payload.length != 1 || payload[0] != 1) {
+                return Error("malformed change_cipher_spec", ErrorCode.UNEXPECTED_MESSAGE);
+            }
+            return;
+        }
+
+        RecordProtection? p = self.rp;
+        if (p == null) {
+            byte[] payload = array.slice(rec, 5);
+            if (outer == ContentType.ALERT) {
+                self.alert(payload);
+                return;
+            }
+            if (outer != ContentType.HANDSHAKE) {
+                return Error(`unprotected record of type ${outer}`,
+                    ErrorCode.UNEXPECTED_MESSAGE);
+            }
+            self.hs = self.hs + string.fromByteArray(payload);
+            return;
+        }
+
+        InnerPlaintext ip = p.open(rec);
+
+        // A record that decrypts to nothing is legal padding. A record with at
+        // least one byte resets the counter, so padding between real records
+        // is not counted.
+        if (ip.data.length == 0 && ip.contentType != ContentType.ALERT) {
+            self.empties = self.empties + 1;
+            if (self.empties > MAX_EMPTY_RECORDS) {
+                return Error(`more than ${MAX_EMPTY_RECORDS} consecutive empty records`,
+                    ErrorCode.TOO_MANY_MESSAGES);
+            }
+            return;
+        }
+        self.empties = 0;
+
+        if (ip.contentType == ContentType.ALERT) {
+            self.alert(ip.data);
+            return;
+        }
+        if (ip.contentType == ContentType.HANDSHAKE) {
+            self.hs = self.hs + string.fromByteArray(ip.data);
+            return;
+        }
+        // Application data before the end of the handshake means that the peer
+        // skipped a step.
+        if (self.handshaking) {
+            return Error("application data during the handshake",
+                ErrorCode.UNEXPECTED_MESSAGE);
+        }
+        self.app = self.app + string.fromByteArray(ip.data);
+    }
+
+    // close_notify is the end of the stream. user_canceled is counted and
+    // ignored. Every other alert fails with the reason that the peer gave.
+    void alert(byte[] payload) {
+        if (payload.length != 2) {
+            return Error("malformed alert record", ErrorCode.DECODE_ERROR);
+        }
+        int level = payload[0];
+        int description = payload[1];
+        // §6 defines two level values. A record with another value cannot be
+        // parsed, so this end does not read its description.
+        if (level != ALERT_WARNING && level != ALERT_FATAL) {
+            return Error(`alert level is ${level}`,
+                ErrorCode.ILLEGAL_PARAMETER);
+        }
+        if (description == ALERT_CLOSE_NOTIFY) {
+            self.closed = true;
+            return;
+        }
+        // TLS 1.3 removed warning alerts (§6): every alert except close_notify
+        // and user_canceled is fatal, for any level byte.
+        if (level == ALERT_WARNING && description != ALERT_USER_CANCELED) {
+            return Error("peer sent a warning alert (" + alertName(description)
+                + "), which TLS 1.3 does not have", ErrorCode.DECODE_ERROR);
+        }
+        // user_canceled is ignored and counted. Without a limit, a peer could
+        // make this end read forever.
+        if (description == ALERT_USER_CANCELED) {
+            self.userCanceled = self.userCanceled + 1;
+            if (self.userCanceled > MAX_USER_CANCELED) {
+                return Error(`more than ${MAX_USER_CANCELED} user_canceled alerts`,
+                    ErrorCode.TOO_MANY_MESSAGES);
+            }
+            return;
+        }
+        return Error("peer sent " + alertName(description), ErrorCode.PEER_ALERT);
+    }
+
+    // RFC 8446 §5.1: handshake messages must not span a key change. Every
+    // handshake byte that the peer sent under the old keys must be read as part
+    // of a whole message. Otherwise a buffer outlives the key that
+    // authenticated it.
+    void endFlight(String what) {
+        if (string.length(self.hs) != 0) {
+            return Error(string.from(string.length(self.hs))
+                + " handshake bytes left over at " + what,
+                ErrorCode.UNEXPECTED_MESSAGE);
+        }
+    }
+
+    // One whole handshake message, with its 4-byte header, which is the form
+    // that the transcript needs.
+    byte[] async message() {
+        while (string.length(self.hs) < 4) {
+            if (self.closed) {
+                return Error("peer closed mid-handshake", ErrorCode.UNEXPECTED_MESSAGE);
+            }
+            await self.pump();
+        }
+        byte[] head = string.toByteArray(string.substring(self.hs, 0, 4));
+        int len = head[1] * 65536 + head[2] * 256 + head[3];
+        if (len > MAX_HANDSHAKE) {
+            return Error(`handshake message of ${len} bytes exceeds ${MAX_HANDSHAKE}`,
+                ErrorCode.RECORD_OVERFLOW);
+        }
+        while (string.length(self.hs) < 4 + len) {
+            if (self.closed) {
+                return Error("peer closed mid-handshake", ErrorCode.UNEXPECTED_MESSAGE);
+            }
+            await self.pump();
+        }
+        String msg = string.substring(self.hs, 0, 4 + len);
+        self.hs = string.substring(self.hs, 4 + len, string.length(self.hs));
+        return string.toByteArray(msg);
+    }
+
+    // `message` plus the rule of the state machine: the message that arrived
+    // must be the next message that the protocol names, or the handshake ends.
+    byte[] async expect(int msgType) {
+        byte[] msg = await self.message();
+        if (msg[0] != msgType) {
+            return Error(`expected handshake message ${msgType}, got ${msg[0]}`,
+                ErrorCode.UNEXPECTED_MESSAGE);
+        }
+        return msg;
+    }
+}
+
+export Framer framer(Transport io) {
+    return {
+        io: io, buf: "", hs: "", app: "", rp: null,
+        handshaking: true, ccs: 0, closed: false, eof: false,
+        empties: 0, keyUpdates: 0, userCanceled: 0,
+    };
+}
+
+// A handshake message without its 4-byte header.
+export byte[] messageBody(byte[] message) {
+    return array.slice(message, 4);
+}
+
+// ---------------------------------------------------------------------------
+// The connection
+// ---------------------------------------------------------------------------
+
+// A TLS connection after the handshake. `peerCertificates` is the chain as it
+// arrived, end-entity first. It is not verified here. `checkPeer` verifies it.
+export type Conn {
+    Framer in;
+    RecordProtection out;
+    Transport io;
+    String alpn;
+    byte[][] peerCertificates;
+    byte[] readSecret;
+    byte[] writeSecret;
+    bool sentClose;
+
+    // Returns up to n bytes, or an empty array at the end of the stream, as
+    // `net.read` does.
+    byte[] async read(int n) {
+        while (string.length(self.in.app) == 0) {
+            if (self.in.closed || self.in.eof) {
+                return string.toByteArray("");
+            }
+            await self.pumpPostHandshake();
+        }
+        int have = string.length(self.in.app);
+        int take = n;
+        if (take > have) { take = have; }
+        String out = string.substring(self.in.app, 0, take);
+        self.in.app = string.substring(self.in.app, take, have);
+        return string.toByteArray(out);
+    }
+
+    // `pump` plus the two messages that can arrive after the handshake. A
+    // KeyUpdate is applied, because a peer that sends one has already changed
+    // its keys. Otherwise every later record would fail to authenticate.
+    void async pumpPostHandshake() {
+        await self.in.pump();
+        while (string.length(self.in.hs) >= 4) {
+            byte[] msg = await self.in.message();
+            int mt = msg[0];
+            if (mt == HandshakeType.NEW_SESSION_TICKET) {
+                checkNewSessionTicket(messageBody(msg));
+                continue;
+            }
+            if (mt == HandshakeType.KEY_UPDATE) {
+                await self.keyUpdate(messageBody(msg));
+                continue;
+            }
+            return Error(`unexpected post-handshake message ${mt}`,
+                ErrorCode.UNEXPECTED_MESSAGE);
+        }
+    }
+
+    // Changes the read keys, and also the write keys when the peer asks.
+    // §4.6.3 makes the reply mandatory.
+    void async keyUpdate(byte[] request) {
+        if (request.length != 1) {
+            return Error("malformed KeyUpdate", ErrorCode.DECODE_ERROR);
+        }
+        self.in.keyUpdates = self.in.keyUpdates + 1;
+        if (self.in.keyUpdates > MAX_KEY_UPDATES) {
+            return Error(`more than ${MAX_KEY_UPDATES} KeyUpdates`,
+                ErrorCode.TOO_MANY_MESSAGES);
+        }
+        self.readSecret = hkdfExpandLabel(self.readSecret, "traffic upd",
+            string.toByteArray(""), 32);
+        self.in.rp = protectionKeys(self.readSecret, self.out.suite);
+        if (request[0] == 0) {
+            return;
+        }
+        if (request[0] != 1) {
+            return Error(`KeyUpdate request is ${request[0]}`,
+                ErrorCode.ILLEGAL_PARAMETER);
+        }
+        byte[] answer = handshakeMessage(HandshakeType.KEY_UPDATE, [0]);
+        await self.io.write(self.out.seal(ContentType.HANDSHAKE, answer));
+        self.writeSecret = hkdfExpandLabel(self.writeSecret, "traffic upd",
+            string.toByteArray(""), 32);
+        self.out = protectionKeys(self.writeSecret, self.out.suite);
+    }
+
+    // Sends application data, split into records at the plaintext limit, so a
+    // caller can give any amount.
+    void async write(byte[] data) {
+        int at = 0;
+        while (at < data.length) {
+            int end = at + MAX_PLAINTEXT;
+            if (end > data.length) { end = data.length; }
+            await self.io.write(
+                self.out.seal(ContentType.APPLICATION_DATA, array.slice(data, at, end)));
+            at = end;
+        }
+    }
+
+    // Sends close_notify and leaves the transport open. This is the first half
+    // of the clean shutdown of §6.1. A caller can continue to read after it. A
+    // failed write is ignored, because a peer that is gone cannot get a
+    // message.
+    void async closeWrite() {
+        if (!self.sentClose) {
+            self.sentClose = true;
+            await self.io.write(
+                self.out.seal(ContentType.ALERT, [ALERT_WARNING as byte, 0])) catch e { };
+        }
+    }
+
+    // The `close` for an error: the connection stops because something is
+    // wrong, and the peer gets the reason. Without it, a peer sees only a
+    // closed socket, which looks like a network failure.
+    void async abort(int description) {
+        await self.io.write(self.out.seal(ContentType.ALERT,
+            [ALERT_FATAL as byte, description as byte])) catch e { };
+        self.sentClose = true;
+        self.io.close();
+    }
+
+    // Sends close_notify and closes the transport. The alert tells the peer
+    // that the stream ended and was not cut. This separates a clean end from a
+    // truncation attack.
+    void async close() {
+        await self.closeWrite();
+        self.io.close();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------
+
+// The trailing options record, in the form that every `net` call uses (§6.15).
+//
+// Verification is on when this record does not set it. By default, `connect`
+// builds the chain to a root in the trust store of the host, checks the leaf
+// against the requested name, and checks that the peer holds the private key
+// of the leaf.
+export type Options {
+    Duration? timeout;
+    String[]? alpn;
+    // The roots to trust in place of the store of the host. It narrows trust
+    // and does not remove it.
+    x509.Certificate[]? roots;
+    // insecureSkipVerify turns off all authentication of the peer: no chain,
+    // no hostname, no CertificateVerify. The connection stays private against
+    // an eavesdropper, but gives no protection against anyone who can redirect
+    // traffic. It exists because `testAccept` cannot sign.
+    bool? insecureSkipVerify;
+
+    // SHA-256 hashes of the SubjectPublicKeyInfo of the keys that this peer can
+    // hold (`x509.spkiPin`). When null, only the chain decides. When set, the
+    // verified chain must contain at least one of them. This protects against
+    // a certificate authority that issues a certificate for this name in error.
+    //
+    // It is a set, because with one pin a key rotation causes an outage. Pin
+    // the current key and the next key, or pin an intermediate, which outlives
+    // a leaf. For this reason, pinning is off by default. Verification still
+    // runs: a pin narrows the accepted chains and does not replace
+    // verification.
+    byte[][]? pins;
+}
+
+String[] alpnOf(Options? o) {
+    Options? opts = o;
+    if (opts == null) { return []; }
+    String[]? a = opts.alpn;
+    if (a == null) { return []; }
+    return a;
+}
+
+Duration? timeoutOf(Options? o) {
+    Options? opts = o;
+    if (opts == null) { return null; }
+    return opts.timeout;
+}
+
+x509.Certificate[]? rootsOf(Options? o) {
+    Options? opts = o;
+    if (opts == null) { return null; }
+    return opts.roots;
+}
+
+byte[][]? pinsOf(Options? o) {
+    Options? opts = o;
+    if (opts == null) { return null; }
+    return opts.pins;
+}
+
+// Refuses a pair of options that cannot both apply. If either one were ignored
+// without notice, the connection would succeed with nothing pinned.
+void checkOptions(Options? o) {
+    byte[][]? pins = pinsOf(o);
+    if (pins == null) { return; }
+    if (pins.length == 0) {
+        return Error("pins is empty, so no peer can match it; leave it null to "
+            + "verify without pinning", ErrorCode.MISCONFIGURED);
+    }
+    if (skipVerify(o)) {
+        return Error("insecureSkipVerify turns off the verification that pins "
+            + "narrow, so the two cannot both be set", ErrorCode.MISCONFIGURED);
+    }
+}
+
+// Absent means verify.
+bool skipVerify(Options? o) {
+    Options? opts = o;
+    if (opts == null) { return false; }
+    bool? skip = opts.insecureSkipVerify;
+    if (skip == null) { return false; }
+    return skip;
+}
+
+// ---------------------------------------------------------------------------
+// Authenticating the peer (RFC 8446 §4.4.2, §4.4.3)
+// ---------------------------------------------------------------------------
+
+// Checks the verified chain against the pins of the caller. Any certificate in
+// the chain can carry a pinned key, so a pin on an intermediate stays valid for
+// every leaf issued under it. `checkOptions` already refused an empty set,
+// which would refuse every peer.
+void checkPins(x509.Certificate[] verified, byte[][]? pins) {
+    byte[][]? given = pins;
+    if (given == null) { return; }
+    if (x509.pinned(verified, given)) { return; }
+    return Error("no certificate in the peer's verified chain carries a pinned "
+        + "public key", ErrorCode.PIN_MISMATCH);
+}
+
+// Authenticates the peer. The two checks are useful only together. The chain
+// shows that a certificate authority states that this public key belongs to
+// this name. The CertificateVerify shows that this peer holds the matching
+// private key. Certificates are public, so a chain check alone authenticates
+// nobody.
+void checkPeer(byte[][] chain, String serverName, CertificateVerify cv,
+    byte[] transcriptHash, Options? o) {
+    // The codes of x509 pass through unchanged, and `alertFor` maps each one to
+    // its alert.
+    x509.Certificate[] verified = x509.verifyChain(chain, serverName, rootsOf(o), null);
+    checkPins(verified, pinsOf(o));
+    x509.Certificate leaf = verified[0];
+
+    // RFC 5280 §4.2.1.3 and RFC 8446 §4.4.2.2: the certificate must permit its
+    // key to sign, because the CertificateVerify below is a signature.
+    if (!leaf.mayDigitallySign()) {
+        return Error("the server's certificate does not permit its key to sign",
+            x509.ErrorCode.CONSTRAINT_VIOLATION);
+    }
+
+    byte[] content = certificateVerifyContent(SERVER_CV_CONTEXT, transcriptHash);
+
+    // PKCS#1 v1.5 is not here, because RFC 8446 §4.4.3 forbids it. The scheme
+    // sets the hash and the kind of key that the leaf must hold. A mismatch
+    // fails in the key accessor below.
+    String hash = "";
+    bool ecdsa = false;
+    String wantCurve = "";
+    if (cv.algorithm == SIG_RSA_PSS_RSAE_SHA256) {
+        hash = "sha256";
+    } else if (cv.algorithm == SIG_RSA_PSS_RSAE_SHA384) {
+        hash = "sha384";
+    } else if (cv.algorithm == SIG_ECDSA_SECP256R1_SHA256) {
+        hash = "sha256";
+        ecdsa = true;
+        wantCurve = "p256";
+    } else if (cv.algorithm == SIG_ECDSA_SECP384R1_SHA384) {
+        hash = "sha384";
+        ecdsa = true;
+        wantCurve = "p384";
+    } else {
+        return Error("server signed its CertificateVerify with scheme "
+            + string.from(cv.algorithm) + ", which this client does not accept",
+            ErrorCode.UNSUPPORTED_CERTIFICATE);
+    }
+    byte[] digest = crypto.sha256(content);
+    if (hash == "sha384") {
+        digest = crypto.sha384(content);
+    }
+
+    if (ecdsa) {
+        x509.EcdsaPublicKey key = x509.ecdsaPublicKey(leaf) catch e {
+            return Error("the CertificateVerify scheme does not fit the certificate: "
+                + e.message, ErrorCode.UNSUPPORTED_CERTIFICATE);
+        };
+        // §4.2.3 ties each ecdsa_secp*r1 scheme to its curve.
+        if (key.curve != wantCurve) {
+            return Error("the CertificateVerify scheme names " + wantCurve
+                + " but the certificate's key is on " + key.curve,
+                ErrorCode.ILLEGAL_PARAMETER);
+        }
+        x509.EcdsaSignature sig = x509.parseEcdsaSignature(cv.signature) catch e {
+            return Error("the server's CertificateVerify signature is malformed: "
+                + e.message, ErrorCode.DECODE_ERROR);
+        };
+        crypto.ecdsaVerify(key.curve, key.point, digest, sig.r, sig.s) catch e {
+            return Error("the server does not hold the private key for the certificate "
+                + "it presented: " + e.message, ErrorCode.DECRYPT_ERROR);
+        };
+        return;
+    }
+
+    x509.RsaPublicKey key = x509.rsaPublicKey(leaf) catch e {
+        return Error("the CertificateVerify scheme does not fit the certificate: "
+            + e.message, ErrorCode.UNSUPPORTED_CERTIFICATE);
+    };
+    crypto.rsaVerifyPss(key.modulus, key.exponent, hash, digest, cv.signature) catch e {
+        return Error("the server does not hold the private key for the certificate "
+            + "it presented: " + e.message, ErrorCode.DECRYPT_ERROR);
+    };
+}
+
+// ---------------------------------------------------------------------------
+// The client handshake (RFC 8446 §4)
+// ---------------------------------------------------------------------------
+
+// The progress of the handshake, used only to send an alert at the correct
+// protection level. Before the key schedule runs, an alert is sent in the
+// clear. After it, the peer reads an unprotected record as a MAC failure.
+type AlertLevel {
+    RecordProtection? rp;
+}
+
+// Writes a fatal alert at the protection level that the handshake has reached.
+// Every caller ignores a failure, because a peer that is gone cannot get a
+// message.
+void async sendAlert(Transport io, AlertLevel al, int description) {
+    RecordProtection? p = al.rp;
+    if (p == null) {
+        await io.write(plaintextRecord(ContentType.ALERT,
+            [ALERT_FATAL as byte, description as byte]));
+        return;
+    }
+    await io.write(p.seal(ContentType.ALERT,
+        [ALERT_FATAL as byte, description as byte]));
+}
+
+// Runs a full 1-RTT client handshake over `io` and returns the connection. Any
+// transport works, so a test or a QUIC implementation can use it.
+//
+// When it fails, it sends the alert to the peer itself. `connect` cannot do
+// this, because only this function knows whether keys existed at the failure.
+export Conn async handshakeClient(Transport io, String serverName, Options? o) {
+    // This check comes before any byte is sent. An option that this end cannot
+    // apply is not a fault of the peer, so it gets no alert.
+    checkOptions(o);
+    AlertLevel al = { rp: null };
+    Conn c = await handshakeClientInner(io, serverName, o, al) catch e {
+        await sendAlert(io, al, alertFor(e.code)) catch e2 { };
+        return e;
+    };
+    return c;
+}
+
+Conn async handshakeClientInner(Transport io, String serverName, Options? o,
+    AlertLevel al) {
+    byte[] priv = crypto.randomBytes(32);
+    byte[] pub = crypto.x25519PublicKey(priv);
+    byte[] random = crypto.randomBytes(32);
+    byte[] sessionId = crypto.randomBytes(32);
+    String[] alpn = alpnOf(o);
+
+    Transcript t = transcript();
+    Framer f = framer(io);
+
+    byte[] hello = buildClientHello(random, sessionId, pub, serverName, alpn);
+    t.push(hello);
+    await io.write(plaintextRecord(ContentType.HANDSHAKE, hello));
+    // The compatibility record that §D.4 requests.
+    await io.write(plaintextRecord(ContentType.CHANGE_CIPHER_SPEC, [1]));
+
+    byte[] shMsg = await f.expect(HandshakeType.SERVER_HELLO);
+    ServerHello sh = parseServerHello(messageBody(shMsg));
+    if (sh.helloRetryRequest) {
+        return Error(
+            "server asked for a HelloRetryRequest, and x25519 is the only group offered",
+            ErrorCode.HANDSHAKE_FAILURE);
+    }
+    // The offered suites depend on what this host can do safely, so this
+    // checks the current list and not a constant.
+    if (array.indexOf(offeredSuites(), sh.cipherSuite) < 0) {
+        return Error(`server chose cipher suite ${sh.cipherSuite}, which was not offered`,
+            ErrorCode.ILLEGAL_PARAMETER);
+    }
+    int suite = sh.cipherSuite;
+    // §4.1.3: the server echoes the session id. A different one is the reply
+    // to a different ClientHello.
+    if (crypto.hexEncode(sh.sessionId) != crypto.hexEncode(sessionId)) {
+        return Error("server echoed a different session id", ErrorCode.ILLEGAL_PARAMETER);
+    }
+    if (sh.keyShare.length != 32) {
+        return Error("server sent no usable key share", ErrorCode.ILLEGAL_PARAMETER);
+    }
+    t.push(shMsg);
+
+    // `x25519SharedSecret` is fallible, so the small-order check cannot be
+    // skipped (§6.17).
+    byte[] shared = crypto.x25519SharedSecret(priv, sh.keyShare) catch e {
+        return Error("server key share is unusable: " + e.message,
+            ErrorCode.ILLEGAL_PARAMETER);
+    };
+
+    byte[] early = earlySecret(null);
+    byte[] hs = handshakeSecret(early, shared);
+    byte[] clientHs = deriveSecret(hs, "c hs traffic", t.hash());
+    byte[] serverHs = deriveSecret(hs, "s hs traffic", t.hash());
+    // The first key change: no unprotected data can stay in the buffer.
+    f.endFlight("the end of the ServerHello");
+    f.rp = protectionKeys(serverHs, suite);
+    // The same object seals the Finished below, so its sequence numbers are
+    // the single sequence that the peer expects.
+    RecordProtection hsOut = protectionKeys(clientHs, suite);
+    al.rp = hsOut;
+
+    byte[] eeMsg = await f.expect(HandshakeType.ENCRYPTED_EXTENSIONS);
+    t.push(eeMsg);
+    // The EncryptedExtensions can reply only to what this ClientHello asked,
+    // so the allowed list comes from what was sent.
+    Reader eer = reader(messageBody(eeMsg));
+    Map<int, byte[]> ee = parseExtensions(eer.vector16());
+    if (!eer.done()) {
+        return Error("trailing bytes after the EncryptedExtensions",
+            ErrorCode.DECODE_ERROR);
+    }
+    int[] eeAllowed = [EXT_SUPPORTED_GROUPS];
+    if (sendsServerName(serverName)) { array.push(eeAllowed, EXT_SERVER_NAME); }
+    if (alpn.length > 0) { array.push(eeAllowed, EXT_ALPN); }
+    checkSolicited(ee, eeAllowed, "EncryptedExtensions");
+    // RFC 6066 §3 makes the server reply to SNI an empty extension. A body here
+    // is data that has no field to hold it.
+    byte[]? sniAck = ee[EXT_SERVER_NAME];
+    if (sniAck != null && sniAck.length != 0) {
+        return Error("the server's server_name acknowledgement is not empty",
+            ErrorCode.DECODE_ERROR);
+    }
+    String selected = "";
+    byte[]? ap = ee[EXT_ALPN];
+    if (ap != null) {
+        selected = parseAlpn(ap);
+        if (array.indexOf(alpn, selected) < 0) {
+            return Error("server selected ALPN protocol \"" + selected
+                + "\", which was not offered", ErrorCode.ILLEGAL_PARAMETER);
+        }
+    }
+
+    // This client has no certificate and never signs. §4.4.2 says to reply to a
+    // CertificateRequest with an empty Certificate list and no
+    // CertificateVerify. A server that requests a certificate, but does not
+    // require one, accepts this. The reply echoes the context, so it is kept.
+    byte[] certRequestContext = EMPTY;
+    bool certRequested = false;
+    byte[] certMsg = await f.message();
+    int certType = certMsg[0];
+    if (certType == HandshakeType.CERTIFICATE_REQUEST) {
+        certRequested = true;
+        // The extension block is read and not skipped, because this end must
+        // check the frame of a message that it ignores.
+        Reader crr = reader(messageBody(certMsg));
+        certRequestContext = crr.vector8();
+        parseExtensions(crr.vector16());
+        if (!crr.done()) {
+            return Error("trailing bytes after the CertificateRequest",
+                ErrorCode.DECODE_ERROR);
+        }
+        t.push(certMsg);
+        certMsg = await f.message();
+        certType = certMsg[0];
+    }
+    if (certType != HandshakeType.CERTIFICATE) {
+        return Error(`expected Certificate, got ${certType}`,
+            ErrorCode.UNEXPECTED_MESSAGE);
+    }
+    byte[][] chain = parseCertificate(messageBody(certMsg));
+    t.push(certMsg);
+
+    // The CertificateVerify signs the transcript up to the Certificate message,
+    // so the hash is taken before the CertificateVerify is added.
+    byte[] beforeCv = t.hash();
+    byte[] cvMsg = await f.expect(HandshakeType.CERTIFICATE_VERIFY);
+    CertificateVerify cv = parseCertificateVerify(messageBody(cvMsg));
+    t.push(cvMsg);
+
+    if (!skipVerify(o)) {
+        checkPeer(chain, serverName, cv, beforeCv, o);
+    }
+
+    // The Finished of the server proves that the peer completed the key
+    // exchange. The chain and the CertificateVerify above identify the peer.
+    byte[] beforeFinished = t.hash();
+    byte[] finMsg = await f.expect(HandshakeType.FINISHED);
+    byte[] want = finishedVerifyData(serverHs, beforeFinished);
+    if (!string.bytesEqualConstantTime(messageBody(finMsg), want)) {
+        return Error("server Finished does not verify", ErrorCode.DECRYPT_ERROR);
+    }
+    t.push(finMsg);
+    // The second key change. Handshake bytes must not span it. Data left in the
+    // buffer after the Finished of the server is not part of a message.
+    f.endFlight("the end of the server's Finished");
+
+    byte[] master = masterSecret(hs);
+    byte[] clientAp = deriveSecret(master, "c ap traffic", t.hash());
+    byte[] serverAp = deriveSecret(master, "s ap traffic", t.hash());
+
+    // Declines the certificate that the server asked for (§4.4.2). It goes
+    // into the transcript before the Finished, so the verify_data below covers
+    // it. The application secrets above come from the transcript up to the
+    // Finished of the server (§7.1), so they are computed before this.
+    if (certRequested) {
+        byte[] decline = handshakeMessage(HandshakeType.CERTIFICATE,
+            emptyCertificateBody(certRequestContext));
+        t.push(decline);
+        await io.write(hsOut.seal(ContentType.HANDSHAKE, decline));
+    }
+
+    // The Finished of the client is the last message under the handshake keys.
+    byte[] verify = finishedVerifyData(clientHs, t.hash());
+    await io.write(hsOut.seal(ContentType.HANDSHAKE,
+        handshakeMessage(HandshakeType.FINISHED, verify)));
+
+    f.rp = protectionKeys(serverAp, suite);
+    f.handshaking = false;
+
+    return {
+        in: f,
+        out: protectionKeys(clientAp, suite),
+        io: io,
+        alpn: selected,
+        peerCertificates: chain,
+        readSecret: serverAp,
+        writeSecret: clientAp,
+        sentClose: false,
+    };
+}
+
+// Opens a TCP connection and runs the handshake over it.
+//
+// The certificate of the server is verified. The chain must build to a root in
+// the trust store of the host, the leaf must be valid for `serverName`, and
+// the CertificateVerify must prove that the peer holds the private key of the
+// leaf. `Options.roots` narrows what is trusted. `Options.insecureSkipVerify`
+// removes the check.
+export Conn async connect(String address, String serverName, Options? o) {
+    Duration? timeout = timeoutOf(o);
+    Socket s = await net.tcp.connect(address, { timeout: timeout });
+    Transport io = socketTransport(s, timeout);
+    Conn c = await handshakeClient(io, serverName, o) catch e {
+        // `handshakeClient` sends the alert, because only it knows whether
+        // there were keys to protect it. This code closes the socket.
+        net.close(s);
+        return e;
+    };
+    return c;
+}
+
+// Writes an unprotected fatal alert, for the test peer below before it has
+// keys. On failure the client uses `sendAlert`, which chooses a level.
+void async sendPlainAlert(Transport io, int description) {
+    await io.write(plaintextRecord(ContentType.ALERT,
+        [ALERT_FATAL as byte, description as byte]));
+}
+
+// ---------------------------------------------------------------------------
+// The server handshake: a test peer, not a server
+// ---------------------------------------------------------------------------
+
+// This is not a TLS server. Do not use it as one. This module cannot sign, so
+// `testAccept` sends a CertificateVerify of the correct form with a signature
+// that verifies nothing. Any peer that checks signatures rejects it.
+//
+// It lets the whole module run against itself over loopback, with no network
+// and no external tools. Thus the failure paths of the handshake are testable.
+export type TestConfig {
+    byte[][] certificates;
+    String[] alpn;
+}
+
+export Conn async testAccept(Transport io, TestConfig config) {
+    Transcript t = transcript();
+    Framer f = framer(io);
+
+    byte[] chMsg = await f.expect(HandshakeType.CLIENT_HELLO);
+    ClientHello ch = parseClientHello(messageBody(chMsg));
+    // The first of the two suites that the client offered, so a client without
+    // AES still gets a handshake.
+    int suite = 0;
+    forEach(ch.cipherSuites, s) {
+        if (suite == 0 && (s == TLS_CHACHA20_POLY1305_SHA256
+            || s == TLS_AES_128_GCM_SHA256)) {
+            suite = s;
+        }
+    }
+    if (suite == 0) {
+        return Error("client offers no cipher suite this peer speaks",
+            ErrorCode.HANDSHAKE_FAILURE);
+    }
+    if (ch.keyShare.length != 32) {
+        return Error("client offered no x25519 key share", ErrorCode.HANDSHAKE_FAILURE);
+    }
+    t.push(chMsg);
+
+    byte[] priv = crypto.randomBytes(32);
+    byte[] pub = crypto.x25519PublicKey(priv);
+    byte[] shared = crypto.x25519SharedSecret(priv, ch.keyShare) catch e {
+        return Error("client key share is unusable: " + e.message,
+            ErrorCode.ILLEGAL_PARAMETER);
+    };
+
+    // The first offered protocol that this config also names. This is the
+    // order of the server preference.
+    String selected = "";
+    forEach(config.alpn, mine) {
+        if (selected == "" && array.indexOf(ch.alpn, mine) >= 0) {
+            selected = mine;
+        }
+    }
+
+    Writer sh = writer();
+    sh.u16(VERSION_TLS12);
+    sh.raw(crypto.randomBytes(32));
+    int sid = sh.open8();
+    sh.raw(ch.sessionId);
+    sh.close8(sid);
+    sh.u16(suite);
+    sh.u8(0);
+    int exts = sh.open16();
+    Writer sv = writer();
+    sv.u16(VERSION_TLS13);
+    writeExtension(sh, EXT_SUPPORTED_VERSIONS, sv.out);
+    writeExtension(sh, EXT_KEY_SHARE, keyShareServer(pub));
+    sh.close16(exts);
+
+    byte[] shMsg = handshakeMessage(HandshakeType.SERVER_HELLO, sh.out);
+    t.push(shMsg);
+    await io.write(plaintextRecord(ContentType.HANDSHAKE, shMsg));
+    await io.write(plaintextRecord(ContentType.CHANGE_CIPHER_SPEC, [1]));
+
+    byte[] early = earlySecret(null);
+    byte[] hs = handshakeSecret(early, shared);
+    byte[] clientHs = deriveSecret(hs, "c hs traffic", t.hash());
+    byte[] serverHs = deriveSecret(hs, "s hs traffic", t.hash());
+    RecordProtection out = protectionKeys(serverHs, suite);
+    f.rp = protectionKeys(clientHs, suite);
+
+    Writer ee = writer();
+    int eeExts = ee.open16();
+    if (selected != "") {
+        writeExtension(ee, EXT_ALPN, alpnExtension([selected]));
+    }
+    ee.close16(eeExts);
+    byte[] eeMsg = handshakeMessage(HandshakeType.ENCRYPTED_EXTENSIONS, ee.out);
+    t.push(eeMsg);
+    await io.write(out.seal(ContentType.HANDSHAKE, eeMsg));
+
+    Writer cert = writer();
+    int ctx = cert.open8();
+    cert.close8(ctx);
+    int list = cert.open24();
+    forEach(config.certificates, der) {
+        int one = cert.open24();
+        cert.raw(der);
+        cert.close24(one);
+        int certExts = cert.open16();
+        cert.close16(certExts);
+    }
+    cert.close24(list);
+    byte[] certMsg = handshakeMessage(HandshakeType.CERTIFICATE, cert.out);
+    t.push(certMsg);
+    await io.write(out.seal(ContentType.HANDSHAKE, certMsg));
+
+    // A fake signature. Its length and algorithm are those of a real
+    // RSA-PSS-SHA256 signature, so the parser of the client sees the real form.
+    // Its content is the bare hash, which a verifier rejects.
+    Writer cv = writer();
+    cv.u16(SIG_RSA_PSS_RSAE_SHA256);
+    int sig = cv.open16();
+    cv.raw(crypto.sha256(certificateVerifyContent(SERVER_CV_CONTEXT, t.hash())));
+    cv.close16(sig);
+    byte[] cvMsg = handshakeMessage(HandshakeType.CERTIFICATE_VERIFY, cv.out);
+    t.push(cvMsg);
+    await io.write(out.seal(ContentType.HANDSHAKE, cvMsg));
+
+    byte[] finMsg = handshakeMessage(HandshakeType.FINISHED,
+        finishedVerifyData(serverHs, t.hash()));
+    t.push(finMsg);
+    await io.write(out.seal(ContentType.HANDSHAKE, finMsg));
+
+    byte[] master = masterSecret(hs);
+    byte[] clientAp = deriveSecret(master, "c ap traffic", t.hash());
+    byte[] serverAp = deriveSecret(master, "s ap traffic", t.hash());
+
+    byte[] want = finishedVerifyData(clientHs, t.hash());
+    byte[] clientFin = await f.expect(HandshakeType.FINISHED);
+    if (!string.bytesEqualConstantTime(messageBody(clientFin), want)) {
+        return Error("client Finished does not verify", ErrorCode.DECRYPT_ERROR);
+    }
+
+    f.rp = protectionKeys(clientAp, suite);
+    f.handshaking = false;
+
+    return {
+        in: f,
+        out: protectionKeys(serverAp, suite),
+        io: io,
+        alpn: selected,
+        peerCertificates: [],
+        readSecret: clientAp,
+        writeSecret: serverAp,
+        sentClose: false,
+    };
+}

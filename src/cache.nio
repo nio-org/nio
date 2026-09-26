@@ -1,0 +1,247 @@
+// The object cache: the C runtime, compiled once and kept.
+//
+// Compiling the runtime is half of a small program's build and a quarter of
+// this compiler's. The runtime does not change between builds: the sources
+// come from the bake and the flags from the command line. The cache is one
+// directory per (sources, flags, clang) triple. It holds the runtime tree,
+// with an object beside each file that a build asked for. The tree is written
+// once, so a build does not write the 22 files again.
+//
+// Only builds without --release use the cache. A --release build passes -flto
+// so that clang can inline the runtime into generated code. That needs the C
+// compiled together with the IR. An object compiled before would silently
+// turn the optimization off.
+//
+// Two nio processes can fill one entry at the same time, so a reader must
+// never find a partial file. The tree is built under a temporary name and
+// renamed into place, and so is every object.
+import 'fs';
+import 'path';
+import 'string';
+import 'array';
+import 'process';
+import 'embed/runtime' as rtsrc;
+import 'lib/hash' as hash;
+import 'lib/str' as str;
+import './loader' as loader;
+
+// What a build needs from the cache: where the headers are, and the objects to
+// hand the linker.
+export type Runtime {
+    String dir;
+    String[] objs;
+}
+
+// Where entries live, or null when the platform gives no location for this
+// compiler's data (§6.10: HOME unset). The caller then compiles the sources
+// itself.
+export String? cacheRoot() {
+    String base = path.userData("nio") catch e {
+        return null;
+    };
+    return path.join(base, "cache");
+}
+
+// The name of the entry for one set of build inputs. The key holds everything
+// that changes an object: the sources, the optimization level, the debug flag,
+// the host and clang's version. The version is necessary because an object
+// outlives the compiler that wrote it. No other part of the key changes when
+// the toolchain is upgraded.
+export String key(String level, bool debug, String ident) {
+    uint h = hash.start();
+    h = hash.add(h, level);
+    if (debug) {
+        h = hash.add(h, "-g");
+    }
+    h = hash.add(h, loader.hostOS());
+    h = hash.add(h, ident);
+    forEach(rtsrc.names(), name) {
+        h = hash.add(h, name);
+        String? text = rtsrc.file(name);
+        if (text != null) {
+            h = hash.add(h, text);
+        }
+    }
+    return hash.hex(h);
+}
+
+// Makes every directory on p that is missing. fs.createDir makes one level
+// (§6.11), and the entry sits three deep under a location that may itself not
+// exist yet.
+bool makeDirs(String p) {
+    if (fs.exists(p)) {
+        return true;
+    }
+    String parent = loader.dirOf(p);
+    if (parent != p && parent != "" && !makeDirs(parent)) {
+        return false;
+    }
+    fs.createDir(p) catch e {
+        // Another process can make it between the test and here. That is not a
+        // failure, because the caller needs only that the directory exists.
+        return fs.exists(p);
+    };
+    return true;
+}
+
+// Writes the whole bake into dir. Called on a temporary directory, never on
+// one a build could be reading.
+bool writeTree(String dir) {
+    forEach(rtsrc.names(), name) {
+        String? text = rtsrc.file(name);
+        if (text == null) {
+            return false;
+        }
+        String p = path.join(dir, path.localize(name));
+        String parent = loader.dirOf(p);
+        if (!makeDirs(parent)) {
+            return false;
+        }
+        fs.writeFile(p, string.toByteArray(text)) catch e {
+            return false;
+        };
+    }
+    return true;
+}
+
+// How many entries a machine keeps. A key changes when the runtime sources,
+// the flags or clang change, so entries go stale in groups. The sweep runs
+// when a new entry appears. The newest entries are kept and not the recently
+// used ones: a complete entry is never written again, so its time tells
+// nothing about its last use. Five covers the compiler in development, the
+// installed compiler, and a branch that is left and then used again.
+int const KEEP = 5;
+
+// Deletes all but the KEEP newest entries under root. Every step is best
+// effort, and a failure leaves a usable cache. An entry that another build
+// reads survives the unlink on every target platform but Windows. There the
+// delete fails.
+void prune(String root) {
+    String[] names = fs.readDir(root) catch e {
+        return;
+    };
+    String[] dirs = [];
+    DateTime[] times = [];
+    forEach(names, n) {
+        String p = path.join(root, n);
+        fs.Stat st = fs.stat(p) catch e {
+            continue;
+        };
+        if (!st.isDirectory) {
+            continue;
+        }
+        array.push(dirs, p);
+        array.push(times, st.modified);
+    }
+    if (dirs.length <= KEEP) {
+        return;
+    }
+    // Selection by repeated minimum. The list has five or six entries, and a
+    // sort would need to move the two arrays together.
+    int extra = dirs.length - KEEP;
+    for (int k = 0; k < extra; k++) {
+        int oldest = -1;
+        forEach(dirs, d, i) {
+            if (d != "" && (oldest < 0 || times[i] < times[oldest])) {
+                oldest = i;
+            }
+        }
+        if (oldest < 0) {
+            return;
+        }
+        fs.delete(dirs[oldest], { recursive: true }) catch e { };
+        dirs[oldest] = "";
+    }
+}
+
+// The entry's directory, made if this is the first build to want it. null when
+// the cache cannot be used at all.
+String? entryDir(String root, String name) {
+    String dir = path.join(root, name);
+    if (fs.exists(dir)) {
+        return dir;
+    }
+    if (!makeDirs(root)) {
+        return null;
+    }
+    String tmp = fs.createTempDir("nio-rt-") catch e {
+        return null;
+    };
+    if (!writeTree(tmp)) {
+        fs.delete(tmp, { recursive: true }) catch e { };
+        return null;
+    }
+    fs.rename(tmp, dir) catch e {
+        // Another process finished first. A rename onto a non-empty directory
+        // fails, so the other process's entry stays.
+        fs.delete(tmp, { recursive: true }) catch e2 { };
+        if (fs.exists(dir)) {
+            return dir;
+        }
+        return null;
+    };
+    prune(root);
+    return dir;
+}
+
+// Compiles one source of the tree to the object beside it. The object is
+// written under a temporary name and renamed, so a build that reads it while
+// this one writes it sees the whole file or no file.
+bool async compileOne(String dir, String name, String level, bool debug) {
+    String src = path.join(dir, path.localize(name));
+    String obj = src + ".o";
+    if (fs.exists(obj)) {
+        return true;
+    }
+    String tmp = fs.createTempDir("nio-obj-") catch e {
+        return false;
+    };
+    String staged = path.join(tmp, "o.o");
+    String[] args = [level, "-I", dir, "-c", src, "-o", staged];
+    if (debug) {
+        array.push(args, "-g");
+    }
+    bool ok = false;
+    process.ChildRunResult? r = await process.child.run("clang", args) catch null;
+    if (r != null && r.code == 0) {
+        fs.rename(staged, obj) catch e { };
+        ok = fs.exists(obj);
+    }
+    fs.delete(tmp, { recursive: true }) catch e { };
+    return ok;
+}
+
+// The objects for the runtime files a program links. Any object the cache
+// does not hold yet is compiled. null means that no cache is available. The
+// caller then writes the sources and its clang call compiles them. The
+// finished binary is the same on both paths.
+export Runtime? async runtime(String[] names, String level, bool debug, String ident) {
+    String? rootOpt = cacheRoot();
+    if (rootOpt == null) {
+        return null;
+    }
+    return await runtimeIn(rootOpt, names, level, debug, ident);
+}
+
+// runtime with the root given by the caller. A test uses it with a temporary
+// directory.
+export Runtime? async runtimeIn(String root, String[] names, String level, bool debug,
+    String ident) {
+    String? dirOpt = entryDir(root, key(level, debug, ident));
+    if (dirOpt == null) {
+        return null;
+    }
+    String dir = dirOpt;
+    String[] objs = [];
+    forEach(names, name) {
+        if (!str.hasSuffix(name, ".c")) {
+            continue;
+        }
+        if (!await compileOne(dir, name, level, debug)) {
+            return null;
+        }
+        array.push(objs, path.join(dir, path.localize(name)) + ".o");
+    }
+    Runtime out = { dir: dir, objs: objs };
+    return out;
+}

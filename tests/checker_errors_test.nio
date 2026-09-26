@@ -1,0 +1,321 @@
+// Error handling and fallibility inference. §2.9 makes errors values, and makes
+// the checker work out which functions can fail from their bodies.
+import 'test';
+import 'string';
+import 'array';
+import 'map';
+import './checkerlib' as lib;
+import '../src/types' as types;
+import '../src/ast' as ast;
+
+// This source pins which functions the checker concludes can fail, and which it
+// leaves alone.
+String const INFERENCE_SRC = `
+String raises(int id) {
+    if (id < 0) { return Error("bad"); }
+    return "ok";
+}
+String clean() {
+    return "ok";
+}
+String propagates(int id) {           // calls raises without catching
+    return "hello " + raises(id);
+}
+String handles(int id) {              // catches, so nothing escapes
+    return raises(id) catch "fallback";
+}
+String rethrows(int id) {
+    String s = raises(id) catch e { return e; };
+    return s;
+}
+String deep(int id) {                 // three links up the chain
+    return propagates(id);
+}
+void voidRaiser(int id) {                  // a void function can fail too
+    if (id < 0) { return Error("bad"); }
+}
+String mutualA(int n) {
+    if (n == 0) { return mutualB(n); }
+    return "a";
+}
+String mutualB(int n) {
+    if (n < 0) { return Error("negative"); }
+    return mutualA(n - 1);
+}
+`;
+
+test.start("errors: fallibility inference", void () -> {
+    lib.Checked c = lib.checkProg(INFERENCE_SRC);
+    test.assert(c.errs.length == 0, "unexpected errors:\n" + string.join(c.errs, "\n"));
+    String[] names = [
+        "raises", "clean", "propagates", "handles", "rethrows", "deep",
+        "voidRaiser", "mutualA", "mutualB",
+    ];
+    bool[] want = [true, false, true, false, true, true, true, true, true];
+    for (int i = 0; i < names.length; i++) {
+        types.FuncType? sig = c.info.funcs[names[i]];
+        if (sig == null) {
+            return Error("no signature for \"" + names[i] + "\"");
+        }
+        if (sig.fallible != want[i]) {
+            return Error(names[i] + ": fallible = " + string.from(sig.fallible)
+                + ", want " + string.from(want[i]));
+        }
+    }
+});
+
+// How a fallible signature prints. Diagnostics show this form to the user.
+test.start("errors: fallible type strings", void () -> {
+    lib.Checked c = lib.checkProg(`
+Function(int)<String!> gen;
+Future<int!> fut;
+String maker(int a) {
+    if (a == 0) { return Error("zero"); }
+    return "x";
+}
+`);
+    test.assert(c.errs.length == 0, "unexpected errors:\n" + string.join(c.errs, "\n"));
+    test.expectString(declType(c, "gen"), "Function(int)<String!>");
+    test.expectString(declType(c, "fut"), "Future<int!>");
+    types.FuncType? maker = c.info.funcs["maker"];
+    if (maker == null) {
+        return Error("no signature for maker");
+    }
+    test.expectString(types.typeString(maker), "Function(int)<String!>");
+});
+
+// Info is keyed by node id, so the lookup goes through the declaration.
+String declType(lib.Checked c, String name) {
+    forEach(c.prog.statements, s) {
+        ast.VarDeclStatement? d = s as ast.VarDeclStatement;
+        if (d != null && d.name == name) {
+            types.Type? t = c.info.declTypes[d.id];
+            if (t != null) {
+                return types.typeString(t);
+            }
+        }
+    }
+    return "";
+}
+
+test.start("errors: valid error handling", void () -> {
+    lib.accepts([
+        lib.ok("default form",
+            `
+String f(int a) { if (a < 0) { return Error("neg"); } return "x"; }
+String s = f(1) catch "fallback";
+printInline(s);`),
+        lib.ok("default form nests",
+            `
+String f(int a) { if (a < 0) { return Error("neg"); } return "x"; }
+printInline((f(1) catch "d") + "!");`),
+        lib.ok("block form leaves the scope",
+            `
+String f(int a) { if (a < 0) { return Error("neg"); } return "x"; }
+String g(int a) {
+    String s = f(a) catch e { printInline(e.message); return "unknown"; };
+    return s;
+}
+printInline(g(1));`),
+        lib.ok("block form falls through into an optional",
+            `
+String f(int a) { if (a < 0) { return Error("neg"); } return "x"; }
+String? s = f(-1) catch e { printInline(e.message); };
+printInline(s);`),
+        lib.ok("catch null with no handler",
+            `
+String f(int a) { if (a < 0) { return Error("neg"); } return "x"; }
+String? s = f(-1) catch null;
+printInline(s);`),
+        lib.ok("statement position may fall through",
+            `
+String f(int a) { if (a < 0) { return Error("neg"); } return "x"; }
+f(-1) catch e { printInline(e.message); };`),
+        lib.ok("one catch covers a whole expression",
+            `
+String f(int a) { if (a < 0) { return Error("neg"); } return "x"; }
+String g(int a) { if (a > 9) { return Error("big"); } return "y"; }
+String s = f(1) + g(2) catch "fallback";
+printInline(s);`),
+        lib.ok("uncaught propagates without complaint",
+            `
+String f(int a) { if (a < 0) { return Error("neg"); } return "x"; }
+String g(int a) { return f(a); }
+printInline(g(1) catch "d");`),
+        lib.ok("uncaught at top level is allowed",
+            `
+String f(int a) { if (a < 0) { return Error("neg"); } return "x"; }
+printInline(f(1));`),
+        lib.ok("error binding is a record with a message",
+            `
+String f() { return Error("neg"); }
+String? s = f() catch e { printInline(e.message + "!"); };
+printInline(s);`),
+        lib.ok("fallible function value",
+            `
+Function(int)<String!> gen = String (int id) -> {
+    if (id == 0) { return Error("bad seed"); }
+    return "Jack";
+};
+printInline(gen(1) catch "anonymous");`),
+        lib.ok("infallible body adopts a fallible contract",
+            `
+Function(int)<String!> gen = String (int id) -> "always";
+printInline(gen(1) catch "anonymous");`),
+        lib.ok("fallible async and future",
+            `
+String async fetch(int id) {
+    if (id < 0) { return Error("bad id"); }
+    return "remote";
+}
+printInline(await fetch(1) catch "offline");
+Future<String!> p = fetch(-1);
+printInline(await p catch "offline");`),
+        lib.ok("Error is a usable type",
+            `
+Error e = Error("boom");
+printInline(e.message);`),
+        lib.ok("a function may return an Error as a value",
+            `
+Error make() { return Error("boom"); }
+printInline(make().message);`),
+        lib.ok("catch inside a lambda binds to the lambda",
+            `
+String f(int a) { if (a < 0) { return Error("neg"); } return "x"; }
+Function()<String> g = String () -> f(-1) catch "handled";
+printInline(g());`),
+    ]);
+});
+
+test.start("errors: error handling errors", void () -> {
+    lib.rejects([
+        lib.bad("catch on an infallible call",
+            `
+String f() { return "x"; }
+String s = f() catch "d";
+printInline(s);`,
+            "nothing in this expression can fail"),
+        lib.bad("catch on a plain expression",
+            `
+String s = "a" catch "d";
+printInline(s);`,
+            "nothing in this expression can fail"),
+        lib.bad("block falls through with a plain target",
+            `
+String f(int a) { if (a < 0) { return Error("neg"); } return "x"; }
+String s = f(-1) catch e { printInline(e.message); };
+printInline(s);`,
+            "falls through"),
+        lib.bad("default of the wrong type",
+            `
+String f(int a) { if (a < 0) { return Error("neg"); } return "x"; }
+String s = f(-1) catch 42;
+printInline(s);`,
+            "cannot use int as the default for String"),
+        lib.bad("Error takes a String",
+            `
+String f() { return Error(42); }
+printInline(f() catch "d");`,
+            "Error takes a String message"),
+        lib.bad("Error takes at most two arguments",
+            `
+String f() { return Error("a", 1, 2); }
+printInline(f() catch "d");`,
+            "Error takes 1 or 2 arguments"),
+        lib.bad("an Error code is a number",
+            `
+String f() { return Error("a", "b"); }
+printInline(f() catch "d");`,
+            "an Error code must be an int or an enum member"),
+        lib.bad("Error is reserved",
+            `
+int Error = 3;
+printInline(Error);`,
+            "reserved name"),
+        lib.bad("fallible value needs a fallible type",
+            `
+Function(int)<String> gen = String (int id) -> {
+    if (id == 0) { return Error("bad seed"); }
+    return "Jack";
+};
+printInline(gen(1));`,
+            "must say so"),
+        lib.bad("fallible future needs the marker",
+            `
+String async fetch(int id) {
+    if (id < 0) { return Error("bad id"); }
+    return "remote";
+}
+Future<String> p = fetch(1);
+printInline(await p catch "d");`,
+            "cannot use Future<String!> as Future<String>"),
+        lib.bad("void call has no default",
+            `
+void run(int a) { if (a < 0) { return Error("neg"); } }
+run(-1) catch "d";`,
+            "nothing for a default to replace"),
+        lib.bad("catch binding may not be a reserved name",
+            `
+String f() { return Error("neg"); }
+String? s = f() catch print { };
+printInline(s);`,
+            "reserved name"),
+        lib.bad("catch binding may not shadow a module alias",
+            `
+import 'json' as j;
+String f() { return Error("neg"); }
+String? s = f() catch j { };
+printInline(s);`,
+            "already used as a module name"),
+        lib.bad("async.run rejects a fallible future",
+            `
+import 'async';
+String async fetch(int id) {
+    if (id < 0) { return Error("bad id"); }
+    return "remote";
+}
+async.run(fetch(1), void (String s) -> printInline(s));`,
+            "cannot be a fallible future"),
+    ]);
+});
+
+test.start("errors: a catch block is visible to statement walks", void () -> {
+    lib.rejects([
+        lib.bad("break outside a loop is still caught",
+            `
+String f() { return Error("neg"); }
+String? s = f() catch e { break; };
+printInline(s);`,
+            "break outside a loop"),
+        lib.bad("continue outside a loop is still caught",
+            `
+String f() { return Error("neg"); }
+String? s = f() catch e { continue; };
+printInline(s);`,
+            "continue outside a loop"),
+        lib.bad("an assignment in a handler un-narrows",
+            `
+String f() { return Error("neg"); }
+String? name = "start";
+while (true) {
+    if (name != null) {
+        String? got = f() catch e { name = null; };
+        printInline(name + "!");                   // name is String? again here
+    }
+    break;
+}`,
+            "operator + is not defined on String? and String"),
+    ]);
+});
+
+test.start("errors: a hole in a string names the hole, not the alias it calls through", void () -> {
+    // The parser desugars `${p}` into a call through ast.templateAlias (§1.6).
+    // A program does not write that name, so no diagnostic may show it.
+    lib.Checked c = lib.checkProg(`type P { int x; }
+P p = { x: 1 };
+String s = \`v=\${p}\`;
+`);
+    test.expectInt(c.errs.length, 1);
+    test.assert(string.contains(c.errs[0], "the value in ${}: cannot use P"), c.errs[0]);
+    test.assert(!string.contains(c.errs[0], ast.templateAlias), c.errs[0]);
+});

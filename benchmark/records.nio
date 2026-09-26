@@ -1,0 +1,40 @@
+// Allocates nested records in a hot loop. It measures record allocation and
+// field access. A ring buffer keeps recent segments alive, so the optimizer
+// cannot remove the work. Evicted segments become garbage.
+type Point {
+    int x;
+    int y;
+}
+
+type Segment {
+    Point a;
+    Point b;
+}
+
+Segment makeSegment(int i) {
+    return {
+        a: { x: i % 1000, y: (i * 7) % 1000 },
+        b: { x: (i * 13) % 1000, y: (i * 31) % 1000 },
+    };
+}
+
+int length2(Segment s) {
+    int dx = s.b.x - s.a.x;
+    int dy = s.b.y - s.a.y;
+    return dx * dx + dy * dy;
+}
+
+int n = 2000000;
+Segment[] recent = [makeSegment(0), makeSegment(0), makeSegment(0), makeSegment(0)];
+int checksum = 0;
+int i = 0;
+
+while (i < n) {
+    Segment s = makeSegment(i);
+    checksum = (checksum + length2(s)) % 1000000007;
+    recent[i % 4] = s;
+    i = i + 1;
+}
+
+print(checksum);
+print(length2(recent[n % 4]));

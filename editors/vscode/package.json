@@ -1,0 +1,91 @@
+{
+  "name": "nio",
+  "displayName": "Nio",
+  "description": "Syntax highlighting, diagnostics, hover, completion and go-to-definition for the Nio programming language.",
+  "version": "0.1.0",
+  "publisher": "nio-lang",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nio-org/nio.git",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "nio",
+    "llvm",
+    "compiled"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "nio",
+        "aliases": [
+          "Nio",
+          "nio"
+        ],
+        "extensions": [
+          ".nio"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "nio",
+        "scopeName": "source.nio",
+        "path": "./syntaxes/nio.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Nio",
+      "properties": {
+        "nio.server.path": {
+          "type": "string",
+          "default": "nio",
+          "markdownDescription": "The `nio` compiler that serves this workspace, found on `PATH` by default. The extension bundles no compiler of its own: one a release behind would report errors from a different language than the one compiling your code.\n\n`${workspaceFolder}` is expanded, which is what to use when working on the compiler itself — `${workspaceFolder}/nio` serves the build in the workspace rather than whichever one is installed.",
+          "scope": "machine-overridable"
+        },
+        "nio.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Log the conversation with the language server to its output channel. For debugging the server itself.",
+          "scope": "window"
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "nio.restartServer",
+        "title": "Restart Language Server",
+        "category": "Nio"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "vscode:prepublish": "npm run typecheck && node esbuild.mjs --production"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^10.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.91.0",
+    "esbuild": "^0.28.1",
+    "typescript": "^5.5.0"
+  }
+}

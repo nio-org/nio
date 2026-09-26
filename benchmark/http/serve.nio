@@ -1,0 +1,43 @@
+// The Nio side of the HTTP server benchmark: three routes over keep-alive
+// connections. It binds port 0 and prints the port, so no fixed port is needed.
+import 'http';
+import 'json';
+import 'string';
+import 'process';
+
+type Message {
+    String message;
+}
+
+http.Server s = http.server();
+
+http.Response plaintext(http.Request req) {
+    return http.text(200, "Hello, World!");
+}
+
+http.Response jsonMessage(http.Request req) {
+    Message m = { message: "Hello, World!" };
+    return http.json(200, json.toText(m));
+}
+
+http.Response showUser(http.Request req) {
+    String? id = req.params["id"];
+    if (id == null) { return http.text(400, "missing id"); }
+    return http.text(200, "user " + id);
+}
+
+void async main() {
+    s.route(http.Method.GET, "/plaintext", http.Response (http.Request r) -> plaintext(r));
+    s.route(http.Method.GET, "/json", http.Response (http.Request r) -> jsonMessage(r));
+    s.route(http.Method.GET, "/users/:id", http.Response (http.Request r) -> showUser(r));
+
+    int port = s.bind("127.0.0.1", 0, null);
+    print(string.from(port));
+    process.stdout.flush();
+
+    await s.serve();
+}
+
+await main() catch e {
+    print("failed: " + e.message);
+};

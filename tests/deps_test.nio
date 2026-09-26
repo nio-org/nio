@@ -1,0 +1,286 @@
+// Packages: the manifest, and the versions a build resolves from it.
+//
+// These cases touch no disk. Resolution is a pure function of the manifests:
+// it gives the same answer on every machine, in any order, with no network.
+// The cases that read a package tree are in modules_test.nio, beside the other
+// module loading.
+import 'test';
+import 'string';
+import 'array';
+import '../src/deps' as deps;
+
+// A band is computed from the version and is not written anywhere. An author
+// needs no `/v2` path suffix for a new major version.
+test.start("deps: a band is semver read literally", void () -> {
+    test.expectString(deps.band("v1.2.3"), "v1");
+    test.expectString(deps.band("v1.9.0"), "v1");
+    // Below 1.0 a minor version counts as a major version. Cargo uses the
+    // same rule.
+    test.expectString(deps.band("v0.2.4"), "v0.2");
+    test.expectString(deps.band("v0.3.0"), "v0.3");
+    test.expectString(deps.band("v0.0.9"), "v0.0");
+    test.expectString(deps.band("nonsense"), "");
+});
+
+test.start("deps: a version is exact, and carries its v", void () -> {
+    test.expectBool(deps.validVersion("v1.2.3"), true);
+    test.expectBool(deps.validVersion("v0.0.0"), true);
+    // A tag is written with its `v`, and a range is not a version at all.
+    test.expectBool(deps.validVersion("1.2.3"), false);
+    test.expectBool(deps.validVersion("v1.2"), false);
+    test.expectBool(deps.validVersion("v1.2.3.4"), false);
+    test.expectBool(deps.validVersion("^v1.2.3"), false);
+    test.expectBool(deps.validVersion("vx.y.z"), false);
+});
+
+// Versions compare by number: v0.2.10 is newer than v0.2.5. String order gets
+// this backwards. MVS uses this order to pick the newest version in a band.
+test.start("deps: versions compare by number", void () -> {
+    test.expectInt(deps.compare("v0.2.5", "v0.2.10"), -1);
+    test.expectInt(deps.compare("v0.2.10", "v0.2.5"), 1);
+    test.expectInt(deps.compare("v1.0.0", "v1.0.0"), 0);
+    test.expectInt(deps.compare("v2.0.0", "v1.9.9"), 1);
+});
+
+test.start("deps: a manifest reads its directives", void () -> {
+    deps.Manifest m = deps.parse("package notes\n"
+        + "entry main.nio\n"
+        + "\n"
+        + "require 'github.com/nio-lang/nio-log' v0.2.0 as log;   // trailing prose\n"
+        + "require 'github.com/someone/nio-sqlite' v1.2.0 as sqlite;\n"
+        + "\n"
+        + "// resolved -- maintained by nio, do not edit\n"
+        + "resolved 'github.com/nio-lang/nio-log' v0.2.0 sha256:abc;\n", "nio.deps");
+    test.expectInt(m.errs.length, 0);
+    test.expectString(m.name, "notes");
+    test.expectString(m.entry, "main.nio");
+    test.expectInt(m.requires.length, 2);
+    test.expectString(m.requires[0].pkg, "github.com/nio-lang/nio-log");
+    test.expectString(m.requires[0].version, "v0.2.0");
+    test.expectString(m.requires[0].alias, "log");
+    test.expectString(m.requires[1].alias, "sqlite");
+    test.expectInt(m.resolved.length, 1);
+    test.expectString(m.resolved[0].hash, "sha256:abc");
+});
+
+// A package with no `entry` presents lib.nio, so the common package writes one
+// line and the import names the alias alone.
+test.start("deps: a manifest without an entry presents lib.nio", void () -> {
+    deps.Manifest m = deps.parse("package nio-log\n", "nio.deps");
+    test.expectInt(m.errs.length, 0);
+    test.expectString(m.entry, "lib.nio");
+});
+
+test.start("deps: a manifest reports what it cannot read", void () -> {
+    deps.Manifest m = deps.parse("require 'x' ^v1.0.0 as x;\n", "nio.deps");
+    test.expectInt(m.errs.length, 1);
+    test.assert(string.contains(m.errs[0], "because nothing here is a range"),
+        "a range should be named as the reason: " + m.errs[0]);
+
+    deps.Manifest bad = deps.parse("require 'x' v1.0.0;\n", "nio.deps");
+    test.expectInt(bad.errs.length, 1);
+    test.assert(string.contains(bad.errs[0], "as <alias>"), bad.errs[0]);
+
+    deps.Manifest unknown = deps.parse("wibble 'x';\n", "nio.deps");
+    test.expectInt(unknown.errs.length, 1);
+    test.assert(string.contains(unknown.errs[0], "unknown directive"), unknown.errs[0]);
+
+    // The line is named, since a manifest is edited by hand.
+    test.assert(string.contains(m.errs[0], "nio.deps:1:"), m.errs[0]);
+});
+
+// An alias is what an import writes, so it is short: the last segment of the
+// path, without the `nio-` a package named for its language carries.
+test.start("deps: an alias is derived from the package path", void () -> {
+    test.expectString(deps.aliasFor("github.com/nio-lang/nio-log"), "log");
+    test.expectString(deps.aliasFor("github.com/someone/nio-sqlite"), "sqlite");
+    test.expectString(deps.aliasFor("github.com/pkg/errors"), "errors");
+    // A name that would not be an identifier keeps its segment, spelled so it
+    // is one.
+    test.expectString(deps.aliasFor("github.com/a/some-thing"), "some_thing");
+    test.expectString(deps.aliasFor("github.com/a/nio-"), "nio_");
+});
+
+// A person writes everything above the resolved block, so a rewrite leaves it
+// unchanged.
+test.start("deps: a requirement is added without disturbing the file", void () -> {
+    String before = "package notes\n"
+        + "\n"
+        + "// what we depend on\n"
+        + "require 'github.com/a/one' v1.0.0 as one;\n";
+    String after = deps.withRequire(before, "github.com/b/two", "v2.1.0", "two");
+    test.assert(string.contains(after, "// what we depend on"), "the comment survives");
+    test.assert(string.contains(after, "require 'github.com/a/one' v1.0.0 as one;"), after);
+    test.assert(string.contains(after, "require 'github.com/b/two' v2.1.0 as two;"), after);
+});
+
+// `nio update` moves only within a band. A new band is a different package,
+// so the user must choose it explicitly.
+test.start("deps: an update picks the newest version of the same band", void () -> {
+    String[] vs = ["v1.2.4", "v1.10.0", "v2.0.0", "v1.2.2", "v0.9.9"];
+    // Numeric, so v1.10.0 is newer than v1.2.4, and v2.0.0 is another band.
+    test.expectString(deps.newestInBand("v1.2.3", vs), "v1.10.0");
+    // Below 1.0 a minor is a band of its own.
+    String[] zero = ["v0.3.0", "v0.2.9", "v0.2.10", "v1.0.0"];
+    test.expectString(deps.newestInBand("v0.2.4", zero), "v0.2.10");
+    // An update never moves down. A band with only older versions changes
+    // nothing.
+    String[] older = ["v1.2.2", "v1.0.0"];
+    test.expectString(deps.newestInBand("v1.2.3", older), "v1.2.3");
+    String[] none = [];
+    test.expectString(deps.newestInBand("v1.2.3", none), "v1.2.3");
+
+    // A later band is reported and not taken, and an earlier one is neither.
+    test.expectString(deps.newestInLaterBand("v1.2.3", vs), "v2.0.0");
+    test.expectString(deps.newestInLaterBand("v0.2.4", zero), "v1.0.0");
+    test.expectString(deps.newestInLaterBand("v1.2.3", older), "");
+    String[] earlier = ["v0.9.9", "v1.2.9"];
+    test.expectString(deps.newestInLaterBand("v1.2.3", earlier), "");
+});
+
+// One line of git's pkt-line framing: its length in four hex digits, the four
+// included, then the line.
+String pkt(String line) {
+    String digits = "0123456789abcdef";
+    int n = string.length(line) + 4;
+    String out = "";
+    for (int shift = 12; shift >= 0; shift = shift - 4) {
+        int d = (n >> shift) & 15;
+        out = out + string.substring(digits, d, d + 1);
+    }
+    return out + line;
+}
+
+byte[] advertisement() {
+    String id = "87f8819acf6dc28bf5d3c14b334268236d686f48";
+    // A repository using SHA-256 names its objects in 64 digits.
+    String id256 = "d56363987d920ee146a4d2a09f04dfa2c5e4ab9dd56363987d920ee146a4d2a0";
+    return string.toByteArray(pkt("# service=git-upload-pack\n") + "0000"
+        + pkt(id + " HEAD\0multi_ack thin-pack symref=HEAD:refs/heads/main\n")
+        + pkt(id + " refs/heads/main\n")
+        + pkt(id + " refs/pull/12/head\n")
+        + pkt(id + " refs/tags/v0.1.0\n")
+        + pkt(id + " refs/tags/v0.1.0^{}\n")
+        + pkt(id + " refs/tags/v0.2.0-rc1\n")
+        + pkt(id + " refs/tags/latest\n")
+        + pkt(id + " refs/tags/v1.0\n")
+        + pkt(id256 + " refs/tags/v0.2.0\n")
+        + "0000");
+}
+
+String refusal(byte[] body) {
+    String[] got = deps.advertisedVersions(body) catch e {
+        return e.message;
+    };
+    return "";
+}
+
+// Versions come from git's own endpoint, which every git host serves. Only a
+// tag that is a version counts: branches, pull requests, peeled duplicates,
+// pre-releases and two-number tags are all in a real advertisement and none
+// is something a manifest can name.
+test.start("deps: versions are read from a ref advertisement", void () -> {
+    String[] got = deps.advertisedVersions(advertisement());
+    test.expectString(string.join(got, ","), "v0.1.0,v0.2.0");
+});
+
+// The body comes from a host. A malformed one is refused and never read past
+// its end.
+test.start("deps: a malformed ref advertisement is refused", void () -> {
+    test.expectString(refusal(string.toByteArray("")), "the answer is not a git ref advertisement");
+    test.assert(refusal(string.toByteArray("<!DOCTYPE html>")) != "", "an HTML page is not an advertisement");
+    test.expectString(refusal(string.toByteArray(pkt("hello\n"))),
+        "the answer is not a git ref advertisement");
+    test.expectString(refusal(string.toByteArray(pkt("# service=git-upload-pack\n") + "0040abc")),
+        "the ref advertisement ends inside a line");
+    test.expectString(refusal(string.toByteArray(pkt("# service=git-upload-pack\n") + "00")),
+        "the ref advertisement ends inside a line length");
+    // Every prefix is answered or refused. An index past the end would be a
+    // runtime error and stop the suite here.
+    byte[] body = advertisement();
+    for (int i = 0; i < body.length; i++) {
+        refusal(array.slice(body, 0, i));
+    }
+});
+
+// A manifest may require two bands of one package under two aliases, so an
+// update rewrites the one line it means, and only its version word.
+test.start("deps: an update rewrites one requirement's version in place", void () -> {
+    String before = "package notes\n"
+        + "require 'github.com/a/log' v0.1.0 as oldlog;\n"
+        + "require   'github.com/a/log'  v0.2.0 as log;   // the current one\n";
+    deps.Manifest m = deps.parse(before, "nio.deps");
+    test.expectInt(m.requires.length, 2);
+    String after = deps.withVersionAt(before, m.requires[1], "v0.2.7");
+    test.expectString(after, "package notes\n"
+        + "require 'github.com/a/log' v0.1.0 as oldlog;\n"
+        + "require   'github.com/a/log'  v0.2.7 as log;   // the current one\n");
+});
+
+// `unify` and `replace` are read in every manifest, one per package.
+test.start("deps: a manifest reads unify and replace", void () -> {
+    deps.Manifest m = deps.parse("package notes\n"
+        + "unify 'github.com/a/nio-log' v0.2.5;\n"
+        + "replace 'github.com/a/nio-fmt' with 'github.com/me/nio-fmt' v1.0.3;\n"
+        + "replace 'github.com/a/nio-web' with '../nio-web';\n", "nio.deps");
+    test.expectInt(m.errs.length, 0);
+    test.expectInt(m.directives.length, 3);
+    test.expectString(m.directives[0].kind, "unify");
+    test.expectString(m.directives[0].version, "v0.2.5");
+    test.expectString(m.directives[1].withPkg, "github.com/me/nio-fmt");
+    test.expectString(m.directives[1].version, "v1.0.3");
+    test.expectString(m.directives[2].dir, "../nio-web");
+
+    deps.Manifest bad = deps.parse("unify 'x' v1;\n"
+        + "replace 'y' with 'github.com/z';\n"
+        + "replace 'w' with './a';\n"
+        + "unify 'w' v1.0.0;\n", "nio.deps");
+    test.expectInt(bad.errs.length, 3);
+    test.assert(string.contains(bad.errs[0], "not a version"), bad.errs[0]);
+    test.assert(string.contains(bad.errs[1], "names its version"), bad.errs[1]);
+    test.assert(string.contains(bad.errs[2], "already has a directive, on line 3"), bad.errs[2]);
+});
+
+// A requirement is read through the entry manifest's directives: a replacement
+// first, then a unify of whatever package that is.
+test.start("deps: a requirement leads where the directives say", void () -> {
+    deps.Manifest m = deps.parse("package notes\n"
+        + "unify 'log' v0.2.5;\n"
+        + "replace 'fmt' with 'my-fmt' v1.0.3;\n"
+        + "unify 'my-fmt' v1.1.0;\n"
+        + "replace 'web' with './web';\n", "nio.deps");
+    test.expectInt(m.errs.length, 0);
+    deps.Resolution res = deps.resolve("/project", m);
+
+    deps.Target log = deps.targetOf(res, "log", "v0.1.4");
+    test.expectString(log.pkg + " " + log.version + " " + log.band, "log v0.2.5 v0.2");
+    deps.Target fmt = deps.targetOf(res, "fmt", "v0.9.0");
+    test.expectString(fmt.pkg + " " + fmt.version + " " + fmt.band, "my-fmt v1.1.0 v1");
+    deps.Target web = deps.targetOf(res, "web", "v2.0.0");
+    test.expectString(web.band, deps.LOCAL);
+    test.assert(string.contains(web.dir, "web"), web.dir);
+    deps.Target other = deps.targetOf(res, "other", "v3.1.0");
+    test.expectString(other.pkg + " " + other.version, "other v3.1.0");
+});
+
+test.start("deps: the resolved block is rewritten whole", void () -> {
+    String before = "package notes\n"
+        + "require 'github.com/a/one' v1.0.0 as one;\n"
+        + "\n"
+        + "// resolved -- maintained by nio, do not edit\n"
+        + "resolved 'github.com/a/one' v0.9.0 sha256:stale;\n";
+    deps.Resolved r = { pkg: "github.com/a/one", version: "v1.0.0", hash: "sha256:fresh", line: 0 };
+    deps.Resolved[] rs = [];
+    array.push(rs, r);
+    String after = deps.withResolved(before, rs);
+    test.assert(!string.contains(after, "sha256:stale"), after);
+    test.assert(string.contains(after, "resolved 'github.com/a/one' v1.0.0 sha256:fresh;"), after);
+    // The file holds one resolved block.
+    test.expectInt(string.split(after, "// resolved").length, 2);
+
+    // What was written must read back.
+    deps.Manifest m = deps.parse(after, "nio.deps");
+    test.expectInt(m.errs.length, 0);
+    test.expectInt(m.resolved.length, 1);
+    test.expectString(m.resolved[0].hash, "sha256:fresh");
+});

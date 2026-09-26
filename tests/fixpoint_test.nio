@@ -1,0 +1,137 @@
+// The compiler builds itself in three stages and must reach a fixpoint:
+//
+//	clang over bootstrap/nio.ll  ->  nio0     (no compiler needed)
+//	nio0 builds src/nio.nio      ->  nio1
+//	nio1 builds src/nio.nio      ->  nio2
+//
+// nio1 and nio2 must be the same binary. The test does not compare nio0. It
+// comes from IR with no target attributes, so its binary is always different.
+// What it builds must match.
+//
+// Every stage is a --release build, because bootstrap/build.sh does one and the
+// compiler ships that way. The -O0 build of the edit loop is cheaper, but no
+// user installs it.
+//
+// It costs most of a minute, nearly all of it clang.
+import 'test';
+import 'string';
+import 'fs';
+import 'path';
+import './harness' as h;
+import './repo' as repo;
+import '../src/driver' as driver;
+
+// Every stage links under this leaf name, each in its own directory.
+// macOS folds the leaf name into the Mach-O LC_UUID and the ad-hoc signature
+// covers it, so two names give identical content a 49-byte difference.
+String const STAGE_NAME = "nio";
+
+String stageDir(String root, String name) {
+    String d = path.join(root, name);
+    fs.createDir(d);
+    // Windows adds .exe to every stage alike, so the leaf names still agree.
+    return driver.exeName(path.join(d, STAGE_NAME));
+}
+
+void buildStage(String compiler, String out, String label) {
+    h.Run r = h.runBinary(compiler, ["build", "--release", repo.at("src/nio.nio"), "-o", out]);
+    if (r.code != 0) {
+        return Error(label + ": exit status " + string.from(r.code) + "\n" + r.err);
+    }
+}
+
+// Gets from one compiler the IR of the compiler's own source. The test compares
+// the IR before the binaries, because the IR shows the line where a drift
+// starts.
+String emitSelf(String compiler) {
+    h.Run r = h.runBinary(compiler, ["emit", repo.at("src/nio.nio")]);
+    if (r.code != 0) {
+        return Error("emit: exit status " + string.from(r.code) + "\n" + r.err);
+    }
+    return r.out;
+}
+
+// Reads a built compiler as bytes into a String, so the comparison is one
+// memcmp and not two million element reads.
+String read(String p) {
+    return string.fromByteArray(fs.readFile(p));
+}
+
+// Says how two binaries differ. A handful of bytes in the header is a linker
+// artifact; a spread through the text section is the compiler.
+String diffBytes(String a, String b) {
+    if (string.length(a) != string.length(b)) {
+        return "lengths differ: " + string.from(string.length(a)) + " and "
+            + string.from(string.length(b)) + " bytes";
+    }
+    byte[] x = string.toByteArray(a);
+    byte[] y = string.toByteArray(b);
+    int first = -1;
+    int n = 0;
+    for (int i = 0; i < x.length; i++) {
+        if (x[i] != y[i]) {
+            if (first < 0) {
+                first = i;
+            }
+            n++;
+        }
+    }
+    if (n == 0) {
+        return "identical";
+    }
+    return string.from(n) + " of " + string.from(x.length)
+        + " bytes differ, first at offset " + string.from(first);
+}
+
+String firstDiffLine(String got, String want) {
+    String[] g = string.split(got, "\n");
+    String[] w = string.split(want, "\n");
+    int n = g.length;
+    if (w.length < n) {
+        n = w.length;
+    }
+    for (int i = 0; i < n; i++) {
+        if (g[i] != w[i]) {
+            return "first differing at line " + string.from(i + 1)
+                + "\n  one: " + g[i] + "\n  two: " + w[i];
+        }
+    }
+    return "one is " + string.from(g.length) + " lines and the other "
+        + string.from(w.length);
+}
+
+test.start("fixpoint: the compiler builds itself, twice, to the same binary", void () -> {
+    String root = h.scratch();
+
+    // Stage 0 uses the checked-in script, so this test also tests the script.
+    String boot = stageDir(root, "boot");
+    h.Run bs = h.runBinary("sh", [repo.at("bootstrap/build.sh"), boot]);
+    if (bs.code != 0) {
+        return Error("bootstrap (clang builds nio0): exit status "
+            + string.from(bs.code) + "\n" + bs.err + bs.out);
+    }
+
+    String stage1 = stageDir(root, "stage1");
+    String stage2 = stageDir(root, "stage2");
+    buildStage(boot, stage1, "stage 1 (nio0 builds nio1)");
+    buildStage(stage1, stage2, "stage 2 (nio1 builds nio2)");
+
+    String ir1 = emitSelf(stage1);
+    String ir2 = emitSelf(stage2);
+    if (ir1 != ir2) {
+        return Error("stage 1 and stage 2 emit different IR for the compiler's own source: "
+            + firstDiffLine(ir1, ir2));
+    }
+
+    String bin1 = read(stage1);
+    String bin2 = read(stage2);
+    if (bin1 != bin2) {
+        return Error("fixpoint: stage 1 and stage 2 are different binaries -- "
+            + diffBytes(bin1, bin2));
+    }
+
+    // A compiler that emits nothing would satisfy every comparison above.
+    test.assert(string.length(ir1) > 1000000,
+        "the compiler emitted only " + string.from(string.length(ir1))
+        + " bytes of IR for its own source");
+});

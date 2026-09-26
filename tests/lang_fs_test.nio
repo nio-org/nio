@@ -1,0 +1,948 @@
+// The fs, os and path modules, end to end: the tests that need a real directory.
+// Nio cannot compute the expected results itself, so each case checks a fixed
+// result or a property.
+import 'test';
+import 'string';
+import 'array';
+import 'json';
+import 'fs';
+import 'os';
+import 'path';
+import 'time';
+import './harness' as h;
+import './repo' as repo;
+import './bytes' as bytes;
+import '../src/loader' as loader;
+import '../src/lib/quote' as quote;
+import '../src/lib/str' as str;
+
+// A path put into the source of a program, quoted as §1.6 requires.
+String at(String dir, String name) {
+    return quote.quote(path.join(dir, name));
+}
+
+String only(String p) {
+    return quote.quote(p);
+}
+
+// §6.11 has no symlink and no chmod, so these run shell commands. Neither is
+// portable, and no test that uses them runs on Windows.
+void link(String target, String where) {
+    h.Run r = h.runBinary("ln", ["-s", target, where]);
+    if (r.code != 0) {
+        return Error("ln -s failed: " + r.err);
+    }
+}
+
+void chmod(String mode, String p) {
+    h.Run r = h.runBinary("chmod", [mode, p]);
+    if (r.code != 0) {
+        return Error("chmod " + mode + " failed: " + r.err);
+    }
+}
+
+// Root gets no permission errors, so a test that expects one cannot run as
+// root.
+bool isRoot() {
+    h.Run r = h.runBinary("id", ["-u"]);
+    return string.trim(r.out) == "0";
+}
+
+// ---- path.join ----
+
+// The golden file holds the reference results of a path join. It is the only
+// reference for the join of §6.10.
+test.start("path: join matches the reference corpus", void () -> {
+    int n = 0;
+    forEach(string.split(repo.readText("tests/golden/path_join_cases.txt"), "\n"), line) {
+        if (string.length(line) == 0 || line[0] == 35) {    // '#'
+            continue;
+        }
+        String[] halves = string.split(line, "\t");
+        if (halves.length != 2) {
+            return Error("malformed golden line: " + line);
+        }
+        String[] elems = [];
+        forEach(string.split(halves[0], " "), f) {
+            array.push(elems, bytes.unhex(f));
+        }
+        String want = bytes.unhex(halves[1]);
+        // One element also goes through join, because join cleans the path.
+        String got = path.join(elems[0]);
+        for (int i = 1; i < elems.length; i++) {
+            got = path.join(got, elems[i]);
+        }
+        // The corpus holds the results on a POSIX host. Windows writes its
+        // own separator into the same shape.
+        if (loader.hostOS() == "windows") {
+            got = string.replaceAll(got, "\\", "/");
+        }
+        if (got != want) {
+            return Error("join of " + json.toText(elems) + " = \"" + got + "\", want \""
+                + want + "\"");
+        }
+        n++;
+    }
+    test.assert(n >= 20, "the corpus has shrunk to " + string.from(n) + " cases");
+});
+
+// localize changes separators and does not clean. The host separator comes
+// from localize itself, so the test checks only the shape.
+test.start("path: localize", void () -> {
+    String s = path.localize("/");
+    test.expectInt(string.length(s), 1);
+    test.expectString(path.localize("./thisdir/file"), "." + s + "thisdir" + s + "file");
+    test.expectString(path.localize(".\\thisdir\\file"), "." + s + "thisdir" + s + "file");
+    test.expectString(path.localize("a\\b/c"), "a" + s + "b" + s + "c");
+    test.expectString(path.localize("a//b"), "a" + s + s + "b");
+    test.expectString(path.localize("../up"), ".." + s + "up");
+    test.expectString(path.localize("plain"), "plain");
+    test.expectString(path.localize(""), "");
+    test.expectString(path.localize("/"), s);
+});
+
+// The working directory cannot be predicted, so the test checks properties.
+test.start("path: getCwd", void () -> {
+    h.expectOutput(`
+import 'path';
+import 'fs';
+import 'string';
+
+String cwd = path.getCwd();
+print(string.length(cwd) > 0);
+print(fs.exists(cwd));
+print(fs.stat(cwd).isDirectory);
+print(cwd == path.join(cwd, "."));
+print(path.join(cwd, "..", "sibling") != cwd);
+`, ["true", "true", "true", "true", "true"]);
+});
+
+// The result depends on the host, so the test checks properties. A name with a
+// separator is INVALID, because it would give a deeper path than the caller
+// wrote.
+test.start("path: userData", void () -> {
+    h.expectOutput(`
+import 'path';
+import 'string';
+
+String d = path.userData("nio-ud-test");
+print(string.length(d) > 0);
+print(d == path.userData("nio-ud-test"));
+String tail = path.localize("/") + "nio-ud-test";
+print(string.substring(d, string.length(d) - string.length(tail), string.length(d)) == tail);
+print(d != path.userData("nio-ud-other"));
+
+path.userData("") catch e {
+    print(e.code == path.ErrorCode.INVALID);
+};
+path.userData("a/b") catch e {
+    print(e.code == path.ErrorCode.INVALID);
+};
+path.userData("a\\\\b") catch e {
+    print(e.code == path.ErrorCode.INVALID);
+};
+`, ["true", "true", "true", "true", "true", "true", "true"]);
+});
+
+// Every argument is a new temporary value, with no variable to root it.
+test.start("path: stress over the path module", void () -> {
+    h.StressRun r = h.runStressed(`
+import 'path';
+import 'string';
+
+String last = "";
+for (int i = 0; i < 200; i++) {
+    String dir = string.append("dir", string.toUpperCaseAscii("a"));
+    last = path.join(dir, path.localize(string.append("x/", "..")), "f.txt");
+}
+print(last);
+print(path.localize(string.append("a\\\\", "b/c")));
+print(string.contains(path.join(path.getCwd(), "leaf"), "leaf"));
+`);
+    test.expectString(r.stressed.out, r.plain.out);
+    test.assert(string.contains(r.plain.out, path.join("dirA", "f.txt")),
+        "unexpected output: \"" + r.plain.out + "\"");
+});
+
+// ---- os ----
+
+// The exact value comes from the module under test, so the test checks only
+// membership in the documented set.
+test.start("os: platform and arch are one of the documented values", void () -> {
+    h.expectOutput(`
+import 'os';
+import 'array';
+
+String[] platforms = ["darwin", "win32", "linux", "openbsd", "freebsd", "unknown"];
+String[] arches = ["arm", "arm32", "x64", "x86", "unknown"];
+print(array.indexOf(platforms, os.getPlatform()) >= 0);
+print(array.indexOf(arches, os.getArch()) >= 0);
+print(os.getPlatform() == os.getPlatform());
+print(os.getArch() == os.getArch());
+`, ["true", "true", "true", "true"]);
+});
+
+// The list contents depend on the machine, so the test checks only the shape.
+test.start("os: getCpus", void () -> {
+    h.expectOutput(`
+import 'os';
+import 'json';
+import 'string';
+
+os.Cpu[] cpus = os.getCpus();
+print(cpus.length >= 1);
+print(getType(cpus));
+print(getType(cpus[0]));
+print(getType(cpus[0].model));
+print(getType(cpus[0].speed));
+
+// Every entry reports the same model and speed, so comparing the last to
+// the first must hold on any host.
+os.Cpu first = cpus[0];
+os.Cpu last = cpus[cpus.length - 1];
+print(first.model == last.model);
+print(first.speed == last.speed);
+
+// A field is either usable after narrowing or null; both are fine, but a
+// model that is present must be non-empty and a speed must be positive.
+bool modelOk = first.model == null;
+if (first.model != null) {
+    modelOk = string.length(first.model) > 0;
+}
+bool speedOk = first.speed == null;
+if (first.speed != null) {
+    speedOk = first.speed > 0;
+}
+print(modelOk);
+print(speedOk);
+
+// A null field is omitted from JSON, so the object is one of these shapes.
+String text = json.toText(first);
+print(text == "{}" || string.find(text, "model") > 0 || string.find(text, "speed") > 0);
+`, [
+        "true", "os.Cpu[]", "os.Cpu", "String?", "int?",
+        "true", "true", "true", "true", "true",
+    ]);
+});
+
+// ---- fs ----
+
+test.start("fs: write, read and delete", void () -> {
+    String dir = h.scratch();
+    h.expectOutput(`
+import 'fs';
+import 'string';
+
+String p = ` + at(dir, "hello.txt") + `;
+print(fs.exists(p));
+fs.writeFile(p, string.toByteArray("hello, world\\n"));
+print(fs.exists(p));
+
+byte[] bytes = fs.readFile(p);
+print(bytes.length);
+printInline(string.fromByteArray(bytes));
+
+// Writing again truncates rather than appending.
+fs.writeFile(p, string.toByteArray("short"));
+print(string.fromByteArray(fs.readFile(p)));
+
+fs.delete(p);
+print(fs.exists(p));
+`, ["false", "true", "13", "hello, world", "short", "false"]);
+    test.assert(!fs.exists(path.join(dir, "hello.txt")),
+        "the file should have been deleted");
+});
+
+// rename replaces the destination, so a write followed by a rename is atomic.
+test.start("fs: rename", void () -> {
+    String dir = h.scratch();
+    h.expectOutput(`
+import 'fs';
+import 'string';
+
+String a = ` + at(dir, "a.txt") + `;
+String b = ` + at(dir, "b.txt") + `;
+fs.writeFile(a, string.toByteArray("payload"));
+fs.rename(a, b);
+print(fs.exists(a));
+print(string.fromByteArray(fs.readFile(b)));
+
+// Renaming over an existing destination replaces it.
+fs.writeFile(a, string.toByteArray("newer"));
+fs.rename(a, b);
+print(string.fromByteArray(fs.readFile(b)));
+
+// A missing source is a catchable NOT_FOUND naming both ends.
+fs.rename(` + at(dir, "missing.txt") + `, b) catch e {
+    print(e.code == fs.ErrorCode.NOT_FOUND);
+    print(string.contains(e.message, "missing.txt") && string.contains(e.message, "b.txt"));
+};
+`, ["false", "payload", "newer", "true", "true"]);
+    test.expectString(string.fromByteArray(fs.readFile(path.join(dir, "b.txt"))), "newer");
+});
+
+test.start("fs: copy", void () -> {
+    String dir = h.scratch();
+    h.expectOutput(`
+import 'fs';
+import 'string';
+
+String a = ` + at(dir, "src.txt") + `;
+String b = ` + at(dir, "dst.txt") + `;
+fs.writeFile(a, string.toByteArray("copy me"));
+fs.copy(a, b);
+print(string.fromByteArray(fs.readFile(a)));
+print(string.fromByteArray(fs.readFile(b)));
+
+// The copies are independent: rewriting the source leaves the copy alone.
+fs.writeFile(a, string.toByteArray("changed"));
+print(string.fromByteArray(fs.readFile(b)));
+
+// Copying onto an existing file truncates it, however long it was.
+fs.writeFile(b, string.toByteArray("a much longer previous content"));
+fs.copy(a, b);
+print(string.fromByteArray(fs.readFile(b)));
+
+fs.copy(` + at(dir, "missing.txt") + `, b) catch e {
+    print(e.code == fs.ErrorCode.NOT_FOUND);
+};
+fs.copy(` + only(dir) + `, b) catch e {
+    print(e.code == fs.ErrorCode.IS_DIRECTORY);
+};
+`, ["copy me", "copy me", "copy me", "changed", "true", "true"]);
+});
+
+test.start("fs: write-then-rename saves atomically", void () -> {
+    String dir = h.scratch();
+    h.expectOutput(`
+import 'fs';
+import 'string';
+
+String real = ` + at(dir, "state.json") + `;
+String tmp = ` + at(dir, "state.json.tmp") + `;
+fs.writeFile(real, string.toByteArray("{\\"v\\":1}"));
+fs.writeFile(tmp, string.toByteArray("{\\"v\\":2}"));
+fs.rename(tmp, real);
+print(string.fromByteArray(fs.readFile(real)));
+print(fs.exists(tmp));
+`, ["{\"v\":2}", "false"]);
+});
+
+test.start("fs: a binary round trip", void () -> {
+    String dir = h.scratch();
+    String p = path.join(dir, "bin");
+    h.expectOutput(`
+import 'fs';
+import 'json';
+
+byte[] content = [0, 1, 127, 128, 255, 239, 191, 189, 65];
+fs.writeFile(` + only(p) + `, content);
+byte[] back = fs.readFile(` + only(p) + `);
+print(json.toText(back));
+print(json.toText(back) == json.toText(content));
+`, ["[0,1,127,128,255,239,191,189,65]", "true"]);
+    test.expectString(json.toText(fs.readFile(p)), "[0,1,127,128,255,239,191,189,65]");
+});
+
+test.start("fs: readDir", void () -> {
+    String dir = h.scratch();
+    forEach(["a.txt", "b.json", ".hidden"], name) {
+        fs.writeFile(path.join(dir, name), string.toByteArray("x"));
+    }
+    String sub = path.join(dir, "sub");
+    fs.createDir(sub);
+    h.expectOutput(`
+import 'fs';
+import 'json';
+import 'string';
+
+String[] names = fs.readDir(` + only(dir) + `);
+print(names.length);
+
+// Order is not promised, so each name is looked for rather than indexed. The
+// quotes make "a.txt" fail to match a hypothetical "xa.txt".
+String text = json.toText(names);
+print(string.contains(text, "\\"a.txt\\""));
+print(string.contains(text, "\\"b.json\\""));
+print(string.contains(text, "\\".hidden\\""));
+print(string.contains(text, "\\"sub\\""));
+
+// The names are bare, not paths: no separator and no "." or ".." entry.
+print(string.contains(text, "/"));
+print(string.contains(text, "\\".\\"") || string.contains(text, "\\"..\\""));
+
+// An empty directory is empty, not an error.
+print(fs.readDir(` + only(sub) + `).length);
+`, ["4", "true", "true", "true", "true", "false", "false", "0"]);
+});
+
+// The program does not choose the file mode, so permissions and modified are
+// checked as a shape and a bound.
+test.start("fs: stat", void () -> {
+    String dir = h.scratch();
+    String p = path.join(dir, "report.tar.gz");
+    fs.writeFile(p, string.toByteArray("0123456789"));
+    h.expectOutput(`
+import 'fs';
+import 'string';
+import 'time';
+
+fs.Stat s = fs.stat(` + only(p) + `);
+print(s.name);
+print(s.extension);
+print(s.size);
+print(s.isDirectory, s.isFile);
+print(string.length(s.permissions));
+// Every character is one of the nine the mode is written with.
+bool shaped = true;
+for (int i = 0; i < string.length(s.permissions); i++) {
+    String c = string.substring(s.permissions, i, i + 1);
+    if (c != "r" && c != "w" && c != "x" && c != "-" && c != "s" && c != "t" && c != "S" && c != "T") {
+        shaped = false;
+    }
+}
+print(shaped);
+// The owner can read and write what this program just wrote.
+print(string.substring(s.permissions, 0, 2) == "rw");
+// And it was modified just now rather than at the epoch.
+Duration age = time.now() - s.modified;
+print(age >= 0 && age < 600000);
+
+fs.Stat d = fs.stat(` + only(dir) + `);
+print(d.name == ` + only(loader.baseOf(dir)) + `);
+print(d.extension == "");
+print(d.isDirectory, d.isFile);
+`, [
+        "report.tar.gz",
+        // the last extension, not ".tar.gz"
+        ".gz",
+        "10", "false true", "9", "true", "true", "true",
+        "true", "true", "true false",
+    ]);
+});
+
+test.start("fs: the names stat reports", void () -> {
+    String dir = h.scratch();
+    forEach(["plain", ".gitignore", "ends.", "a.b.c"], name) {
+        fs.writeFile(path.join(dir, name), []);
+    }
+    fs.createDir(path.join(dir, "d"));
+    h.expectOutput(`
+import 'fs';
+import 'json';
+
+// A name with no dot, a leading dot (a hidden file, not an extension), a
+// trailing dot (nothing follows it), and several dots (only the last counts).
+print(json.toText(fs.stat(` + at(dir, "plain") + `).extension));
+print(json.toText(fs.stat(` + at(dir, ".gitignore") + `).extension));
+print(json.toText(fs.stat(` + at(dir, "ends.") + `).extension));
+print(json.toText(fs.stat(` + at(dir, "a.b.c") + `).extension));
+print(fs.stat(` + at(dir, ".gitignore") + `).name);
+
+// A trailing separator does not cost a directory its name.
+print(fs.stat(` + only(path.join(dir, "d") + path.localize("/")) + `).name);
+print(fs.stat(` + at(dir, "d") + `).isDirectory);
+`, ["\"\"", "\"\"", "\"\"", "\".c\"", ".gitignore", "d", "true"]);
+});
+
+test.start("fs: errors are catchable", void () -> {
+    String dir = h.scratch();
+    String file = path.join(dir, "file.txt");
+    fs.writeFile(file, string.toByteArray("body"));
+    h.expectOutput(`
+import 'fs';
+import 'string';
+
+// The paths are bound once here rather than interpolated at each use, so the
+// messages below can be rebuilt out of the same values.
+String dir = ` + only(dir) + `;
+String file = ` + only(file) + `;
+String missing = ` + at(dir, "missing") + `;
+
+// The catch-with-a-default form: the failure supplies a value instead.
+byte[] b = fs.readFile(missing) catch [];
+print(b.length);
+
+// The catch-with-a-block form binds the Error, whose message names the
+// function, quotes the path, and gives the reason the system reported.
+fs.readFile(missing) catch e {
+    print(string.find(e.message, "fs.readFile") == 0);
+    print(string.contains(e.message, missing));
+    print(string.length(e.message) > string.length("fs.readFile"));
+}
+
+// Reading a directory as a file: the one message fs composes itself rather
+// than taking from the C library, so it is asserted whole.
+fs.readFile(dir) catch e {
+    print(e.message == "fs.readFile \\"" + dir + "\\": is a directory");
+}
+// And listing a file as a directory, whose reason the system supplies.
+fs.readDir(file) catch e { print(string.contains(e.message, "fs.readDir")); }
+
+// A directory with anything in it will not be removed by accident.
+fs.delete(dir) catch e { print(string.contains(e.message, "fs.delete")); }
+
+// Writing under a directory that is not there fails rather than creating it.
+fs.writeFile(` + only(path.join(path.join(dir, "no"), "such")) + `, string.toByteArray("x")) catch e {
+    print(string.contains(e.message, "fs.writeFile"));
+}
+
+// Fallibility is inferred, never declared: slurp calls something that can
+// fail, so slurp can fail, and its caller must handle it.
+String slurp(String p) {
+    return string.fromByteArray(fs.readFile(p));
+}
+print(slurp(file) catch "default");
+print(slurp(missing) catch "default");
+
+// A catch may also rethrow, which is how a caller decides what a failure means.
+String describe(String p) {
+    return slurp(p) catch e {
+        return "could not read: " + p;
+    }
+}
+print(describe(missing) == "could not read: " + missing);
+`, [
+        "0", "true", "true", "true", "true", "true", "true", "true",
+        "body", "default", "true",
+    ]);
+});
+
+test.start("fs: an uncaught error stops the program", void () -> {
+    String dir = h.scratch();
+    h.expectRuntimeError(`
+import 'fs';
+print("before");
+byte[] b = fs.readFile(` + at(dir, "absent") + `);
+print("after");
+`, "fs.readFile \"" + path.join(dir, "absent") + "\"");
+});
+
+test.start("fs: exists is total", void () -> {
+    String dir = h.scratch();
+    fs.writeFile(path.join(dir, "f"), string.toByteArray(""));
+    h.expectOutput(`
+import 'fs';
+
+print(fs.exists(` + at(dir, "f") + `));      // a file
+print(fs.exists(` + only(dir) + `));           // a directory
+print(fs.exists(` + at(dir, "nope") + `));   // nothing there
+print(fs.exists(` + only(path.join(path.join(dir, "f"), "under-a-file")) + `)); // a parent that is not a directory
+print(fs.exists(""));                          // the empty path names nothing
+`, ["true", "true", "false", "false", "false"]);
+});
+
+// ---- fs.delete ----
+
+test.start("fs: delete a file and an empty directory", void () -> {
+    String dir = h.scratch();
+    String empty = path.join(dir, "empty");
+    fs.createDir(empty);
+    fs.writeFile(path.join(dir, "f"), []);
+    h.expectOutput(`
+import 'fs';
+
+fs.delete(` + at(dir, "f") + `);
+print(fs.exists(` + at(dir, "f") + `));
+fs.delete(` + only(empty) + `);
+print(fs.exists(` + only(empty) + `));
+
+// Gone means gone: deleting it again has nothing to delete.
+fs.delete(` + only(empty) + `) catch e { print("already gone"); }
+`, ["false", "false", "already gone"]);
+});
+
+// §6.11 refuses to delete a directory that is not empty unless the caller sets
+// `recursive: true`.
+test.start("fs: delete recursive", void () -> {
+    String dir = h.scratch();
+    String tree = path.join(dir, "tree");
+    // The walk must reach depth, a hidden entry and an empty directory.
+    fs.createDir(tree);
+    fs.createDir(path.join(tree, "a"));
+    fs.createDir(path.join(path.join(tree, "a"), "b"));
+    fs.createDir(path.join(tree, "empty"));
+    fs.writeFile(path.join(tree, "top.txt"), string.toByteArray("x"));
+    fs.writeFile(path.join(path.join(tree, "a"), ".hidden"), string.toByteArray("x"));
+    fs.writeFile(path.join(path.join(path.join(tree, "a"), "b"), "deep.bin"),
+        string.toByteArray("x"));
+    String file = path.join(dir, "plain.txt");
+    fs.writeFile(file, string.toByteArray("x"));
+    h.expectOutput(`
+import 'fs';
+import 'string';
+
+String tree = ` + only(tree) + `;
+
+// Without the option, a directory that is not empty is refused. Setting
+// recursive to false, or passing an options record that sets nothing, has
+// the same result.
+fs.delete(tree) catch e { print(string.contains(e.message, "fs.delete")); }
+fs.delete(tree, { recursive: false }) catch e { print("still refused"); }
+fs.delete(tree, {}) catch e { print("still refused"); }
+print(fs.exists(tree));
+
+// With it, the tree goes.
+fs.delete(tree, { recursive: true });
+print(fs.exists(tree));
+
+// A file is a file either way: recursive is about what a directory contains,
+// and a path that names neither still fails.
+fs.delete(` + only(file) + `, { recursive: true });
+print(fs.exists(` + only(file) + `));
+fs.delete(` + at(dir, "gone") + `, { recursive: true }) catch e {
+    print(string.contains(e.message, "fs.delete"));
+}
+
+// The options record is an ordinary value, so it can be built once and named.
+fs.DeleteOptions opts = { recursive: true };
+fs.createDir(` + at(dir, "again") + `);
+fs.createDir(` + only(path.join(path.join(dir, "again"), "inner")) + `);
+fs.delete(` + at(dir, "again") + `, opts);
+print(fs.exists(` + at(dir, "again") + `), opts.recursive);
+`, [
+        "true", "still refused", "still refused", "true", "false", "false", "true",
+        "false true",
+    ]);
+
+    test.assert(!fs.exists(tree), "the tree should be gone");
+    test.assert(fs.exists(dir), "the parent should have survived");
+});
+
+// lib/fs.c uses lstat, so the walk unlinks a symlink and never follows it out
+// of the tree.
+test.start("fs: delete recursive does not follow symlinks", void () -> {
+    if (os.getPlatform() == "win32") {
+        // Windows needs a privilege for symlinks, and lib/fs.c has no lstat.
+        return;
+    }
+    String dir = h.scratch();
+    String outside = path.join(dir, "outside");
+    String tree = path.join(dir, "tree");
+    fs.createDir(tree);
+    fs.createDir(path.join(tree, "inner"));
+    fs.createDir(outside);
+    String kept = path.join(outside, "keep.txt");
+    fs.writeFile(kept, string.toByteArray("keep"));
+    link(outside, path.join(tree, "dirlink"));
+    link(kept, path.join(path.join(tree, "inner"), "filelink"));
+    h.expectOutput(`
+import 'fs';
+
+fs.delete(` + only(tree) + `, { recursive: true });
+print(fs.exists(` + only(tree) + `));
+print(fs.exists(` + only(outside) + `), fs.exists(` + only(kept) + `));
+`, ["false", "true true"]);
+    test.assert(fs.exists(kept), "the file the link pointed at should have survived");
+});
+
+// A failed walk names the entry where it stopped, not the root.
+test.start("fs: delete recursive names the failing entry", void () -> {
+    if (os.getPlatform() == "win32") {
+        // A read-only directory does not stop a delete on Windows.
+        return;
+    }
+    if (isRoot()) {
+        return;    // root gets no permission errors
+    }
+    String dir = h.scratch();
+    String tree = path.join(dir, "tree");
+    String locked = path.join(tree, "locked");
+    fs.createDir(tree);
+    fs.createDir(locked);
+    String stuck = path.join(locked, "stuck.txt");
+    fs.writeFile(stuck, string.toByteArray("x"));
+    // To remove an entry needs write permission on the directory that holds it.
+    chmod("555", locked);
+    h.expectOutput(`
+import 'fs';
+
+fs.delete(` + only(tree) + `, { recursive: true }) catch e {
+    print(e.message);
+}
+print(fs.exists(` + only(stuck) + `));
+`, ["fs.delete \"" + stuck + "\": Permission denied", "true"]);
+    // Restore the mode, or the workspace cleanup cannot remove it.
+    chmod("755", locked);
+});
+
+// ---- fs.createDir and fs.createTempDir ----
+
+// The createDir of §6.11 makes one directory. The parent must already exist.
+test.start("fs: createDir", void () -> {
+    String dir = h.scratch();
+    String made = path.join(dir, "made");
+    String kept = path.join(dir, "kept");
+    h.expectOutput(`
+import 'fs';
+import 'string';
+
+String made = ` + only(made) + `;
+print(fs.exists(made));
+fs.createDir(made);
+print(fs.exists(made), fs.stat(made).isDirectory, fs.stat(made).isFile);
+
+// A real directory: a file can be written in it and listed back out.
+byte[] nothing = [];
+fs.writeFile(` + at(made, "f") + `, nothing);
+print(fs.readDir(made).length);
+
+// Making it a second time is a failure rather than a silent success, and so is
+// making one where a file already sits.
+fs.createDir(made) catch e { print(string.contains(e.message, "fs.createDir")); }
+fs.createDir(` + at(made, "f") + `) catch e { print("in the way"); }
+
+// One directory, not the chain leading to it: a missing parent fails, and
+// nothing along the way is built on the caller's behalf.
+fs.createDir(` + only(path.join(path.join(path.join(dir, "no"), "such"), "leaf")) + `) catch e { print("no parent"); }
+print(fs.exists(` + at(dir, "no") + `));
+
+// What it makes, delete removes -- once it is empty again.
+fs.delete(` + at(made, "f") + `);
+fs.delete(made);
+print(fs.exists(made));
+
+// This one is left behind for the host to look at.
+fs.createDir(` + only(kept) + `);
+`, [
+        "false", "true true false", "1", "true", "in the way", "no parent", "false",
+        "false",
+    ]);
+
+    test.assert(fs.exists(kept), "the directory should still be there");
+    test.assert(fs.stat(kept).isDirectory, kept + " is not a directory");
+});
+
+// The variable that fs.createTempDir reads: TMPDIR on POSIX. The CRT reads TMP
+// first.
+String tempVar() {
+    if (loader.hostOS() == "windows") {
+        return "TMP";
+    }
+    return "TMPDIR";
+}
+
+Map<String, String> tempEnv(String root) {
+    Map<String, String> env = {};
+    env[tempVar()] = root;
+    return env;
+}
+
+// The paths cannot be predicted, so the test compares the plain and stressed
+// runs only for the other lines.
+test.start("fs: createTempDir", void () -> {
+    String root = h.scratch();
+    String bin = h.buildSource(`
+import 'fs';
+import 'string';
+
+String a = fs.createTempDir("nio-") catch "";
+String b = fs.createTempDir("nio-") catch "";
+print(a != b);
+print(fs.exists(a), fs.stat(a).isDirectory);
+print(fs.readDir(a).length);          // brand new, so empty
+
+// A real directory: something can be written in it and read back.
+fs.writeFile(string.append(a, "/f"), string.toByteArray("scratch"));
+print(string.fromByteArray(fs.readFile(string.append(a, "/f"))));
+print(fs.readDir(a).length);
+
+// Nothing removes it for the caller. fs.delete does, and the directory is
+// not empty, so the recursive form is needed.
+fs.delete(a, { recursive: true });
+print(fs.exists(a));
+
+print(a);
+print(b);
+`);
+    Map<String, String> env = {};
+    env[tempVar()] = root;
+    Map<String, String> stressEnv = { "NIO_GC_STRESS": "1" };
+    stressEnv[tempVar()] = root;
+    h.Run plain = h.runBinaryIn(bin, [], path.getCwd(), env);
+    h.Run stressed = h.runBinaryIn(bin, [], path.getCwd(), stressEnv);
+    String[] got = h.lines(plain.out);
+    String[] stressGot = h.lines(stressed.out);
+    if (got.length != 8 || stressGot.length != 8) {
+        return Error("expected 8 lines, got " + string.from(got.length) + " and "
+            + string.from(stressGot.length) + ":\n" + plain.out);
+    }
+    String[] want = ["true", "true true", "0", "scratch", "1", "false"];
+    for (int i = 0; i < want.length; i++) {
+        if (got[i] != want[i]) {
+            return Error("line " + string.from(i + 1) + ": got \"" + got[i]
+                + "\", want \"" + want[i] + "\"");
+        }
+        if (stressGot[i] != want[i]) {
+            return Error("stress changed line " + string.from(i + 1) + ": \""
+                + stressGot[i] + "\"");
+        }
+    }
+    // A missing GC root in codegen shows here first, as a path made from
+    // collected memory.
+    forEach([got[6], got[7], stressGot[6], stressGot[7]], p) {
+        if (loader.dirOf(p) != root) {
+            return Error("\"" + p + "\" is not directly under \"" + root + "\"");
+        }
+        String base = loader.baseOf(p);
+        if (string.substring(base, 0, 4) != "nio-") {
+            return Error("\"" + p + "\" does not carry the prefix");
+        }
+    }
+    test.assert(fs.exists(got[7]) && fs.stat(got[7]).isDirectory,
+        got[7] + " should still be a directory");
+});
+
+// When the environment prevents a temp directory, the call raises and does not
+// stop the program.
+test.start("fs: createTempDir failure is catchable", void () -> {
+    String root = path.join(path.join(path.join(h.scratch(), "no"), "such"), "place");
+    h.Run r = h.runBinaryIn(h.buildSource(`
+import 'fs';
+fs.createTempDir("nio-") catch e { print(e.message); print(e.code); }
+print("still running");
+`), [], path.getCwd(), tempEnv(root));
+    h.expectContains(r.out, "fs.createTempDir \"");
+    h.expectContains(r.out, path.localize("no/such/place/nio-XXXXXX"));
+    if (!str.hasSuffix(r.out, "still running\n")) {
+        return Error("the raise should be catchable: got \"" + r.out + "\"");
+    }
+});
+
+// Every fs call allocates a path, so a collection can occur inside any of
+// them.
+test.start("fs: GC stress over the fs module", void () -> {
+    String dir = h.scratch();
+    h.expectSameUnderStress(`
+import 'fs';
+import 'string';
+import 'path';
+
+for (int i = 0; i < 60; i++) {
+    fs.writeFile(path.join(` + only(dir) + `, string.append("f", string.toUpperCaseAscii("a"))),
+                 string.toByteArray(string.append("body-", "x")));
+}
+print(string.fromByteArray(fs.readFile(path.join(` + only(dir) + `, "fA"))));
+print(fs.stat(path.join(` + only(dir) + `, string.append("f", "A"))).name);
+print(fs.readDir(string.append(` + only(dir) + `, "")).length);
+print(fs.exists(path.join(` + only(dir) + `, string.append("f", "A"))));
+
+int failures = 0;
+int bytesRead = 0;
+for (int i = 0; i < 6; i++) {
+    String name = path.join(` + only(dir) + `, "missing");
+    if (i % 2 == 0) {
+        name = path.join(` + only(dir) + `, "fA");
+    }
+    byte[] b = fs.readFile(name) catch e {
+        failures = failures + 1;
+        continue;
+    }
+    bytesRead = bytesRead + b.length;
+}
+print(failures, bytesRead);
+
+// A delete with options is the one call in the library whose second argument
+// allocates: the record literal is built while the path temporary is live, so
+// the path has to be rooted across it or a collection there loses it.
+for (int i = 0; i < 20; i++) {
+    String d = path.join(` + only(dir) + `, string.append("d", "X"));
+    fs.createDir(d);
+    fs.writeFile(path.join(d, string.append("f", "")), string.toByteArray("x"));
+    fs.delete(path.join(` + only(dir) + `, string.append("d", "X")), { recursive: true });
+}
+print(fs.exists(path.join(` + only(dir) + `, "dX")));
+`, "body-x\nfA\n1\ntrue\n3 18\nfalse\n");
+});
+
+// ---- where a fallible call can sit ----
+
+// A raise in an async body goes through the future: the type is
+// Future<String!>.
+test.start("fs: inside an async function", void () -> {
+    String dir = h.scratch();
+    fs.writeFile(path.join(dir, "f"), string.toByteArray("from-async"));
+    h.expectOutput(`
+import 'fs';
+import 'string';
+import 'time';
+
+String async read(String p) {
+    await time.sleep(1);
+    return string.fromByteArray(fs.readFile(p));
+}
+
+// The fallibility rides on the future and surfaces at the await, not at the
+// call that made it, so the declared type is Future<String!>.
+Future<String!> ok = read(` + at(dir, "f") + `);
+print(await ok);
+
+Future<String!> bad = read(` + at(dir, "missing") + `);
+print(await bad catch "handled");
+
+// And in a function value, whose signature must admit the failure too.
+Function(String)<String!> f = String (String p) -> string.fromByteArray(fs.readFile(p));
+print(f(` + at(dir, "f") + `) catch "no");
+print(f(` + at(dir, "missing") + `) catch "no");
+`, ["from-async", "handled", "from-async", "no"]);
+});
+
+// Codegen emits the raise edge as control flow, so a value must stay rooted
+// across all the code around the call.
+test.start("fs: calls inside control flow expressions", void () -> {
+    String dir = h.scratch();
+    String file = path.join(dir, "f.txt");
+    fs.writeFile(file, string.toByteArray("body"));
+    h.expectSameUnderStress(`
+import 'fs';
+import 'string';
+
+String file = ` + only(file) + `;
+String gone = ` + at(dir, "gone") + `;
+
+// A fallible call as the right operand of &&.
+print(fs.exists(file) && string.length(string.fromByteArray(fs.readFile(file))) == 4);
+
+// The right operand is not evaluated when the left decides the result, so a
+// call that would fail there must not raise.
+print(fs.exists(gone) && fs.readFile(gone).length > 0);
+
+// A loop condition, whose block is re-entered every iteration.
+int n = 0;
+while (fs.exists(file) && n < 3) {
+    n = n + fs.readFile(file).length;
+}
+print(n);
+
+// Two calls in one expression whose other parts allocate: each array has to
+// stay rooted while the strings around it are built.
+print(string.append(string.fromByteArray(fs.readFile(file)),
+                      string.append("-", string.fromByteArray(fs.readFile(file)))));
+
+// A failing call inside a guarded expression that allocates before reaching it.
+print(string.append("pre-", string.fromByteArray(fs.readFile(gone))) catch "caught");
+`, "true\nfalse\n4\nbody-body\ncaught\n");
+});
+
+// A Nio string is bytes and a C path ends at a NUL, so fs rejects a path that
+// contains one. An implementation that truncates would open the file that the
+// prefix names.
+test.start("fs: rejects NUL in paths", void () -> {
+    String dir = h.scratch();
+    fs.writeFile(path.join(dir, "real"), string.toByteArray("x"));
+    h.expectOutput(`
+import 'fs';
+import 'string';
+import 'array';
+
+// "<dir>/real\\0.": the prefix names a file that does exist, so a truncating
+// implementation would open it and report success.
+byte[] bytes = string.toByteArray(` + at(dir, "real") + `);
+array.push(bytes, 0);
+array.push(bytes, 46);
+String p = string.fromByteArray(bytes);
+
+fs.readFile(p) catch e { print(e.message); }
+print(fs.exists(p));
+`, ["fs.readFile: a path cannot contain a NUL byte", "false"]);
+});

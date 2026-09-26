@@ -1,0 +1,193 @@
+// Locks §5.7 packing: every value occupies its natural width where it is
+// stored. The assertions read the emitted IR, which is the contract with the
+// C runtime. An array's width reaches `rt_arr_new`, a record's field offsets
+// reach its TypeDesc, and the element stores name the packed LLVM type.
+import 'test';
+import 'string';
+import 'array';
+import '../src/lexer' as lexer;
+import '../src/parser' as parser;
+import '../src/checker' as checker;
+import '../src/codegen' as codegen;
+import '../src/module' as module;
+import '../src/ast' as ast;
+
+// No target attributes and no coverage: the assertions must not depend on the
+// host.
+String generate(String src) {
+    parser.Parser p = parser.newParser(lexer.newLexer(src));
+    ast.Program prog = p.parseProgram();
+    if (p.errs.length > 0) {
+        return Error("parse errors: " + string.join(p.errs, "\n"));
+    }
+    checker.CheckResult res = checker.check(prog);
+    if (res.errs.length > 0) {
+        return Error("check errors: " + string.join(res.errs, "\n"));
+    }
+    module.Module m = { prog: prog, info: res.info, qual: "", path: "" };
+    return codegen.generate([m], codegen.noOptions());
+}
+
+void wants(String ir, String want) {
+    if (!string.contains(ir, want)) {
+        return Error("IR missing \"" + want + "\"\n---\n" + ir);
+    }
+}
+
+// ---- arrays ----
+
+// The width `rt_arr_new` is given is the element's own width. A byte[] of a
+// thousand elements is a thousand bytes.
+test.start("repr: an array is allocated at its element's width", void () -> {
+    String[][] cases = [
+        ["byte", "1"],
+        ["int8", "1"],
+        ["uint8", "1"],
+        ["bool", "1"],
+        ["int16", "2"],
+        ["uint16", "2"],
+        ["int32", "4"],
+        ["uint32", "4"],
+        ["float32", "4"],
+        ["int", "8"],
+        ["uint", "8"],
+        ["int64", "8"],
+        ["uint64", "8"],
+        ["float", "8"],
+        ["float64", "8"],
+        ["String", "8"],
+        ["DateTime", "8"],
+        ["Duration", "8"],
+    ];
+    forEach(cases, c) {
+        String t = c[0];
+        String w = c[1];
+        String src = t + "[7] a;\nprint(a.length);\n";
+        wants(generate(src), "@rt_arr_new(i64 7, i64 " + w + ")");
+    }
+});
+
+// An element store names the packed LLVM type, not the 8-byte compute unit.
+// A float32 stored as `float` is what rounds it onto the binary32 grid.
+test.start("repr: an element store names the packed type", void () -> {
+    String[][] cases = [
+        ["byte", "1", "store i8"],
+        ["bool", "true", "store i8"],
+        ["int16", "1", "store i16"],
+        ["int32", "1", "store i32"],
+        ["float32", "1.5", "store float"],
+        ["int", "1", "store i64"],
+        ["float", "1.5", "store double"],
+        ["String", "\"x\"", "store ptr"],
+    ];
+    forEach(cases, c) {
+        String src = c[0] + "[] a = [" + c[1] + "];\nprint(a.length);\n";
+        wants(generate(src), c[2]);
+    }
+});
+
+// A fixed-size array of a million bytes is a million bytes.
+test.start("repr: a byte array is one byte per element", void () -> {
+    wants(generate("byte[1000000] a;\nprint(a.length);\n"),
+        "@rt_arr_new(i64 1000000, i64 1)");
+    wants(generate("int[1000000] a;\nprint(a.length);\n"),
+        "@rt_arr_new(i64 1000000, i64 8)");
+});
+
+// ---- records ----
+
+// Slot [0] is the TypeDesc pointer, so every field offset starts past 8. Each
+// field then starts at the next multiple of its own width, which is what puts
+// a pointer field on a word boundary for the collector.
+test.start("repr: record fields sit at their own alignment", void () -> {
+    String ir = generate(`
+type Mixed {
+    byte a;
+    int b;
+    bool c;
+    int32 d;
+    float32 e;
+}
+Mixed m = { a: 1, b: 2, c: true, d: 3, e: 1.5 };
+print(m.b);
+`);
+    // a at 8 (width 1), b at 16 (width 8, aligned up from 9), c at 24
+    // (width 1), d at 28 (width 4, aligned up from 25), e at 32 (width 4).
+    wants(ir, "[i64 8, i64 16, i64 24, i64 28, i64 32]");
+    // e ends at 36; the block is rounded to a whole number of words.
+    wants(ir, "i64 40, ptr null }");
+    wants(ir, "@rt_alloc(i64 40)");
+});
+
+// All-pointer fields need no padding at all: every one is already on a word.
+test.start("repr: a record of pointers packs with no padding", void () -> {
+    String ir = generate(`
+type Three {
+    String a;
+    String b;
+    String c;
+}
+Three t = { a: "x", b: "y", c: "z" };
+print(t.a);
+`);
+    wants(ir, "[i64 8, i64 16, i64 24]");
+    wants(ir, "@rt_alloc(i64 32)");
+});
+
+// Packing saves the most in the narrow case: five bytes in one word and not
+// five words.
+test.start("repr: narrow fields share words", void () -> {
+    String ir = generate(`
+type Bytes {
+    byte a;
+    byte b;
+    byte c;
+    byte d;
+    byte e;
+}
+Bytes v = { a: 1, b: 2, c: 3, d: 4, e: 5 };
+print(v.a);
+`);
+    wants(ir, "[i64 8, i64 9, i64 10, i64 11, i64 12]");
+    // Five bytes from offset 8 end at 13, rounded to 16.
+    wants(ir, "@rt_alloc(i64 16)");
+});
+
+// An extending type carries the base's fields at the front, and the shared
+// prefix must fold to the same offsets or a value of the extending type read
+// through a base-typed slot reads the wrong bytes (§2.4).
+//
+// Holder makes the assertion possible. A sealed type cannot be constructed,
+// so its TypeDesc is emitted only where something holds one. Both
+// descriptors must be present to compare them.
+test.start("repr: an extending type keeps the base's offsets", void () -> {
+    String ir = generate(`
+sealed type Base {
+    byte tag;
+    int n;
+}
+type Derived extends Base {
+    byte extra;
+    String s;
+}
+type Holder {
+    Base b;
+}
+Derived d = { tag: 1, n: 2, extra: 3, s: "x" };
+Holder h = { b: d };
+print(h.b.n);
+`);
+    // Base's own prefix: tag at 8, n at 16.
+    wants(ir, "[2 x i64] [i64 8, i64 16]");
+    // Derived repeats it, then extra at 24 and s at 32 (a pointer, aligned).
+    wants(ir, "[4 x i64] [i64 8, i64 16, i64 24, i64 32]");
+});
+
+// ---- boxes ----
+
+// An optional is a pointer to a box holding the inner value at its own width,
+// so a present bool? points at a single byte.
+test.start("repr: an optional boxes at the inner width", void () -> {
+    wants(generate("byte? b = 1;\nprint(b == 1);\n"), "@rt_box");
+    wants(generate("int? n = 1;\nprint(n == 1);\n"), "@rt_box");
+});

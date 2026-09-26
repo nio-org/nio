@@ -1,0 +1,111 @@
+// `nio format`: the formatter as a command (§1.1).
+//
+// It takes paths. A directory means every `.nio` file under it. A file that
+// does not parse is reported and not changed, because a tree from a failed
+// parse would lose text.
+import './lexer' as lexer;
+import './parser' as parser;
+import './format' as format;
+import './ast' as ast;
+import 'fs';
+import 'string';
+import 'array';
+import 'path';
+import 'process';
+
+// What one file turned into.
+export type Result {
+    String path;
+    bool changed;
+    String? err;
+}
+
+// Formats the text of one file, or answers the parse errors it holds.
+export String? formatted(String src, String[] errs) {
+    lexer.Lexer lx = lexer.newLexer(src);
+    parser.Parser ps = parser.newParser(lx);
+    ast.Program prog = ps.parseProgram();
+    if (ps.errs.length > 0) {
+        forEach(ps.errs, e) {
+            array.push(errs, e);
+        }
+        return null;
+    }
+    return format.format(prog);
+}
+
+// Every `.nio` file at or under each of `roots`, in a settled order, so that
+// two runs report in the same sequence.
+export String[] nioFiles(String[] roots) {
+    String[] out = [];
+    forEach(roots, r) {
+        collect(r, out);
+    }
+    return out;
+}
+
+export String readText(String file) {
+    byte[] data = fs.readFile(file);
+    return string.fromByteArray(data);
+}
+
+// Every `.nio` file at or under `p`, in a settled order, so that two runs
+// report in the same sequence.
+void collect(String p, String[] out) {
+    fs.Stat st = fs.stat(p) catch e {
+        return;
+    };
+    if (!st.isDirectory) {
+        if (st.extension == ".nio") {
+            array.push(out, p);
+        }
+        return;
+    }
+    String[] names = fs.readDir(p) catch e {
+        return;
+    };
+    array.sort(names);
+    forEach(names, n) {
+        // These directories hold no source of the project.
+        if (n == ".git" || n == "node_modules") {
+            continue;
+        }
+        collect(path.join(p, n), out);
+    }
+}
+
+export Result[] formatPaths(String[] paths, bool listOnly) {
+    String[] files = nioFiles(paths);
+    Result[] out = [];
+    forEach(files, f) {
+        array.push(out, formatOne(f, listOnly));
+    }
+    return out;
+}
+
+Result formatOne(String file, bool listOnly) {
+    Result r = { path: file, changed: false, err: null };
+    byte[] data = fs.readFile(file) catch e {
+        r.err = e.message;
+        return r;
+    };
+    String src = string.fromByteArray(data);
+    String[] errs = [];
+    String? out = formatted(src, errs);
+    if (out == null) {
+        r.err = string.join(errs, "; ");
+        return r;
+    }
+    if (out == src) {
+        return r;
+    }
+    r.changed = true;
+    if (listOnly) {
+        return r;
+    }
+    fs.writeFile(file, string.toByteArray(out)) catch e {
+        r.err = e.message;
+        return r;
+    };
+    return r;
+}

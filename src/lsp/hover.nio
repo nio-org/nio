@@ -1,0 +1,545 @@
+// The hover text for the item under the caret: the type of the name, then the
+// prose above its declaration (src/lsp/doc.nio).
+//
+// src/lsp/def.nio selects that declaration, so a hover shows the prose at the
+// place where a jump goes.
+import '../ast' as ast;
+import '../types' as types;
+import '../checker' as checker;
+import '../builtins' as builtins;
+import '../loader' as loader;
+import './find' as find;
+import './def' as def;
+import './doc' as doc;
+import './form' as form;
+import './sig' as sig;
+import 'string';
+import 'array';
+import 'map';
+
+// The markdown for a position, or "" when there is nothing to say.
+export String render(loader.Checked mod, Map<String, loader.Checked> world, int line, int col) {
+    find.Hit? found = find.at(mod.prog, line, col);
+    if (found == null) {
+        return "";
+    }
+    find.Hit hit = found;
+    String body = describe(mod, world, hit);
+    if (body == "") {
+        return "";
+    }
+    String prose = docFor(mod, world, line, col);
+    if (prose == "") {
+        return code(body);
+    }
+    return code(body) + "\n\n---\n\n" + prose;
+}
+
+// The prose above the declaration this position resolves to, which can be in
+// another file.
+String docFor(loader.Checked mod, Map<String, loader.Checked> world, int line, int col) {
+    def.Target? where = def.at(mod, world, line, col);
+    if (where == null) {
+        return "";
+    }
+    def.Target t = where;
+    loader.Checked owner = mod;
+    if (t.file != mod.file) {
+        loader.Checked? other = world[t.file];
+        if (other == null) {
+            return "";
+        }
+        owner = other;
+    }
+    return doc.above(owner.prog.comments, t.site.startLine);
+}
+
+// Puts text in a Nio code block, so the editor colors it with the file's
+// grammar (editors/).
+String code(String text) {
+    return "```nio\n" + text + "\n```";
+}
+
+// The line that a hover shows, without the fence.
+String describe(loader.Checked mod, Map<String, loader.Checked> world, find.Hit hit) {
+    checker.Info info = mod.info;
+    // A type annotation describes the type it names: `Car` in `Car c`
+    // describes Car.
+    ast.NamedType? named = hit.named;
+    if (named != null) {
+        if (named.module != "") {
+            // `Union.Tag` reads the same as `alias.Type` (§2.11). Try the union
+            // first, as the checker does.
+            String u = describeUnionName(info, named, hit.name);
+            if (u != "") {
+                return u;
+            }
+            return describeQualified(info, world, named.module, named.name, hit.name);
+        }
+        return describeTypeName(info, named.name, hit.name);
+    }
+
+    // `Future<T>`, `Map<K, V>` and `Function(...)<R>` name no declaration. The
+    // hover shows the full written type, for example `Future<http.Response>`
+    // for the keyword `Future`.
+    ast.TypeNode? word = hit.typeKeyword;
+    if (word != null) {
+        return ast.typeNodeString(word);
+    }
+
+    // The name of a declaration: the type it was declared with.
+    ast.Statement? decl = hit.decl;
+    if (decl != null) {
+        String d = describeDecl(info, decl, hit.name);
+        if (d != "") {
+            return d;
+        }
+    }
+
+    // A parameter or a record field. Neither has a statement of its own.
+    ast.TypeNode? declared = hit.declType;
+    if (declared != null) {
+        return ast.typeNodeString(declared) + " " + hit.name;
+    }
+
+    ast.Expression? expr = hit.expr;
+    if (expr == null) {
+        // The alias of a qualified type name, such as `geo.Point`. The finder
+        // records it as a bare name.
+        if (info.moduleAliases[hit.name] != null) {
+            return importOf(mod.prog, hit.name);
+        }
+        // The union part of `Union.Tag`. The finder also records it as a bare
+        // name, because the two forms are the same (§2.11).
+        types.Record? u = info.records[hit.name];
+        if (u != null && checker.isUnion(u)) {
+            return form.unionDecl(u);
+        }
+        // A binding with no declaration and no written type, such as a forEach
+        // element or a catch error. The hover shows only the name.
+        return hit.name;
+    }
+    ast.Expression e = expr;
+
+    ast.MemberExpression? mem = e as ast.MemberExpression;
+    if (mem != null) {
+        String m = describeMember(mod, world, mem, hit.name, hit.call);
+        if (m != "") {
+            return m;
+        }
+    }
+
+    // All other cases use the checker's type. A function shows in declaration
+    // form, `int add(int, int)`, and not as `Function(int, int)<int>`.
+    types.Type? t = info.types[e.id];
+    if (t != null) {
+        types.FuncType? asFn = t as types.FuncType;
+        if (asFn != null) {
+            return funcSignature(mod, hit.name, asFn);
+        }
+        return types.typeString(t) + " " + hit.name;
+    }
+
+    // A name that the checker did not type as an expression: a function, which
+    // a call resolves by name, or an import alias, which is not a value.
+    types.FuncType? fn = info.funcs[hit.name];
+    if (fn != null) {
+        return funcSignature(mod, hit.name, fn);
+    }
+    // An import alias. Its import statement names the module.
+    if (info.moduleAliases[hit.name] != null) {
+        return importOf(mod.prog, hit.name);
+    }
+    types.Record? rec = info.records[hit.name];
+    if (rec != null) {
+        return form.recordDecl(rec);
+    }
+    types.Enum? en = info.enums[hit.name];
+    if (en != null) {
+        return form.enumDecl(en);
+    }
+    // One of the four names always in scope (§6.1, §6.2, §2.9). The checker
+    // checks each one at its call site, so no table above holds it.
+    return builtins.globalShape(hit.name);
+}
+
+// Writes the import statement that gave a name to a module. It shows the alias
+// only when the file wrote one. Otherwise the parser takes it from the path.
+String importOf(ast.Program prog, String alias) {
+    String out = "";
+    forEach(prog.imports, imp) {
+        if (out == "" && imp.alias == alias) {
+            out = "import '" + imp.path + "'";
+            if (imp.aliasTok.line != 0) {
+                out = out + " as " + alias;
+            }
+            out = out + ";";
+        }
+    }
+    if (out == "") {
+        // No import statement made this alias. The checker never accepts this.
+        return "module " + alias;
+    }
+    return out;
+}
+
+String describeQualified(checker.Info info, Map<String, loader.Checked> world,
+    String alias, String name, String hitName) {
+    checker.ModuleExports? ex = exportsOf(info, alias);
+    if (ex != null) {
+        String d = describeExport(world, ex, name);
+        if (d != "") {
+            return d;
+        }
+    }
+    // A type of a built-in module, such as fs.Stat or os.Cpu, which no module
+    // exports.
+    return hitName;
+}
+
+// Describes a name that refers to a member of a union (§2.11): `Union.Tag` in
+// this module, `alias.Union.Tag` in another. It returns "" for other names,
+// such as `alias.Type`, which has the same form. On the tag it describes the
+// member. On the name before the tag it describes the union.
+String describeUnionName(checker.Info info, ast.NamedType n, String hitName) {
+    String union = n.module;
+    String tag = n.name;
+    Map<String, types.Record> records = info.records;
+    if (n.member != "") {
+        // Three segments: the first is an alias, so the union is in that
+        // module's exports.
+        checker.ModuleExports? ex = exportsOf(info, n.module);
+        if (ex == null) {
+            return "";
+        }
+        records = ex.records;
+        union = n.name;
+        tag = n.member;
+    }
+    types.Record? arm = records[ast.unionArmName(union, tag)];
+    if (arm == null) {
+        return "";
+    }
+    if (hitName == tag) {
+        return form.unionMemberDecl(arm);
+    }
+    types.Record? u = records[union];
+    if (u != null && hitName == union) {
+        return form.unionDecl(u);
+    }
+    return "";
+}
+
+// The exports of a program module under an alias. It returns null for a
+// built-in module, whose exports are in the compiler's tables.
+checker.ModuleExports? exportsOf(checker.Info info, String alias) {
+    checker.ModuleRef? ref = info.moduleAliases[alias];
+    if (ref == null || ref.builtin != "") {
+        return null;
+    }
+    return ref.exports;
+}
+
+// The table key that an expression names: `string` gives "string" and
+// `time.date` gives "time.date". All other expressions give "", program
+// modules included. It recurses, because the object of `time.date.year` is
+// also a member expression.
+String builtinKey(checker.Info info, ast.Expression e) {
+    ast.Identifier? id = e as ast.Identifier;
+    if (id != null) {
+        checker.ModuleRef? ref = info.moduleAliases[id.name];
+        if (ref == null) {
+            return "";
+        }
+        return ref.builtin;
+    }
+    ast.MemberExpression? me = e as ast.MemberExpression;
+    if (me != null) {
+        String outer = builtinKey(info, me.object);
+        if (outer != "" && builtins.isNamespace(outer, me.property)) {
+            return outer + "." + me.property;
+        }
+    }
+    return "";
+}
+
+// Describes one member of a built-in module or namespace. Every member is a
+// function with a signature, a function with a written shape from §6, such as
+// `json.toText` and `array.push`, or a namespace. tests/lsp_test.nio checks
+// the tables for this.
+String describeBuiltin(String key, String name) {
+    types.FuncType? found = builtins.lookupSig(key, name);
+    if (found != null) {
+        return sig.fromType(found, key + "." + name, builtins.paramNames(key, name),
+            builtins.hasOptionalTail(key, name));
+    }
+    String written = builtins.shape(key, name);
+    if (written != "") {
+        return written;
+    }
+    if (builtins.isNamespace(key, name)) {
+        return namespaceDecl(key + "." + name);
+    }
+    return "";
+}
+
+// Writes a namespace as recordDecl writes a record: the name, then its members.
+String namespaceDecl(String key) {
+    String[] lines = [];
+    array.push(lines, key + " {");
+    forEach(builtins.members(key), name) {
+        types.FuncType? found = builtins.lookupSig(key, name);
+        if (found != null) {
+            array.push(lines, "    " + sig.fromType(found, name, builtins.paramNames(key, name),
+                builtins.hasOptionalTail(key, name)) + ";");
+            continue;
+        }
+        String written = builtins.shape(key, name);
+        if (written != "") {
+            array.push(lines, "    " + written + ";");
+            continue;
+        }
+        array.push(lines, "    " + name + ";");
+    }
+    array.push(lines, "}");
+    return string.join(lines, "\n");
+}
+
+// Writes a function this module names. It prefers the declaration, which is the
+// only source of parameter names.
+String funcSignature(loader.Checked mod, String name, types.FuncType fallback) {
+    ast.FunctionDeclStatement? decl = funcDeclOf(mod.prog, name);
+    if (decl != null) {
+        return sig.fromDecl(decl, name, fallback.fallible);
+    }
+    return form.signature(fallback, name);
+}
+
+ast.FunctionDeclStatement? funcDeclOf(ast.Program prog, String name) {
+    ast.Statement? decl = find.declOf(prog, name);
+    if (decl == null) {
+        return null;
+    }
+    return decl as ast.FunctionDeclStatement;
+}
+
+// The AST of a method, for its parameter names, from the module that declared
+// the record. It answers null when that module is not among the checked ones.
+ast.FunctionDeclStatement? methodDeclOf(loader.Checked home, Map<String, loader.Checked> world,
+    types.Record owner, String name) {
+    loader.Checked? found = def.ownerOfRecord(home, world, owner.id);
+    if (found == null) {
+        return null;
+    }
+    ast.Statement? decl = find.declOf(found.prog, owner.name);
+    if (decl == null) {
+        return null;
+    }
+    ast.TypeDeclStatement? td = decl as ast.TypeDeclStatement;
+    if (td == null) {
+        return null;
+    }
+    ast.FunctionDeclStatement? written = null;
+    forEach(td.methods, m) {
+        if (written == null && m.name == name) {
+            written = m;
+        }
+    }
+    return written;
+}
+
+// Describes one name of another module, in the form that file wrote it.
+String describeExport(Map<String, loader.Checked> world, checker.ModuleExports ex, String name) {
+    types.FuncType? fn = ex.funcs[name];
+    if (fn != null) {
+        // The declaration in the other module, for its parameter names, which
+        // no exported type carries.
+        loader.Checked? owner = world[ex.source];
+        if (owner != null) {
+            ast.FunctionDeclStatement? decl = funcDeclOf(owner.prog, name);
+            if (decl != null) {
+                return sig.fromDecl(decl, name, fn.fallible);
+            }
+        }
+        return form.signature(fn, name);
+    }
+    types.Record? rec = ex.records[name];
+    if (rec != null) {
+        return form.recordDecl(rec);
+    }
+    types.Enum? en = ex.enums[name];
+    if (en != null) {
+        return form.enumDecl(en);
+    }
+    types.Type? v = ex.vars[name];
+    if (v != null) {
+        String written = types.typeString(v);
+        if (ex.consts[name] != null) {
+            written = written + " const";
+        }
+        return "export " + written + " " + name;
+    }
+    return "";
+}
+
+String describeTypeName(checker.Info info, String name, String hitName) {
+    types.Record? rec = info.records[name];
+    if (rec != null) {
+        return form.recordDecl(rec);
+    }
+    types.Enum? en = info.enums[name];
+    if (en != null) {
+        return form.enumDecl(en);
+    }
+    // `Error` is the only type that the compiler declares. §2.9 makes it an
+    // ordinary record of two slots, so it shows as a record.
+    types.Type? own = checker.builtinTypes[name];
+    if (own != null) {
+        types.Record? asRec = own as types.Record;
+        if (asRec != null) {
+            return form.recordDecl(asRec);
+        }
+    }
+    // A built-in type name, or a name from another module's table. The hover
+    // shows only the name.
+    return hitName;
+}
+
+// Whether a function that this module declares can fail (§2.9). The table keys
+// a method as `Type.name`, so a bare method name finds nothing and gives false.
+bool fallibleByName(checker.Info info, String name) {
+    types.FuncType? fn = info.funcs[name];
+    if (fn == null) {
+        return false;
+    }
+    return fn.fallible;
+}
+
+String describeDecl(checker.Info info, ast.Statement decl, String name) {
+    ast.ImportStatement? imp = decl as ast.ImportStatement;
+    if (imp != null) {
+        String out = "import '" + imp.path + "'";
+        if (imp.aliasTok.line != 0) {
+            out = out + " as " + imp.alias;
+        }
+        return out + ";";
+    }
+    ast.VarDeclStatement? v = decl as ast.VarDeclStatement;
+    if (v != null) {
+        types.Type? t = info.declTypes[v.id];
+        String written = ast.typeNodeString(v.type);
+        if (t != null) {
+            written = types.typeString(t);
+        }
+        if (v.const) {
+            written = written + " const";
+        }
+        if (v.exported) {
+            return "export " + written + " " + name;
+        }
+        return written + " " + name;
+    }
+    ast.FunctionDeclStatement? fn = decl as ast.FunctionDeclStatement;
+    if (fn != null) {
+        // Use the declaration. info.funcs holds no parameter names and keys a
+        // method as `Type.name`. The inferred `!` still comes from that table.
+        return sig.fromDecl(fn, name, fallibleByName(info, name));
+    }
+    ast.TypeDeclStatement? td = decl as ast.TypeDeclStatement;
+    if (td != null) {
+        types.Record? rec = info.records[name];
+        if (rec != null) {
+            return form.recordDecl(rec);
+        }
+        return "type " + name;
+    }
+    ast.EnumDeclStatement? ed = decl as ast.EnumDeclStatement;
+    if (ed != null) {
+        types.Enum? en = info.enums[ed.name];
+        if (en != null && ed.name != name) {
+            // The position is on a member, and not on the name of the enum.
+            return member(en, name);
+        }
+        if (en != null) {
+            return form.enumDecl(en);
+        }
+    }
+    return "";
+}
+
+String describeMember(loader.Checked home, Map<String, loader.Checked> world,
+    ast.MemberExpression mem, String name, ast.CallExpression? call) {
+    checker.Info info = home.info;
+    // A member of an enum is a constant, so the hover shows its number.
+    int? constant = info.enumMembers[mem.id];
+    if (constant != null) {
+        types.Type? et = info.types[mem.id];
+        String owner = "";
+        if (et != null) {
+            owner = types.typeString(et) + ".";
+        }
+        return owner + name + " = " + string.from(constant);
+    }
+
+    // `Union.Tag(v)` puts a value into a union (§2.11). The checker records the
+    // member on the call, because the member expression has no type.
+    if (call != null) {
+        types.Record? ctor = info.unionCtors[call.id];
+        if (ctor != null) {
+            return form.unionMemberDecl(ctor);
+        }
+    }
+
+    // `string.length` and `time.date.year` are functions of a built-in module
+    // or of a namespace in it. builtinKey tells them apart.
+    String key = builtinKey(info, mem.object);
+    if (key != "") {
+        String d = describeBuiltin(key, name);
+        if (d != "") {
+            return d;
+        }
+    }
+
+    // `alias.name`, where the alias is a module of the program. A qualified
+    // call resolves by name, so the type comes from the exports, not
+    // info.types.
+    ast.Identifier? obj = mem.object as ast.Identifier;
+    if (obj != null) {
+        checker.ModuleExports? ex = exportsOf(info, obj.name);
+        if (ex != null) {
+            String d = describeExport(world, ex, name);
+            if (d != "") {
+                return d;
+            }
+        }
+    }
+
+    // The checker records a method call on the call and not on the member
+    // expression, so this case needs the call from the finder.
+    if (call != null) {
+        checker.MethodRef? method = info.methodCalls[call.id];
+        if (method != null) {
+            String label = method.owner.name + "." + method.name;
+            ast.FunctionDeclStatement? decl = methodDeclOf(home, world, method.owner, method.name);
+            if (decl != null) {
+                return sig.fromDecl(decl, label, method.sig.fallible);
+            }
+            return form.signature(method.sig, label);
+        }
+    }
+
+    // A field, or anything else that the checker typed.
+    types.Type? t = info.types[mem.id];
+    if (t != null) {
+        return types.typeString(t) + " " + name;
+    }
+    return "";
+}
+
+String member(types.Enum e, String name) {
+    int? v = e.memberValue(name);
+    if (v != null) {
+        return e.name + "." + name + " = " + string.from(v);
+    }
+    return e.name + "." + name;
+}

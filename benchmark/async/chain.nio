@@ -1,0 +1,17 @@
+// Runs a million sequential awaits. Measures the cost of one spawn, suspend
+// and resume through the scheduler.
+int async bump(int x) {
+    return x + 1;
+}
+
+int async run(int n) {
+    int acc = 0;
+    int i = 0;
+    while (i < n) {
+        acc = (acc + await bump(i)) % 1000000;
+        i = i + 1;
+    }
+    return acc;
+}
+
+printInline(await run(1000000));

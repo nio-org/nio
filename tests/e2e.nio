@@ -1,0 +1,44 @@
+// The end-to-end suite: compile a real program with clang, run it, and compare
+// its output line by line.
+import './lang_test' as lang_test;
+import './lang_fs_test' as lang_fs_test;
+import './closures_test' as closures_test;
+import './async_test' as async_test;
+import './errors_e2e_test' as errors_e2e_test;
+import './trace_test' as trace_test;
+import './debug_e2e_test' as debug_e2e_test;
+import './modules_test' as modules_test;
+import './ffi_e2e_test' as ffi_e2e_test;
+import './test_module_test' as test_module_test;
+import './process_test' as process_test;
+import './gc_test' as gc_test;
+import './coverage_test' as coverage_test;
+// Runs clang directly to compare cached objects with what clang writes. It
+// belongs with the suites that build.
+import './cache_test' as cache_test;
+import './cli_test' as cli_test;
+// Comes after the command-line suite: h.compiler() shares its build of
+// src/nio.nio.
+import './lsp_e2e_test' as lsp_e2e_test;
+// The packaging suite also shares that build. It drives `nio package`.
+import './package_test' as package_test;
+import './regexp_test' as regexp_test;
+import './math_test' as math_test;
+import './random_test' as random_test;
+import './array_test' as array_test;
+import './crypto_test' as crypto_test;
+import './tls_test' as tls_test;
+import './x509_test' as x509_test;
+import './net_test' as net_test;
+import './http_test' as http_test;
+import './path_win_test' as path_win_test;
+// These three check the generated artifacts. None starts a program under test.
+// Each takes seconds.
+import './bootstrap_test' as bootstrap_test;
+import './bake_test' as bake_test;
+import './fixpoint_test' as fixpoint_test;
+import './harness' as h;
+
+// Removes the workspace after every test that uses it has run. The entry point
+// that imports this module writes the summary and sets the exit status.
+h.cleanup();

@@ -1,0 +1,39 @@
+// HTTP request parsing with no socket. This measures string handling only.
+// The `http` module is Nio code over the `string` module.
+import 'http';
+import 'string';
+import 'array';
+
+int const ITERATIONS = 200000;
+
+String request() {
+    return "GET /users/42?a=1&b=2 HTTP/1.1" + http.CRLF
+        + "Host: example.com" + http.CRLF
+        + "User-Agent: bench/1" + http.CRLF
+        + "Accept: */*" + http.CRLF
+        + "Accept-Encoding: gzip, deflate" + http.CRLF
+        + "Connection: keep-alive" + http.CRLF
+        + "Content-Length: 0" + http.CRLF;
+}
+
+int parseOnce(String block) {
+    String[] lines = string.split(block, http.CRLF);
+    http.RequestLine rl = http.parseRequestLine(lines[0]);
+    http.HeaderBlock hb = http.parseHeaders(array.slice(lines, 1));
+    return string.length(rl.path) + string.length(rl.query) + hb.headers.length;
+}
+
+void main() {
+    String block = request();
+    int sum = 0;
+    int i = 0;
+    while (i < ITERATIONS) {
+        sum = sum + parseOnce(block);
+        i++;
+    }
+    print(string.from(sum));
+}
+
+main() catch e {
+    print("failed: " + e.message);
+};

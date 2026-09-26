@@ -1,0 +1,281 @@
+// Visits every node in a tree and collects the id each one carries.
+//
+// No type switch below has a `default:`. By §4.9, a new node type in
+// src/ast.nio is then a compile error here, where the walk would skip it.
+import 'array';
+import 'string';
+import 'map';
+import '../src/ast' as ast;
+
+// Walk holds the ids collected so far and the problems found with them.
+export type Walk {
+    Map<int, String> seen;
+    String[] problems;
+}
+
+export Walk newWalk() {
+    Walk w = { seen: {}, problems: [] };
+    return w;
+}
+
+// note records one id. It rejects a zero and a duplicate.
+void note(Walk w, int id, String what) {
+    if (id == 0) {
+        array.push(w.problems, "unnumbered node: " + what);
+        return;
+    }
+    String? prev = w.seen[id];
+    if (prev != null) {
+        array.push(w.problems, "duplicate node id " + string.from(id) + ": " + prev
+            + " and " + what);
+        return;
+    }
+    w.seen[id] = what;
+}
+
+export void walkProgram(Walk w, ast.Program p) {
+    forEach(p.imports, imp) {
+        walkStmt(w, imp);
+    }
+    forEach(p.statements, s) {
+        walkStmt(w, s);
+    }
+}
+
+void walkParam(Walk w, ast.Param p) {
+    note(w, p.id, "Param " + p.name);
+    walkTypeNode(w, p.type);
+}
+
+void walkFieldDef(Walk w, ast.FieldDef f) {
+    walkTypeNode(w, f.type);
+}
+
+// A type annotation carries no id, but it holds expressions that do.
+export void walkTypeNode(Walk w, ast.TypeNode t) {
+    switch (t) {
+        case ast.NamedType n:
+            break;
+        case ast.ArrayTypeNode a:
+            walkTypeNode(w, a.elem);
+            ast.IntLiteral? size = a.size;
+            if (size != null) {
+                walkExpr(w, size);
+            }
+        case ast.OptionalTypeNode o:
+            walkTypeNode(w, o.inner);
+        case ast.FuncTypeNode f:
+            forEach(f.params, p) {
+                walkTypeNode(w, p);
+            }
+            ast.TypeNode? ret = f.return;
+            if (ret != null) {
+                walkTypeNode(w, ret);
+            }
+        case ast.FutureTypeNode fu:
+            ast.TypeNode? elem = fu.elem;
+            if (elem != null) {
+                walkTypeNode(w, elem);
+            }
+        case ast.MapTypeNode m:
+            walkTypeNode(w, m.key);
+            walkTypeNode(w, m.value);
+        case ast.RecordTypeNode r:
+            forEach(r.fields, f) {
+                walkFieldDef(w, f);
+            }
+    }
+}
+
+export void walkExpr(Walk w, ast.Expression e) {
+    note(w, e.id, "Expression");
+    switch (e) {
+        case ast.Identifier id:
+            break;
+        case ast.IntLiteral il:
+            break;
+        case ast.FloatLiteral fl:
+            break;
+        case ast.StringLiteral sl:
+            break;
+        case ast.BoolLiteral bl:
+            break;
+        case ast.NullLiteral nl:
+            break;
+        case ast.ArrayLiteral a:
+            forEach(a.elements, el) {
+                walkExpr(w, el);
+            }
+        case ast.RecordLiteral r:
+            forEach(r.fields, f) {
+                walkExpr(w, f.value);
+            }
+        case ast.MapLiteral m:
+            forEach(m.entries, en) {
+                walkExpr(w, en.key);
+                walkExpr(w, en.value);
+            }
+        case ast.FuncLit fn:
+            forEach(fn.params, p) {
+                walkParam(w, p);
+            }
+            ast.TypeNode? rt = fn.returnType;
+            if (rt != null) {
+                walkTypeNode(w, rt);
+            }
+            ast.Expression? eb = fn.exprBody;
+            if (eb != null) {
+                walkExpr(w, eb);
+            }
+            ast.BlockStatement? bb = fn.blockBody;
+            if (bb != null) {
+                walkStmt(w, bb);
+            }
+        case ast.AwaitExpr aw:
+            walkExpr(w, aw.value);
+        case ast.CatchExpr cx:
+            walkExpr(w, cx.value);
+            ast.BlockStatement? body = cx.body;
+            if (body != null) {
+                walkStmt(w, body);
+            }
+            ast.Expression? d = cx.default;
+            if (d != null) {
+                walkExpr(w, d);
+            }
+        case ast.PrefixExpression p:
+            walkExpr(w, p.right);
+        case ast.InfixExpression i:
+            walkExpr(w, i.left);
+            walkExpr(w, i.right);
+        case ast.IndexExpression ix:
+            walkExpr(w, ix.left);
+            walkExpr(w, ix.index);
+        case ast.AsExpression ax:
+            walkExpr(w, ax.value);
+            walkTypeNode(w, ax.type);
+        case ast.MemberExpression me:
+            walkExpr(w, me.object);
+        case ast.CallExpression c:
+            walkExpr(w, c.callee);
+            forEach(c.args, a) {
+                walkExpr(w, a);
+            }
+    }
+}
+
+void walkFunctionDecl(Walk w, ast.FunctionDeclStatement fd) {
+    note(w, fd.id, "FunctionDeclStatement " + fd.name);
+    forEach(fd.params, p) {
+        walkParam(w, p);
+    }
+    ast.Param? recv = fd.recv;
+    if (recv != null) {
+        walkParam(w, recv);
+    }
+    ast.TypeNode? rt = fd.returnType;
+    if (rt != null) {
+        walkTypeNode(w, rt);
+    }
+    walkStmt(w, fd.body);
+}
+
+export void walkStmt(Walk w, ast.Statement s) {
+    switch (s) {
+        case ast.FunctionDeclStatement fd:
+            // walkFunctionDecl records its id. The method lists below reach it.
+            walkFunctionDecl(w, fd);
+            return;
+        default:
+            note(w, s.id, "Statement");
+    }
+    switch (s) {
+        case ast.ImportStatement imp:
+            break;
+        case ast.NativeStatement na:
+            break;    // a leaf: two strings and a token, no child nodes
+        case ast.ReExportStatement re:
+            break;    // a leaf: an alias and a list of names, no child nodes
+        case ast.VarDeclStatement v:
+            walkTypeNode(w, v.type);
+            ast.Expression? val = v.value;
+            if (val != null) {
+                walkExpr(w, val);
+            }
+        case ast.TypeDeclStatement td:
+            ast.NamedType? ext = td.extends;
+            if (ext != null) {
+                walkTypeNode(w, ext);
+            }
+            forEach(td.fields, f) {
+                walkFieldDef(w, f);
+            }
+            forEach(td.allMethods(), m) {
+                walkFunctionDecl(w, m);
+            }
+        case ast.EnumDeclStatement ed:
+            break;
+        case ast.FunctionDeclStatement fd:
+            break;    // handled above
+        case ast.AssignStatement a:
+            walkExpr(w, a.target);
+            walkExpr(w, a.value);
+        case ast.ReturnStatement r:
+            ast.Expression? rv = r.value;
+            if (rv != null) {
+                walkExpr(w, rv);
+            }
+        case ast.IfStatement i:
+            walkExpr(w, i.cond);
+            walkStmt(w, i.then);
+            ast.BlockStatement? els = i.else;
+            if (els != null) {
+                walkStmt(w, els);
+            }
+        case ast.SwitchStatement sw:
+            walkExpr(w, sw.subject);
+            forEach(sw.cases, cl) {
+                note(w, cl.id, "SwitchCase");
+                forEach(cl.values, v) {
+                    walkExpr(w, v);
+                }
+                ast.NamedType? tn = cl.typeName;
+                if (tn != null) {
+                    walkTypeNode(w, tn);
+                }
+                walkStmt(w, cl.body);
+            }
+        case ast.WhileStatement wh:
+            walkExpr(w, wh.cond);
+            walkStmt(w, wh.body);
+            forEach(wh.tail, t) {
+                walkStmt(w, t);
+            }
+        case ast.ForStatement f:
+            ast.Statement? init = f.init;
+            if (init != null) {
+                walkStmt(w, init);
+            }
+            walkExpr(w, f.cond);
+            ast.Statement? post = f.post;
+            if (post != null) {
+                walkStmt(w, post);
+            }
+            walkStmt(w, f.body);
+        case ast.IncDecStatement idc:
+            walkExpr(w, idc.target);
+        case ast.ForEachStatement fe:
+            walkExpr(w, fe.array);
+            walkStmt(w, fe.body);
+        case ast.BreakStatement br:
+            break;
+        case ast.ContinueStatement co:
+            break;
+        case ast.BlockStatement b:
+            forEach(b.statements, st) {
+                walkStmt(w, st);
+            }
+        case ast.ExpressionStatement es:
+            walkExpr(w, es.expression);
+    }
+}

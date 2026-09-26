@@ -1,0 +1,4763 @@
+// The checker. Nothing else in the suite pins the wording of a diagnostic.
+// A message carries a line and column, so a case matches by substring.
+import 'test';
+import 'string';
+import 'array';
+import 'map';
+import '../src/checker' as checker;
+import '../src/ast' as ast;
+import '../src/types' as types;
+import '../src/builtins' as builtins;
+
+import './checkerlib' as lib;
+
+String const CARTYPE = `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+`;
+
+String const HTTPENUM = `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+`;
+
+String const COUNTERTYPE = `
+type Counter {
+    int n;
+    String label;
+
+    int bump() {
+        self.n = self.n + 1;
+        return self.n;
+    }
+
+    void reset() {
+        self.n = 0;
+    }
+}
+`;
+
+String const VEHICLETYPES = `
+type Car {
+    String name;
+    String? color;
+    int wheels() { return 4; }
+    String describe() { return self.name; }
+}
+
+type Truck extends Car {
+    int load;
+    int override wheels() { return 6; }
+}
+`;
+
+test.start("checker: valid programs", void () -> {
+    lib.accepts([
+        lib.ok("spec example",
+            `import 'json';
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+
+int[] myArray = [2,5,4];
+int sum;
+int sumElements(int a, int b) {
+    return a + b;
+}
+forEach(myArray, e, i) {
+    sum = sumElements(sum, e + i);
+}
+Car myCar = {
+    make: "toyota",
+    age: 4
+}
+Car[] myCars = [myCar, { make: "honda", age: 6 }];
+String myCarJson = json.toText(myCar);
+`),
+        lib.ok("arithmetic and comparisons",
+            `
+int a = 1 + 2 * 3 - 4 / 2 % 2;
+float f = 1.5 * 2.0;
+bool b = 1 < 2 && 2.0 >= 1.0 || "a" < "b";
+bool c = !b == false;
+int n = -a;
+float g = -f;
+`),
+        lib.ok("control flow",
+            `
+int i = 0;
+while (i < 10) {
+    if (i % 2 == 0) {
+        i = i + 1;
+    } else if (i > 5) {
+        i = i + 2;
+    } else {
+        i = i + 3;
+    }
+}
+`),
+        lib.ok("for loops and inc/dec",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+
+int myVariable = 10;
+int sum = 0;
+for (int i = 0; i < myVariable; i++) {
+    sum = sum + i;
+}
+int i = 99;                            // the loop's i is gone; shadowing is fine
+for (int i = 0; i < 3; i++) {
+    sum = sum - i;
+}
+for (i = 5; i > 0; i--) {
+    sum = sum + 1;
+}
+for (; i < 3;) { i++; }
+float f;
+f--;
+int[] a = [1, 2];
+a[0]++;
+Car c = { make: "x", age: 1 }
+c.age--;
+`),
+        lib.ok("functions and recursion",
+            `
+int fib(int n) {
+    if (n < 2) { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+void noop() { return; }
+int x = fib(10);
+noop();
+`),
+        lib.ok("const bindings",
+            `import 'array';
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+
+String const greeting = "ciao";
+int const limit = 10;
+int[] const nums = [1, 2, 3];
+Car const c = { make: "fiat", age: 1 }
+int n = limit + nums[0];
+nums[0] = 9;                           // element writes are allowed
+nums[1]++;
+array.push(nums, 4);                   // the array stays mutable
+array.pop(nums);
+c.make = "toyota";                     // field writes are allowed
+c.age++;
+if (n > limit) {
+    int limit = 0;                     // shadowing a const is fine
+    limit = 1;                         // and the shadow is not const
+}
+`),
+        lib.ok("optionals",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+
+String? s;
+s = null;
+s = "hi";
+bool b1 = s == null;
+bool b2 = s != "hi";
+int? n = 5;
+bool b3 = n == 5;
+int? m = n;
+Car? c = { make: "x", age: 1 }
+bool b4 = c == null;
+`),
+        lib.ok("narrowing",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+
+Car? c;
+if (c != null) {
+    String m = c.make;
+    c.age = c.age + 1;
+}
+if (c == null) {
+    printInline("none");
+} else {
+    printInline(c.make);
+}
+int? n;
+if (n != null && n > 3) {
+    int big = n;
+}
+bool viaOr = n == null || n + 1 > 0;
+String? s = "hi";
+printInline(s + "!");
+s = null;
+int? cnt = 1;
+cnt++;
+printInline(cnt + 1);
+int f(Car? x) {
+    if (x == null) {
+        return 0;
+    }
+    return x.age;
+}
+`),
+        lib.ok("narrowing in loops",
+            `
+type Node { int value; Node? next; }
+Node? cur;
+int sum;
+while (cur != null) {
+    sum = sum + cur.value;
+    cur = cur.next;
+}
+int? n;
+while (n == null) {
+    n = 1;
+}
+int after = n;
+`),
+        lib.ok("optional chaining",
+            `
+type Team { String name; String[] members; }
+type Company { Team? boss; }
+type Node { int value; Node? next; }
+Company c = { boss: null };
+String? name = c.boss?.name;
+int? count = c.boss?.members.length;
+String? first = c.boss?.members[0];
+Node nd = { value: 1, next: null };
+int? deep = nd.next?.next?.value;
+bool b = c.boss?.name != null;
+printInline(c.boss?.name);
+`),
+        lib.ok("int8",
+            `
+int8 small = 127;
+int8 negative = -128;
+byte alias = 7;
+int widened = small + negative;
+int direct = small;
+`),
+        lib.ok("narrow numbers",
+            `
+int8 small = 1;
+int16 short = 32767;
+int32 long = -2147483648;
+float32 temp = 0.1;
+int16 fromByte = small;
+int32 fromShort = short;
+int64 fromLong = long;
+float64 fromTemp = temp;
+int sum = short + long + small;
+float scaled = temp * 2.0;
+bool ordered = small < short && short < long;
+bool same = temp == 1.5;
+int16[] shorts = [1, 2];
+float32[] temps = [0.5];
+int32 indexed = shorts[short];
+`),
+        lib.ok("alternate spellings",
+            `
+int64 a = 1;
+int b = a;
+int64 c = b;
+float64 x = 1.5;
+float y = x;
+float64 z = y;
+byte n = 1;
+uint8 m = n;
+uint16 w = m;
+int q = m;
+uint64 big = 1;
+uint natural = 2;
+uint64 wider = natural;
+uint alsoNatural = big;
+int fromByte = n + 1;
+bool small = n < 200 && big > 0 && natural == 2;
+uint sum = natural + big;
+uint quot = big / natural;
+uint8[] bytes = [0, 255];
+Map<uint8, uint> counts = { 1: 2 };
+`),
+        lib.ok("records",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+
+Car a = { make: "t", age: 1 }
+Car b = { make: "u", age: 2, owner: "bob" }
+a.age = 3;
+a.owner = null;
+String s = a.make;
+String? o = a.owner;
+bool same = a.owner == "bob";
+`),
+        lib.ok("arrays",
+            `
+int[] xs = [1, 2, 3];
+int[] empty = [];
+xs[0] = 5;
+int n = xs[1] + xs.length;
+String[] ss = ["a", "b"];
+forEach(ss, s) { printInline(s); }
+forEach(xs, x, i) { xs[i] = x + i; }
+int?[] opts = [1, null, 3];
+`),
+        lib.ok("array library and fixed-size arrays",
+            `
+import 'array';
+int[] xs = [1, 2, 3];
+array.push(xs, 4);
+int last = array.pop(xs);
+int[] ys = array.copy(xs);
+int[5] fixed = [1, 2, 3, 4, 5];
+fixed[0] = 9;
+int n = fixed[4] + fixed.length;
+int[] loose = array.copy(fixed);
+forEach(fixed, e, i) { printInline(e + i); }
+String[] ss = [];
+array.push(ss, "hi");
+String s = array.pop(ss);
+int[2][] rows = [[1, 2], [3, 4]];
+int[2] row = rows[0];
+`),
+        lib.ok("aliased array module",
+            `
+import 'array' as arr;
+int[] xs = [];
+arr.push(xs, 1);
+int x = arr.pop(xs);
+`),
+        lib.ok("forEach shadows outer name",
+            `
+int e = 1;
+int[] xs = [1];
+forEach(xs, e) { printInline(e); }
+forEach(xs, e, i) {
+    while (e > 0) { e = e - 1; }
+}
+`),
+        lib.ok("nested and anonymous types",
+            `
+type Engine { float liters; int cylinders }
+type Truck {
+    String make;
+    Engine engine;
+    {
+        String label;
+        { int weight }[] boxes;
+    }[]? cargo;
+}
+Truck t = { make: "volvo", engine: { liters: 12.8, cylinders: 6 } }
+t.cargo = [{ label: "a", boxes: [{ weight: 1 }] }];
+float l = t.engine.liters;
+`),
+        lib.ok("record arrays",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+
+Car[] cars = [{ make: "a", age: 1 }, { make: "b", age: 2, owner: "o" }];
+forEach(cars, c, i) {
+    printInline(c.make);
+    printInline(i);
+}
+Car? maybe = cars[0];
+`),
+        lib.ok("times",
+            `
+import 'time';
+DateTime now = time.now();
+Duration span = time.duration("30m");
+DateTime d = time.date.fromText("2026-07-25");
+String s = time.date.toText(d);
+int y = time.date.year(d);
+int m = time.date.month(d);
+int dd = time.date.day(d);
+DateTime later = time.date.addDays(d, 30);
+bool cmp = d < later && d != later && span < time.duration("1h");
+`),
+        lib.ok("instants and durations",
+            `
+import 'time';
+DateTime start = time.now();
+DateTime end = start + time.duration("1h");
+Duration took = end - start;
+Duration twice = took + took;
+Duration less = took - time.duration("30m");
+Duration scaled = took * 3;
+Duration mirrored = 3 * took;
+Duration shared = took / 4;
+Duration back = -took;
+DateTime earlier = end - time.duration("15m");
+int ms = time.milliseconds(took);
+bool ok = took > time.duration("1s") && took == 3600000 && ms > 0 && earlier < end;
+`),
+        // A bare number where a Duration is wanted means milliseconds.
+        lib.ok("integer literals become durations",
+            `
+import 'time';
+Duration d = 500;
+Duration neg = -250;
+bool a = d == 500;
+bool b = 500 == d;
+bool c = d < 1000 && -1 < d;
+Duration sum = d + 250;
+Duration diff = 1000 - d;
+DateTime t = time.now() + 5000;
+DateTime u = 5000 + time.now();
+DateTime v = time.now() - 5000;
+`),
+        lib.ok("time.sleep is a Future<void>",
+            `
+import 'time';
+import 'async';
+void async nap() { await time.sleep(time.duration("1s")); }
+void async slow() { await time.sleep(1); }
+async.run(time.sleep(0), void () -> printInline("tick"));
+`),
+        lib.ok("json",
+            `import 'json';
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+
+Car c = { make: "t", age: 1 }
+String a = json.toText(c);
+String b = json.toText([1, 2]);
+String s = json.toText("x");
+String f = json.toText(1.5);
+printInline(a);
+`),
+        lib.ok("nested records",
+            `
+type Point { int x; int y; }
+type Line { Point from; Point to; }
+Line l = { from: { x: 0, y: 0 }, to: { x: 1, y: 1 } }
+int x = l.from.x;
+l.to = { x: 2, y: 2 }
+`),
+        lib.ok("shadowing in blocks",
+            `
+int x = 1;
+if (x == 1) {
+    int y = 2;
+    x = y;
+}
+int f(int x) { return x; }
+`),
+        lib.ok("DateTime equality with optional",
+            `
+DateTime? maybe;
+bool b = maybe == null;
+`),
+        lib.ok("aliased builtin modules",
+            `
+import 'time' as when;
+import 'json' as encode;
+DateTime d = when.now();
+String s = encode.toText(when.date.year(d));
+`),
+        lib.ok("single-quoted strings",
+            `
+String s = 'hello';
+bool b = 'a' < "b";
+`),
+        // getType accepts the records, arrays and function values print rejects.
+        lib.ok("getType",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+
+enum E { A: 1 }
+Car c;
+int[] xs = [1, 2];
+Function(int)<int> f = int (int n) -> n;
+int async slow() { return 1; }
+String a = getType(c);
+String b = getType(xs);
+String d = getType(f);
+String e = getType(E.A);
+String g = getType(slow());
+String h = getType(null);
+String i = getType(1 + 2);
+printInline(getType("x") + "!");
+`),
+        lib.ok("record field named length",
+            `
+type T { int length; }
+T v = { length: 3 }
+v.length = 5;
+int n = v.length;
+`),
+        lib.ok("break and continue in every loop",
+            `
+while (true) {
+    if (true) { continue; }
+    break;
+}
+for (int i = 0; i < 3; i++) {
+    if (i == 1) { continue; }
+    break;
+}
+forEach([1, 2], e) {
+    if (e == 1) { continue; }
+    break;
+}
+`),
+        lib.ok("break and continue bind to the innermost loop",
+            `
+forEach([1, 2], e) {
+    while (true) {
+        break;
+    }
+    continue;
+}
+`),
+        lib.ok("break and continue inside a function declaration's loop",
+            `
+int f(int[] xs) {
+    int n = 0;
+    forEach(xs, x) {
+        if (x < 0) { continue; }
+        if (x > 10) { break; }
+        n = n + x;
+    }
+    return n;
+}
+`),
+        lib.ok("continue narrows for the rest of the body",
+            `
+int? maybe() { return 1; }
+forEach([1, 2], e) {
+    int? x = maybe();
+    if (x == null) { continue; }
+    printInline(x + 1);
+}
+`),
+        lib.ok("break narrows for the rest of the body",
+            `
+int? maybe() { return 1; }
+while (true) {
+    int? x = maybe();
+    if (x == null) { break; }
+    printInline(x + 1);
+}
+`),
+        lib.ok("a loop with no break still narrows after it",
+            `
+int? maybe() { return 1; }
+int? x = maybe();
+while (x == null) {
+    x = maybe();
+}
+printInline(x + 1);
+`),
+        lib.ok("a loop inside a function value has its own loops",
+            `
+Function()<void> f = void () -> {
+    while (true) { break; }
+};
+`),
+        // A library name stays free in a file that does not import it.
+        lib.ok("library names are free without the import",
+            `
+type Route { String path; int os; }
+String path = "/tmp";
+int[] array = [1, 2];
+Map<String, int> map = { "a": 1 }
+int time = 3;
+String json(String s) { return s; }
+int async(int n) { return n * 2; }
+Route fs(String string) { return { path: string, os: 1 } }
+forEach(array, os) { printInline(os); }
+printInline(path + json("x") + fs(path).path);
+printInline(async(time));
+printInline(map["a"] == null);
+`),
+        lib.ok("a renamed import frees the library's own name",
+            `
+import 'path' as p;
+String path = "/tmp";
+printInline(p.join(path, "a"));
+`),
+    ]);
+});
+
+test.start("checker: invalid programs", void () -> {
+    lib.rejects([
+        lib.bad("undefined variable", "printInline(x);", "undefined: x"),
+        lib.bad("undefined function", "foo();", "undefined function: foo"),
+        lib.bad("call non-function", "int x = 1; x();", "\"x\" is not a function"),
+        lib.bad("redeclared variable", "int x = 1; int x = 2;", "already declared"),
+        lib.bad("unknown type", "frob x;", "unknown type \"frob\""),
+        lib.bad("type mismatch decl", "int x = \"a\";", "cannot use String as int"),
+        lib.bad("int float mix",
+            "int x = 1 + 1.5;",
+            "operator + is not defined on int and float"),
+        lib.bad("String minus", "String s = \"a\" - \"b\";", "operator - is not defined"),
+        lib.bad("float modulo", "float f = 1.5 % 2.0;", "operator % is not defined"),
+        lib.bad("bang on int", "bool b = !1;", "operator ! is not defined on int"),
+        lib.bad("minus on string",
+            "String s = -\"a\";",
+            "operator - is not defined on String"),
+        lib.bad("and on ints", "bool b = 1 && 2;", "operator && is not defined"),
+        lib.bad("condition not bool", "if (1) {}", "condition must be bool"),
+        lib.bad("break at top level", "break;", "break outside a loop"),
+        lib.bad("continue at top level", "continue;", "continue outside a loop"),
+        lib.bad("break in a function, no loop",
+            "void f() { break; }",
+            "break outside a loop"),
+        lib.bad("break after the loop ends",
+            "while (true) {} break;",
+            "break outside a loop"),
+        lib.bad("break in an if, no loop",
+            "if (true) { continue; }",
+            "continue outside a loop"),
+        lib.bad("break in a function value nested in a loop",
+            "while (true) { Function()<void> f = void () -> { break; }; f(); }",
+            "break outside a loop"),
+        lib.bad("a loop with a break does not narrow after it",
+            `int? maybe() { return 1; }
+int? x = maybe();
+while (x == null) { x = maybe(); break; }
+printInline(x + 1);`,
+            "operator + is not defined on int? and int"),
+        lib.bad("while condition not bool", "while (\"x\") {}", "condition must be bool"),
+        lib.bad("assign type mismatch",
+            "int x = 1; x = \"a\";",
+            "cannot assign String to int"),
+        lib.bad("assign to undefined", "x = 1;", "undefined: x"),
+        lib.bad("assign to const",
+            "int const x = 1; x = 2;",
+            "cannot assign to \"x\": it is declared const"),
+        lib.bad("assign to const string",
+            "String const s = \"a\"; s = \"b\";",
+            "cannot assign to \"s\": it is declared const"),
+        lib.bad("assign to const array binding",
+            "int[] const a = [1]; a = [2];",
+            "cannot assign to \"a\": it is declared const"),
+        lib.bad("incdec on const",
+            "int const x = 1; x++;",
+            "cannot assign to \"x\": it is declared const"),
+        lib.bad("const in for post",
+            "for (int const i = 0; i < 3; i++) {}",
+            "cannot assign to \"i\": it is declared const"),
+        lib.bad("assign to const in function",
+            "int const x = 1; void f() { x = 2; }",
+            "cannot assign to \"x\": it is declared const"),
+        lib.bad("assign to function",
+            "void f() {} f = 1;",
+            "cannot assign to function \"f\""),
+        lib.bad("return outside function", "return 1;", "return outside function"),
+        lib.bad("void returns value",
+            "void f() { return 1; }",
+            "unexpected return value in void function"),
+        lib.bad("missing return value", "int f() { return; }", "missing return value"),
+        // sealed types (§2.4, §3.6, §4.9)
+        lib.bad("sealed extended from another module is caught elsewhere; here: a leaf cannot be extended",
+            "sealed type E { int l; } type A extends E { int a; } type B extends A { int b; }",
+            "which is sealed, so A cannot itself be extended"),
+        lib.bad("plain extends still grants no assignability",
+            "type V { String m; } type T extends V { int l; } T t = { m: \"a\", l: 1 }; V v = t;",
+            "cannot use T as V"),
+        lib.bad("downcast target must extend the subject",
+            `sealed type E { int l; } type A extends E { int a; } type O { int z; }
+\t\t\t A a = { l: 1, a: 2 }; E e = a; O? o = e as O;`,
+            "cannot narrow E to O: E is extended by A"),
+        lib.bad("as on an unsealed record is not a narrowing",
+            "type P { int z; } P p = { z: 1 }; P? q = p as P;",
+            "but P is not sealed"),
+        lib.bad("type switch must cover every extender",
+            `sealed type E { int l; } type A extends E { int a; } type B extends E { int b; }
+\t\t\t A a = { l: 1, a: 2 }; E e = a; switch (e) { case A x: print(x.a); }`,
+            "does not cover every type extending E: add B, or a default clause"),
+        lib.bad("an exhaustive type switch has no reachable default",
+            `sealed type E { int l; } type A extends E { int a; }
+\t\t\t A a = { l: 1, a: 2 }; E e = a;
+\t\t\t switch (e) { case A x: print(x.a); default: print("no"); }`,
+            "already matched, so this switch's default clause can never run"),
+        lib.bad("a type is matched once",
+            `sealed type E { int l; } type A extends E { int a; } type B extends E { int b; }
+\t\t\t A a = { l: 1, a: 2 }; E e = a;
+\t\t\t switch (e) { case A x: print(x.a); case A y: print(y.a); default: print("?"); }`,
+            "type A is already matched by an earlier clause"),
+        lib.bad("only a sealed type has a known set of extenders",
+            "type P { int z; } P p = { z: 1 }; switch (p) { case P q: print(q.z); }",
+            "only a sealed type has a known set of types extending it"),
+        lib.bad("type labels and value labels do not mix",
+            `sealed type E { int l; } type A extends E { int a; }
+\t\t\t A a = { l: 1, a: 2 }; E e = a;
+\t\t\t switch (e) { case A x: print(x.a); case 3: print("three"); }`,
+            "matches types, so its clauses cannot also match values"),
+        lib.bad("a method needs a certain receiver",
+            `sealed type S { int n; String d() { return "s"; } }
+\t\t\t type Q extends S { String override d() { return "q"; } }
+\t\t\t Q q = { n: 1 }; S s = q; print(s.d());`,
+            "S is sealed, so this value may be of any type extending it"),
+        lib.bad("wrong return type", "int f() { return \"a\"; }", "cannot return String"),
+        lib.bad("int8 out of range", "int8 b = 200;", "cannot use int as int8"),
+        lib.bad("int8 from int var", "int x = 1; int8 b = x;", "cannot use int as int8"),
+        lib.bad("int16 out of range", "int16 s = 32768;", "cannot use int as int16"),
+        lib.bad("int16 negative out of range",
+            "int16 s = -32769;",
+            "cannot use int as int16"),
+        lib.bad("int32 out of range", "int32 n = 2147483648;", "cannot use int as int32"),
+        lib.bad("int32 negative out of range",
+            "int32 n = -2147483649;",
+            "cannot use int as int32"),
+        lib.bad("no narrowing int32 to int16",
+            "int32 n = 1; int16 s = n;",
+            "cannot use int32 as int16"),
+        lib.bad("no narrowing int16 to int8",
+            "int16 s = 1; int8 b = s;",
+            "cannot use int16 as int8"),
+        lib.bad("no narrowing int64 to int32",
+            "int64 n = 1; int32 m = n;",
+            "cannot use int64 as int32"),
+        lib.bad("widened arithmetic does not fit back",
+            "int16 a = 1; int16 b = 2; int16 c = a + b;",
+            "cannot use int as int16"),
+        lib.bad("negation widens", "int8 b = -128; int8 c = -b;", "cannot use int as int8"),
+        lib.bad("float32 out of range",
+            "float32 f = 400000000000000000000000000000000000000.0;",
+            "cannot use float as float32"),
+        lib.bad("no narrowing float64 to float32",
+            "float64 g = 1.5; float32 f = g;",
+            "cannot use float64 as float32"),
+        lib.bad("float32 arithmetic widens",
+            "float32 f = 1.5; float32 g = f + f;",
+            "cannot use float as float32"),
+        lib.bad("int literal is not a float32",
+            "float32 f = 1;",
+            "cannot use int as float32"),
+        lib.bad("families do not mix",
+            "int16 s = 1; float32 f = 1.5; printInline(s + f);",
+            "operator + is not defined on int16 and float32"),
+        lib.bad("redefine int32",
+            "type int32 { int x; }",
+            "cannot redefine built-in type \"int32\""),
+        lib.bad("alias float32",
+            "import 'json' as float32;",
+            "cannot use \"float32\" as a module name"),
+        lib.bad("null to non-optional", "int x = null;", "cannot use null as int"),
+        lib.bad("compare int null", "bool b = 1 == null;", "cannot compare int and null"),
+        lib.bad("compare records",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Car a = {make:"x",age:1} Car b = {make:"y",age:2} bool c = a == b;`,
+            "cannot compare Car and Car"),
+        lib.bad("order bools", "bool b = true < false;", "operator < is not defined"),
+        lib.bad("record literal no context",
+            "{ a: 1 };",
+            "cannot determine the record type"),
+        lib.bad("record unknown field",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Car c = { make: "x", age: 1, wheels: 4 }`,
+            "no field \"wheels\""),
+        lib.bad("record missing field",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Car c = { make: "x" }`,
+            "missing field \"age\""),
+        lib.bad("record duplicate field",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Car c = { make: "x", make: "y", age: 1 }`,
+            "duplicate field"),
+        lib.bad("record field type",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Car c = { make: 5, age: 1 }`,
+            "field \"make\": cannot use int as String"),
+        lib.bad("empty array no context", "[];", "cannot infer the element type"),
+        lib.bad("array element mismatch",
+            "int[] a = [1, \"x\"];",
+            "cannot use String as int"),
+        lib.bad("index non-array", "int x = 1; int y = x[0];", "cannot index int"),
+        lib.bad("non-int index",
+            "int[] a = [1]; int x = a[\"0\"];",
+            "array index must be int"),
+        lib.bad("assign to length",
+            "int[] a = [1]; a.length = 2;",
+            "cannot assign to array length"),
+        lib.bad("member on int", "int x = 1; int y = x.foo;", "type int has no properties"),
+        lib.bad("unknown record field",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Car c = { make: "x", age: 1 } int y = c.wheels;`,
+            "no field \"wheels\""),
+        lib.bad("unknown array property",
+            "int[] a = [1]; int x = a.size;",
+            "arrays have no property \"size\""),
+        lib.bad("member on optional",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Car? c; String m = c.make;`,
+            "compare with null first"),
+        lib.bad("optional of optional", "int?? x;", "optional of optional"),
+        lib.bad("narrowing does not reach else",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Car? c;
+if (c != null) {} else { String m = c.make; }`,
+            "compare with null first"),
+        lib.bad("narrowing killed by null assignment",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Car? c = { make: "x", age: 1 }
+c = null;
+String m = c.make;`,
+            "compare with null first"),
+        lib.bad("narrowing killed by optional assignment",
+            "int? a = 1; int? b; a = b; int x = a;",
+            "cannot use int? as int"),
+        lib.bad("narrowing killed by loop reassignment",
+            `int? p = 5;
+while (true) {
+    int x = p;
+    p = null;
+}`,
+            "cannot use int? as int"),
+        lib.bad("narrowing killed after loop",
+            `int? p = 5;
+forEach([1, 2], e) {
+    p = null;
+}
+int x = p;`,
+            "cannot use int? as int"),
+        lib.bad("or does not narrow",
+            `int? n;
+if (n != null || true) { int x = n; }`,
+            "cannot use int? as int"),
+        lib.bad("narrowing is per-variable",
+            `int? a; int? b;
+if (a != null) { int x = b; }`,
+            "cannot use int? as int"),
+        lib.bad("shadow is not narrowed",
+            `int? a = 1;
+if (true) {
+    int? a;
+    int x = a;
+}`,
+            "cannot use int? as int"),
+        lib.bad("function body does not inherit narrowing",
+            `int? g = 1;
+void f() { int x = g; }`,
+            "cannot use int? as int"),
+        lib.bad("chain on non-optional",
+            "int x = 1; printInline(x?.foo);",
+            "?. needs an optional value"),
+        lib.bad("chain on module",
+            "import 'time'; printInline(time?.now());",
+            "cannot call through ?."),
+        lib.bad("assign through chain",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Car? c; c?.make = "x";`,
+            "cannot assign through ?."),
+        lib.bad("assign through chain index",
+            `type Box { int[]? xs; }
+Box b = { xs: null }
+b.xs?.length = 1;`,
+            "cannot assign through ?."),
+        lib.bad("incdec through chain",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Car? c; c?.age++;`,
+            "cannot assign through ?."),
+        lib.bad("index optional without chain",
+            "int[]? a; int x = a[0];",
+            "cannot index optional type int[]?"),
+        lib.bad("chain member unknown",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Car? c; printInline(c?.wheels);`,
+            "no field \"wheels\""),
+        lib.bad("for condition not bool",
+            "for (int i = 0; i + 1; i++) {}",
+            "condition must be bool"),
+        lib.bad("for body redeclares init var",
+            "for (int i = 0; i < 3; i++) { int i = 1; }",
+            "already declared"),
+        lib.bad("for init var scoped to loop",
+            "for (int i = 0; i < 3; i++) {} printInline(i);",
+            "undefined: i"),
+        lib.bad("for post cannot see body vars",
+            "for (int i = 0; i < 3; j++) { int j = 0; }",
+            "undefined: j"),
+        lib.bad("for init reserved name",
+            "for (int print = 0; print < 1; print++) {}",
+            "reserved name"),
+        lib.bad("for init module alias",
+            "import 'json'; for (int json = 0; json < 1; json++) {}",
+            "already used as a module name"),
+        lib.bad("return at top level in for",
+            "for (int i = 0; i < 1; i++) { return; }",
+            "return outside function"),
+        lib.bad("incdec on string",
+            "String s = \"a\"; s++;",
+            "operator ++ is not defined on String"),
+        lib.bad("incdec on bool", "bool b; b--;", "operator -- is not defined on bool"),
+        lib.bad("incdec on int8", "int8 b = 1; b++;", "int8 arithmetic widens to int"),
+        lib.bad("incdec on int16", "int16 s = 1; s++;", "int16 arithmetic widens to int"),
+        lib.bad("incdec on int32", "int32 n = 1; n--;", "int32 arithmetic widens to int"),
+        lib.bad("incdec on float32",
+            "float32 f = 1.5; f++;",
+            "float32 arithmetic widens to float"),
+        lib.bad("incdec on record",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Car c = { make: "x", age: 1 } c++;`,
+            "operator ++ is not defined on Car"),
+        lib.bad("incdec on un-narrowed optional",
+            "int? n; n++;",
+            "operator ++ is not defined on int?"),
+        lib.bad("incdec killed by loop reassignment",
+            `int? n = 1;
+while (true) { n++; n = null; }`,
+            "operator ++ is not defined on int?"),
+        lib.bad("incdec undefined", "x++;", "undefined: x"),
+        lib.bad("incdec on array length",
+            "int[] a = [1]; a.length++;",
+            "cannot assign to array length"),
+        lib.bad("incdec on function",
+            "void f() {} f++;",
+            "cannot assign to function \"f\""),
+        lib.bad("forEach non-array",
+            "forEach(1, e) {}",
+            "forEach iterates over an array, got int"),
+        lib.bad("forEach optional array",
+            "int[]? a; forEach(a, e) {}",
+            "forEach iterates over an array, got int[]?"),
+        lib.bad("forEach duplicate binding",
+            "int[] a = [1]; forEach(a, e, e) {}",
+            "distinct names"),
+        lib.bad("forEach reserved binding",
+            "int[] a = [1]; forEach(a, print) {}",
+            "reserved name"),
+        lib.bad("forEach alias binding",
+            "import 'json'; int[] a = [1]; forEach(a, e, json) {}",
+            "already used as a module name"),
+        lib.bad("forEach elem type",
+            "int[] a = [1]; forEach(a, e) { String s = e; }",
+            "cannot use int as String"),
+        lib.bad("forEach index type",
+            "int[] a = [1]; forEach(a, e, i) { String s = i; }",
+            "cannot use int as String"),
+        lib.bad("forEach over a String binds an int code point",
+            "forEach(\"a\", r) { String s = r; }",
+            "cannot use int as String"),
+        lib.bad("forEach over a String binds an int byte offset",
+            "forEach(\"a\", r, i) { String s = i; }",
+            "cannot use int as String"),
+        lib.bad("forEach bindings scoped to body",
+            "int[] a = [1]; forEach(a, e) {} printInline(e);",
+            "undefined: e"),
+        lib.bad("forEach body redeclares elem",
+            "int[] a = [1]; forEach(a, e) { int e = 1; }",
+            "already declared"),
+        lib.bad("forEach elem not an array",
+            "int[] a = [1]; forEach(a, e) { forEach(e, x) {} }",
+            "forEach iterates over an array, got int"),
+        lib.bad("return at top level in forEach",
+            "int[] a = [1]; forEach(a, e) { return; }",
+            "return outside function"),
+        lib.bad("unknown array method",
+            "int[] a = [1]; a.map(a);",
+            "arrays have no method \"map\""),
+        lib.bad("push as method",
+            "int[] a = [1]; a.push(2);",
+            "push is a function of the array library"),
+        lib.bad("array not imported",
+            "int[] a = [1]; array.push(a, 2);",
+            "import it first"),
+        lib.bad("array bare", "printInline(array);", "built-in library"),
+        lib.bad("array unknown function",
+            "import 'array'; int[] a = [1]; array.frobnicate(a);",
+            "array has no function \"frobnicate\""),
+        lib.bad("push arity",
+            "import 'array'; int[] a = [1]; array.push(a);",
+            "array.push takes 2 argument(s), got 1"),
+        lib.bad("push non-array",
+            "import 'array'; array.push(1, 2);",
+            "argument 1 of array.push must be an array, got int"),
+        lib.bad("push element type",
+            "import 'array'; int[] a = [1]; array.push(a, \"x\");",
+            "argument 2 of array.push: cannot use String as int"),
+        lib.bad("push to fixed-size array",
+            "import 'array'; int[3] a = [1, 2, 3]; array.push(a, 4);",
+            "cannot push to a fixed-size array (int[3])"),
+        lib.bad("pop from fixed-size array",
+            "import 'array'; int[3] a = [1, 2, 3]; int x = array.pop(a);",
+            "cannot pop from a fixed-size array (int[3])"),
+        lib.bad("pop result type",
+            "import 'array'; int[] a = [1]; String s = array.pop(a);",
+            "cannot use int as String"),
+        lib.bad("copy is growable",
+            "import 'array'; int[3] a = [1, 2, 3]; int[3] b = array.copy(a);",
+            "cannot use int[] as int[3]"),
+        lib.bad("sort arity",
+            "import 'array'; int[] a = [1]; array.sort(a, bool (int x, int y) -> true, 3);",
+            "array.sort takes 1 or 2 argument(s), got 3"),
+        lib.bad("sort unordered element",
+            "import 'array'; type P { int n; } P[] a = [{n: 1}]; array.sort(a);",
+            "cannot sort P[]: P values have no order; pass a comparator"),
+        lib.bad("sort bool",
+            "import 'array'; bool[] a = [true]; array.sort(a);",
+            "cannot sort bool[]: bool values have no order"),
+        lib.bad("sort optional element",
+            "import 'array'; int?[] a = [1]; array.sort(a);",
+            "cannot sort int?[]: int? values have no order"),
+        lib.bad("sort comparator params",
+            "import 'array'; int[] a = [1]; array.sort(a, bool (String x, String y) -> true);",
+            "argument 2 of array.sort must be Function(int, int)<bool>, got Function(String, String)<bool>"),
+        lib.bad("sort comparator result",
+            "import 'array'; int[] a = [1]; array.sort(a, int (int x, int y) -> 1);",
+            "argument 2 of array.sort must be Function(int, int)<bool>, got Function(int, int)<int>"),
+        lib.bad("sort comparator not a function",
+            "import 'array'; int[] a = [1]; array.sort(a, 5);",
+            "argument 2 of array.sort must be Function(int, int)<bool>, got int"),
+        lib.bad("sort comparator fallible",
+            "import 'array'; int[] a = [1]; Function(int, int)<bool!> c; array.sort(a, c);",
+            "argument 2 of array.sort cannot be fallible"),
+        lib.bad("sort returns nothing",
+            "import 'array'; int[] a = [1]; int[] b = array.sort(a);",
+            "cannot use void as int[]"),
+        lib.bad("indexOf arity",
+            "import 'array'; int[] a = [1]; array.indexOf(a);",
+            "array.indexOf takes 2 argument(s), got 1"),
+        lib.bad("indexOf record element",
+            "import 'array'; type P { int n; } P[] a = [{n: 1}]; array.indexOf(a, a[0]);",
+            "cannot use array.indexOf on P[]: P values cannot be compared with =="),
+        lib.bad("indexOf array element",
+            "import 'array'; int[][] a = [[1]]; array.indexOf(a, a[0]);",
+            "cannot use array.indexOf on int[][]: int[] values cannot be compared with =="),
+        lib.bad("indexOf value type",
+            "import 'array'; int[] a = [1]; array.indexOf(a, \"x\");",
+            "argument 2 of array.indexOf: cannot use String as int"),
+        lib.bad("indexOf result type",
+            "import 'array'; int[] a = [1]; String s = array.indexOf(a, 1);",
+            "cannot use int as String"),
+        lib.bad("slice arity",
+            "import 'array'; int[] a = [1]; array.slice(a);",
+            "array.slice takes 2 or 3 argument(s), got 1"),
+        lib.bad("slice index type",
+            "import 'array'; int[] a = [1]; array.slice(a, \"x\");",
+            "argument 2 of array.slice must be an int, got String"),
+        lib.bad("slice end type",
+            "import 'array'; int[] a = [1]; array.slice(a, 0, 1.5);",
+            "argument 3 of array.slice must be an int, got float"),
+        lib.bad("slice is growable",
+            "import 'array'; int[3] a = [1, 2, 3]; int[3] b = array.slice(a, 0);",
+            "cannot use int[] as int[3]"),
+        lib.bad("array name taken by the import",
+            "import 'array'; int array = 1;",
+            "already used as a module name"),
+        lib.bad("fixed literal too short",
+            "int[5] a = [1, 2, 3];",
+            "wrong number of elements for int[5]: got 3, want 5"),
+        lib.bad("fixed literal too long",
+            "int[2] a = [1, 2, 3];",
+            "wrong number of elements for int[2]: got 3, want 2"),
+        lib.bad("fixed literal empty",
+            "int[2] a = [];",
+            "wrong number of elements for int[2]: got 0, want 2"),
+        lib.bad("fixed to growable",
+            "int[3] a = [1, 2, 3]; int[] b = a;",
+            "cannot use int[3] as int[]"),
+        lib.bad("growable to fixed",
+            "int[] a = [1, 2, 3]; int[3] b = a;",
+            "cannot use int[] as int[3]"),
+        lib.bad("fixed size mismatch",
+            "int[3] a = [1, 2, 3]; int[4] b = a;",
+            "cannot use int[3] as int[4]"),
+        lib.bad("zero array size",
+            "int[0] a;",
+            "a fixed-size array needs a positive size, got 0"),
+        lib.bad("constant index out of range",
+            "int[3] a = [1, 2, 3]; int x = a[3];",
+            "index 3 out of range for int[3]"),
+        lib.bad("string index assigned",
+            "String s = \"hi\"; s[0] = 65;",
+            "cannot assign to a byte of a String"),
+        lib.bad("string index not int",
+            "String s = \"hi\"; byte b = s[\"x\"];",
+            "string index must be int, got String"),
+        lib.bad("string index of optional",
+            "String? s = null; byte b = s[0];",
+            "cannot index optional type String? (compare with null first)"),
+        lib.bad("string index is a byte",
+            "String s = \"hi\"; String c = s[0];",
+            "cannot use uint8 as String"),
+        lib.bad("fixed array as growable argument",
+            "void f(int[] xs) {} int[2] a = [1, 2]; f(a);",
+            "cannot use int[2] as int[]"),
+        lib.bad("anon type duplicate field",
+            "type T { { int x; int x; } a; }",
+            "type \"T.a\" has duplicate field \"x\""),
+        lib.bad("anon type unknown field",
+            "type T { { int x; } a; } T v = { a: { y: 1 } }",
+            "type T.a has no field \"y\""),
+        lib.bad("anon type missing field",
+            "type T { { int x; } a; } T v = { a: {} }",
+            "missing field \"x\" (int) in T.a literal"),
+        lib.bad("call method on int", "int x = 1; x.foo();", "type int has no properties"),
+        lib.bad("print void", "void f() {} printInline(f());", "cannot print a void value"),
+        lib.bad("print record",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Car c; printInline(c);`,
+            "cannot print Car"),
+        lib.bad("print array", "printInline([1, 2]);", "cannot print int[]"),
+        lib.bad("print optional record",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Car? c; printInline(c);`,
+            "cannot print Car?"),
+        lib.bad("print function",
+            "void f() {} printInline(f);",
+            "function \"f\" must be called"),
+        lib.bad("bare function ref", "void f() {} f;", "function \"f\" must be called"),
+        lib.bad("print bare", "print;", "print must be called"),
+        lib.bad("printInline bare",
+            "printInline;",
+            "printInline must be called: printInline(value)"),
+        lib.bad("printInline later argument", "printInline(1, [2]);", "cannot print int[]"),
+        lib.bad("print later argument",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Car c; print("car:", c);`,
+            "cannot print Car; print takes strings, numbers, bools, DateTime and Duration values, and enums"),
+        lib.bad("reserved printInline var", "int printInline = 1;", "reserved name"),
+        lib.bad("getType arity zero",
+            "printInline(getType());",
+            "getType takes exactly 1 argument, got 0"),
+        lib.bad("getType arity two",
+            "printInline(getType(1, 2));",
+            "getType takes exactly 1 argument, got 2"),
+        lib.bad("getType void",
+            "void f() {} printInline(getType(f()));",
+            "cannot take getType of a void value"),
+        lib.bad("getType bare", "getType;", "getType must be called: getType(value)"),
+        lib.bad("getType undefined arg", "printInline(getType(nope));", "undefined: nope"),
+        lib.bad("reserved getType var", "int getType = 1;", "reserved name"),
+        lib.bad("reserved getType function", "void getType() {}", "reserved name"),
+        lib.bad("reserved getType param", "void f(int getType) {}", "reserved name"),
+        lib.bad("reserved getType type", "type getType { int x; }", "reserved name"),
+        lib.bad("alias getType",
+            "import 'json' as getType;",
+            "cannot use \"getType\" as a module name"),
+        lib.bad("json bare", "printInline(json);", "built-in library"),
+        lib.bad("json member no call",
+            "import 'json'; String s = json.toText;",
+            "must be called"),
+        lib.bad("json unknown",
+            "import 'json'; String s = json.decode(\"x\");",
+            "json has no function \"decode\""),
+        lib.bad("json null",
+            "import 'json'; String s = json.toText(null);",
+            "cannot serialize null"),
+        lib.bad("json arity",
+            "import 'json'; String s = json.toText(1, 2);",
+            "json.toText takes exactly 1 argument"),
+        lib.bad("json function arg",
+            "import 'json'; void f() {} String s = json.toText(f);",
+            "function \"f\" must be called"),
+        lib.bad("json not imported", "String s = json.toText(1);", "import it first"),
+        lib.bad("time not imported", "DateTime d = time.now();", "import it first"),
+        lib.bad("time unknown",
+            "import 'time'; DateTime d = time.tomorrow();",
+            "time has no function \"tomorrow\""),
+        lib.bad("calendar function on the module",
+            "import 'time'; int y = time.year(time.now());",
+            "time has no function \"year\"; it is a calendar function: time.date.year(...)"),
+        lib.bad("time.date is not a value",
+            "import 'time'; printInline(time.date);",
+            "time.date is a group of functions, not a value"),
+        lib.bad("time.date unknown",
+            "import 'time'; DateTime d = time.date.tomorrow();",
+            "time.date has no function \"tomorrow\""),
+        lib.bad("time.date wrong arg",
+            "import 'time'; int y = time.date.year(\"x\");",
+            "cannot use String as DateTime"),
+        lib.bad("time.date arity",
+            "import 'time'; DateTime d = time.date.addDays(time.now());",
+            "time.date.addDays takes 2 argument(s), got 1"),
+        lib.bad("duration wrong arg",
+            "import 'time'; Duration d = time.duration(10);",
+            "argument 1 of time.duration: cannot use int as String"),
+        lib.bad("sleep needs a duration",
+            "import 'time'; time.sleep(\"soon\");",
+            "argument 1 of time.sleep: cannot use String as Duration"),
+        lib.bad("sleep future is void",
+            "import 'time'; int x = await time.sleep(1);",
+            "cannot use void as int"),
+        // Duration and DateTime are both int64 milliseconds. Only the checker
+        // keeps them apart.
+        lib.bad("instant plus instant",
+            "import 'time'; DateTime t = time.now(); printInline(t + t);",
+            "operator + is not defined on DateTime and DateTime"),
+        lib.bad("instant scaled",
+            "import 'time'; printInline(time.now() * 2);",
+            "operator * is not defined on DateTime and int"),
+        lib.bad("instant against a bare number",
+            "import 'time'; printInline(time.now() == 0);",
+            "cannot compare DateTime and int"),
+        lib.bad("instant ordered against a bare number",
+            "import 'time'; printInline(time.now() < 1000);",
+            "operator < is not defined on DateTime and int"),
+        lib.bad("duration times duration",
+            "import 'time'; printInline(time.duration(\"1s\") * time.duration(\"2s\"));",
+            "operator * is not defined on Duration and Duration"),
+        lib.bad("duration minus instant",
+            "import 'time'; printInline(time.duration(\"1s\") - time.now());",
+            "operator - is not defined on Duration and DateTime"),
+        lib.bad("an int variable is not a duration",
+            "import 'time'; int n = 5; time.sleep(n);",
+            "argument 1 of time.sleep: cannot use int as Duration"),
+        lib.bad("a duration is not an int",
+            "import 'time'; int n = time.duration(\"1s\");",
+            "cannot use Duration as int"),
+        lib.bad("a duration is not an instant",
+            "import 'time'; DateTime t = time.duration(\"1s\");",
+            "cannot use Duration as DateTime"),
+        lib.bad("calendar function needs an instant",
+            "import 'time'; printInline(time.date.year(time.duration(\"1s\")));",
+            "argument 1 of time.date.year: cannot use Duration as DateTime"),
+        lib.bad("old date type name",
+            "date d;",
+            "unknown type \"date\" (did you mean DateTime?)"),
+        lib.bad("lower-case duration",
+            "duration d;",
+            "unknown type \"duration\" (did you mean Duration?)"),
+        lib.bad("function arity", "void f(int a) {} f();", "f takes 1 argument(s), got 0"),
+        lib.bad("function arg type",
+            "void f(int a) {} f(\"x\");",
+            "argument 1 of f: cannot use String as int"),
+        lib.bad("duplicate function",
+            "void f() {} void f() {}",
+            "function \"f\" already declared"),
+        // The second declaration is refused by name, whatever its parameters are.
+        lib.bad("duplicate function with more params",
+            `int f() { return 1; }
+int f(int a) { return a; }`,
+            "function \"f\" already declared"),
+        lib.bad("duplicate type",
+            "type A { int x; } type A { int y; }",
+            "type \"A\" already declared"),
+        lib.bad("duplicate record field decl",
+            "type A { int x; String x; }",
+            "duplicate field"),
+        lib.bad("redefine builtin type",
+            "type int { int x; }",
+            "cannot redefine built-in type"),
+        lib.bad("lower-case type name",
+            "type car { int x; }",
+            "type name \"car\" must start with an upper-case letter (did you mean \"Car\"?)"),
+        lib.bad("underscore type name",
+            "type _car { int x; }",
+            "type name \"_car\" must start with an upper-case letter"),
+        lib.bad("reserved var", "int print = 1;", "reserved name"),
+        lib.bad("reserved function", "void print() {}", "reserved name"),
+        lib.bad("reserved type",
+            "type DateTime { int x; }",
+            "cannot redefine built-in type"),
+        lib.bad("reserved duration type",
+            "type Duration { int x; }",
+            "cannot redefine built-in type"),
+        lib.bad("reserved param", "void f(int getType) {}", "reserved name"),
+        lib.bad("library var needs the import",
+            "import 'json'; int json = 1;",
+            "already used as a module name"),
+        lib.bad("library param needs the import",
+            "import 'json'; void f(int json) {}",
+            "already used as a module name"),
+        lib.bad("duplicate param", "void f(int a, int a) {}", "duplicate parameter"),
+        lib.bad("nested function",
+            "void f() { void g() {} }",
+            "only allowed at the top level"),
+        lib.bad("nested type",
+            "void f() { type t { int x; } }",
+            "only allowed at the top level"),
+        lib.bad("var shadows function",
+            "void f() {} int f = 1;",
+            "already declared as a function"),
+        lib.bad("function ref alone",
+            "void f(int x) {} f + 1;",
+            "function \"f\" must be called"),
+        lib.bad("use before declaration",
+            "int f() { return later; } int later = 1;",
+            "undefined: later"),
+        lib.bad("call a literal", "5();", "expression is not callable"),
+        lib.bad("compare void results",
+            "void f() {} bool b = f() == f();",
+            "cannot compare void and void"),
+        lib.bad("assign to reserved", "print = 1;", "cannot assign to \"print\""),
+        lib.bad("assign to an unimported library", "json = 1;", "import it first"),
+        lib.bad("assign length on record",
+            "type T { int x; } T c = { x: 1 } c.length = 2;",
+            "no field \"length\""),
+        lib.bad("minus cascades undefined", "int x = -y;", "undefined: y"),
+        lib.bad("member call on undefined", "undef.map(alsoUndef);", "undefined: undef"),
+        lib.bad("print bare null", "printInline(null);", "cannot print a bare null"),
+        lib.bad("unresolvable user module",
+            "import 'utils';",
+            "cannot resolve module 'utils'"),
+        lib.bad("duplicate module alias",
+            "import 'time'; import 'json' as time;",
+            "module name \"time\" already used"),
+        lib.bad("alias print",
+            "import 'json' as print;",
+            "cannot use \"print\" as a module name"),
+        lib.bad("alias printInline",
+            "import 'json' as printInline;",
+            "cannot use \"printInline\" as a module name"),
+        lib.bad("alias builtin type",
+            "import 'json' as int;",
+            "cannot use \"int\" as a module name"),
+        lib.bad("alias DateTime",
+            "import 'json' as DateTime;",
+            "cannot use \"DateTime\" as a module name"),
+        lib.bad("alias Duration",
+            "import 'json' as Duration;",
+            "cannot use \"Duration\" as a module name"),
+        lib.bad("var shadows alias",
+            "import 'json' as enc; int enc = 1;",
+            "already used as a module name"),
+        lib.bad("function shadows alias",
+            "import 'json' as enc; void enc() {}",
+            "already used as a module name"),
+        lib.bad("type shadows alias",
+            "import 'json' as enc; type enc { int x; }",
+            "already used as a module name"),
+        lib.bad("param shadows alias",
+            "import 'json' as enc; void f(int enc) {}",
+            "already used as a module name"),
+        lib.bad("bare builtin alias",
+            "import 'time' as when; when;",
+            "when is a built-in library"),
+        lib.bad("assign to alias",
+            "import 'time' as when; when = 1;",
+            "cannot assign to module \"when\""),
+        lib.bad("builtin has no types",
+            "import 'time'; time.thing x;",
+            "has no exported types"),
+        lib.bad("unknown module type", "geo.point p;", "unknown module \"geo\""),
+        lib.bad("export in function",
+            "void f() { export int x = 1; }",
+            "export is only allowed at the top level"),
+        // Signed and unsigned are two families (§2.1). Every pair here is one
+        // a C program converts silently.
+        lib.bad("int + uint",
+            "int i = 1; uint u = 2; uint s = i + u;",
+            "operator + is not defined on int and uint"),
+        lib.bad("int < uint",
+            "int i = 1; uint u = 2; bool b = i < u;",
+            "operator < is not defined on int and uint"),
+        lib.bad("int64 == uint64",
+            "int64 i = 1; uint64 u = 2; bool b = i == u;",
+            "cannot compare int64 and uint64"),
+        lib.bad("uint32 % int32",
+            "uint32 a = 1; int32 b = 2; uint32 c = a % b;",
+            "operator % is not defined on uint32 and int32"),
+        lib.bad("negate unsigned",
+            "uint u = 2; uint n = -u;",
+            "operator - is not defined on uint (an unsigned type has no negative values)"),
+        lib.bad("negate byte",
+            "byte b = 2; int n = -b;",
+            "operator - is not defined on uint8"),
+        lib.bad("signed into unsigned", "int i = 1; uint u = i;", "cannot use int as uint"),
+        lib.bad("uint64 into int64",
+            "uint64 u = 1; int64 i = u;",
+            "cannot use uint64 as int64"),
+        lib.bad("uint into uint8", "uint u = 1; uint8 b = u;", "cannot use uint as uint8"),
+        lib.bad("uint literal too big", "uint8 b = 256;", "cannot use int as uint8"),
+        lib.bad("uint literal negative", "uint u = -1;", "cannot use int as uint"),
+        lib.bad("narrow unsigned increment",
+            "uint8 b = 1; b++;",
+            "operator ++ is not defined on uint8 (uint8 arithmetic widens to uint)"),
+        lib.bad("enum into uint", "enum E { A: 1 } uint u = E.A;", "cannot use E as uint"),
+        lib.bad("enum vs uint",
+            "enum E { A: 1 } uint u = 1; bool b = u == E.A;",
+            "cannot compare uint and E"),
+        lib.bad("uint into float", "uint u = 1; float f = u;", "cannot use uint as float"),
+    ]);
+});
+
+test.start("checker: function values", void () -> {
+    lib.accepts([
+        lib.ok("closure over param and local",
+            `
+Function(int)<int> sumAll(int a) {
+    Function(int)<int> sum = int (int b) -> a + b;
+    return sum;
+}
+Function(int)<int> f = sumAll(1);
+int r = f(2);
+`),
+        lib.ok("counter mutates its capture",
+            `
+Function()<int> counter() {
+    int n = 0;
+    return int () -> {
+        n = n + 1;
+        return n;
+    };
+}
+`),
+        lib.ok("void literal and expression body",
+            `
+Function()<void> t = void () -> { printInline("hi"); };
+Function()<void> u = void () -> printInline("hi");
+t();
+u();
+`),
+        lib.ok("function values are first class",
+            `
+type Handler { Function(int)<int> run; }
+Handler h = { run: int (int x) -> x };
+Function(int)<int>[] funcs = [h.run, int (int x) -> x + 1];
+int r = funcs[0](1) + h.run(2);
+Function(int)<int>? m = null;
+m = h.run;
+if (m != null) {
+    r = m(3);
+}
+`),
+        lib.ok("captures narrow inside the body",
+            `
+int? seen;
+Function()<int> f = int () -> {
+    if (seen != null) {
+        return seen;
+    }
+    return 0;
+};
+`),
+        lib.ok("immediately invoked",
+            `
+int r = (int (int n) -> n * 2)(21);
+`),
+    ]);
+});
+
+test.start("checker: function value errors", void () -> {
+    lib.rejects([
+        lib.bad("void literal into typed slot",
+            "Function(int)<int> s = void (int b) -> b;",
+            "cannot use Function(int)<void> as Function(int)<int>"),
+        lib.bad("wrong return in body",
+            "Function()<int> f = int () -> \"a\";",
+            "cannot return String (the function value returns int)"),
+        lib.bad("param types are part of the type",
+            "Function(String)<int> f = int (int b) -> b;",
+            "cannot use Function(int)<int> as Function(String)<int>"),
+        lib.bad("call optional without narrowing",
+            "Function()<void>? f = null; f();",
+            "cannot call optional type Function()<void>? (compare \"f\" with null first)"),
+        lib.bad("print a function value",
+            "Function()<void> f = void () -> { printInline(\"x\"); }; printInline(f);",
+            "cannot print a function value"),
+        lib.bad("compare function values",
+            "Function()<void> a = void () -> {}; Function()<void> b = void () -> {}; bool e = a == b;",
+            "cannot compare Function()<void> and Function()<void>"),
+        lib.bad("serialize a function value",
+            "import 'json'; Function()<void> f = void () -> {}; String s = json.toText(f);",
+            "function values have no JSON form"),
+        lib.bad("serialize an array of them",
+            "import 'json'; Function()<void>[] funcs = []; String s = json.toText(funcs);",
+            "function values have no JSON form"),
+        lib.bad("serialize an optional one",
+            "import 'json'; Function()<void>? f; String s = json.toText(f);",
+            "function values have no JSON form"),
+        lib.bad("declared functions are not values",
+            "int add(int a, int b) { return a + b; } Function(int, int)<int> f = add;",
+            "function \"add\" must be called"),
+        lib.bad("reserved lambda parameter",
+            "Function(int)<int> f = int (int print) -> 1;",
+            "\"print\" is a reserved name"),
+        lib.bad("assign to const capture",
+            "int const k = 1; Function()<void> f = void () -> { k = 2; };",
+            "cannot assign to \"k\": it is declared const"),
+        lib.bad("missing return value in body",
+            "Function()<int> f = int () -> { return; };",
+            "missing return value (function returns int)"),
+    ]);
+});
+
+test.start("checker: async programs", void () -> {
+    lib.accepts([
+        lib.ok("await and future variables",
+            `
+int async sum(int a) { return a; }
+int x = await sum(5);
+Future<int> f = sum(6);
+int y = await f + await f;
+`),
+        lib.ok("void async",
+            `
+void async log(String m) { printInline(m); }
+Future<void> t = log("hi");
+await t;
+`),
+        lib.ok("async.run callbacks",
+            `
+import 'async';
+int async sum(int a) { return a; }
+void async log(String m) { printInline(m); }
+async.run(sum(5), void (int i) -> printInline(i));
+async.run(log("x"), void () -> printInline("done"));
+`),
+        lib.ok("futures as values",
+            `
+import 'array';
+int async sum(int a) { return a; }
+type Job { Future<int> r; }
+Job j = { r: sum(1) };
+Future<int>[] funcs = [];
+array.push(funcs, j.r);
+Future<int>? maybe = null;
+maybe = sum(2);
+if (maybe != null) {
+    int v = await maybe;
+}
+int settle(Future<int> f) { return await f; }
+int s = settle(sum(3));
+`),
+        lib.ok("await inside async and lambdas",
+            `
+int async one() { return 1; }
+int async two() { return await one() + 1; }
+Function()<int> f = int () -> await two();
+`),
+        lib.ok("future-returning function type",
+            `
+int async sum(int a) { return a; }
+Function(int)<Future<int>> mk = Future<int> (int x) -> sum(x);
+Future<int> f = mk(4);
+`),
+    ]);
+});
+
+test.start("checker: async errors", void () -> {
+    lib.rejects([
+        lib.bad("await non-future", "int x = await 5;", "await needs a future, got int"),
+        lib.bad("await optional future",
+            "Future<int>? f; int x = await f;",
+            "cannot await optional type Future<int>?"),
+        lib.bad("future used as result",
+            "int async f() { return 1; } int x = f();",
+            "cannot use Future<int> as int"),
+        lib.bad("await void as value",
+            "void async g() {} int x = await g();",
+            "cannot use void as int"),
+        lib.bad("print a future",
+            "int async f() { return 1; } printInline(f());",
+            "cannot print Future<int>"),
+        lib.bad("field on a future",
+            "type P { int x; } P async f() { return { x: 1 }; } int n = f().x;",
+            "type Future<P> has no properties; await it first: (await f()).x"),
+        lib.bad("compare futures",
+            "int async f() { return 1; } bool b = f() == f();",
+            "cannot compare Future<int> and Future<int>"),
+        lib.bad("serialize a future",
+            "import 'json'; int async f() { return 1; } String s = json.toText(f());",
+            "futures have no JSON form"),
+        lib.bad("serialize a record holding one",
+            "import 'json'; type j { Future<int> r; } int async f() { return 1; } j v = { r: f() } String s = json.toText(v);",
+            "futures have no JSON form"),
+        lib.bad("async body checks declared type",
+            "int async f() { return \"s\"; }",
+            "cannot return String"),
+        lib.bad("run needs a future",
+            "import 'async'; async.run(5, void (int i) -> printInline(i));",
+            "argument 1 of async.run must be a future, got int"),
+        lib.bad("run callback type",
+            "import 'async'; int async f() { return 1; } async.run(f(), void (String s) -> printInline(s));",
+            "cannot use Function(String)<void> as Function(int)<void>"),
+        lib.bad("run void callback type",
+            "import 'async'; void async g() {} async.run(g(), void (int i) -> printInline(i));",
+            "cannot use Function(int)<void> as Function()<void>"),
+        lib.bad("run arity",
+            "import 'async'; int async f() { return 1; } async.run(f());",
+            "async.run takes 2 argument(s), got 1"),
+        lib.bad("unknown async function",
+            "import 'async'; async.wait(1);",
+            "async has no function \"wait\" (available: race, run)"),
+        lib.bad("sleep moved to time",
+            "import 'async'; async.sleep(1);",
+            "async has no function \"sleep\"; it moved to the time module: import 'time'; time.sleep(ms)"),
+        lib.bad("async without import",
+            "int async f() { return 1; } async.run(f(), void (int i) -> printInline(i));",
+            "async is a built-in library; import it first"),
+        lib.bad("async is taken by the import",
+            "import 'async'; int async = 1;",
+            "\"async\" is already used as a module name"),
+        lib.bad("async function name taken by the import",
+            "import 'async'; int async(int a) { return a; }",
+            "\"async\" is already used as a module name"),
+    ]);
+});
+
+test.start("checker: enum programs", void () -> {
+    lib.accepts([
+        lib.ok("declaration and member access",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+
+HttpResponses r = HttpResponses.OK;
+HttpResponses const def = HttpResponses.NOT_FOUND;
+r = def;
+printInline(r);
+`),
+        lib.ok("widening and comparisons",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+
+HttpResponses r = HttpResponses.OK;
+int code = r;
+int also = HttpResponses.NOT_FOUND;
+bool same = r == HttpResponses.OK;
+bool other = r != HttpResponses.NOT_FOUND;
+bool vsInt = r == 200;
+bool ordered = r < 400 && 100 <= r;
+bool members = HttpResponses.OK < HttpResponses.NOT_FOUND;
+`),
+        lib.ok("enums in shapes",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+
+type Response { HttpResponses status; String? body }
+Response resp = { status: HttpResponses.OK }
+HttpResponses[] all = [HttpResponses.OK, resp.status];
+HttpResponses? maybe = null;
+maybe = HttpResponses.NOT_FOUND;
+if (maybe != null) {
+    printInline(maybe);
+}
+forEach(all, e) {
+    printInline(e);
+}
+`),
+        lib.ok("enums through functions",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+
+HttpResponses classify(int code) {
+    if (code == 404) {
+        return HttpResponses.NOT_FOUND;
+    }
+    return HttpResponses.OK;
+}
+void log(HttpResponses r) { printInline(r); }
+log(classify(500));
+`),
+        lib.ok("serialization",
+            `import 'json';
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+
+String s = json.toText(HttpResponses.OK);
+`),
+        lib.ok("negative members",
+            `
+enum Signal { UP: 1, FLAT: 0, DOWN: -1 }
+Signal s = Signal.DOWN;
+bool b = s < Signal.FLAT;
+`),
+    ]);
+});
+
+test.start("checker: switch programs", void () -> {
+    lib.accepts([
+        lib.ok("int labels",
+            `
+int n = 2;
+switch (n) {
+    case 1:
+    case 2:
+        print("low");
+        break;
+    default:
+        print("high");
+}
+`),
+        lib.ok("every comparable type",
+            `
+String s = "a";
+switch (s) { case "a": print(1); default: print(0); }
+bool b = true;
+switch (b) { case true: print(1); default: print(0); }
+float f = 1.5;
+switch (f) { case -1.5: print(1); default: print(0); }
+byte y = 3;
+switch (y) { case 3: print(1); default: print(0); }
+`),
+        lib.ok("enum labels",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+
+HttpResponses r = HttpResponses.OK;
+switch (r) {
+    case HttpResponses.OK:
+        print("ok");
+    case HttpResponses.NOT_FOUND:
+        print("missing");
+    default:
+        print("other");
+}
+`),
+        lib.ok("an enum subject also takes integer labels",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+
+HttpResponses r = HttpResponses.OK;
+switch (r) { case 200: print("ok"); default: print("other"); }
+`),
+        lib.ok("duration labels take a bare millisecond count",
+            `
+Duration d = 1000;
+switch (d) { case 1000: print("a second"); default: print("other"); }
+`),
+        // A label is matched with ==, so a byte subject takes an int label.
+        lib.ok("a narrow subject widens like an operand of ==",
+            `
+byte b = 1;
+switch (b) { case 300: print(0); default: print(1); }
+`),
+        lib.ok("an optional subject matches null",
+            `
+int? x = null;
+switch (x) { case null: print("absent"); case 1: print("one"); default: print("other"); }
+`),
+        lib.ok("a break in a clause needs no loop around it",
+            `
+switch (1) { case 1: break; default: print(0); }
+`),
+        lib.ok("a continue in a clause binds to the loop outside",
+            `
+for (int i = 0; i < 3; i++) {
+    switch (i) { case 1: continue; default: print(i); }
+}
+`),
+        lib.ok("no default is fine",
+            `
+switch (1) { case 1: print("one"); }
+`),
+        lib.ok("clause bodies have scopes of their own",
+            `
+switch (1) {
+    case 1:
+        int x = 1;
+        print(x);
+    default:
+        int x = 2;
+        print(x);
+}
+`),
+        lib.ok("narrowing established before the switch survives it",
+            `
+int? x = 7;
+if (x == null) { x = 1; }
+switch (1) { case 1: print("a"); default: print("b"); }
+print(x + 1);
+`),
+        lib.ok("an exhaustive switch whose clauses all return terminates",
+            `
+String f(int n) {
+    switch (n) {
+        case 1:
+            return "one";
+        default:
+            return "other";
+    }
+}
+print(f(1));
+`),
+    ]);
+});
+
+test.start("checker: enum errors", void () -> {
+    lib.rejects([
+        lib.bad("int not assignable",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+HttpResponses r = 200;`,
+            "cannot use int as HttpResponses"),
+        lib.bad("different enum not assignable",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+enum Other { A: 1 }
+HttpResponses r = Other.A;`,
+            "cannot use Other as HttpResponses"),
+        lib.bad("no narrowing to int8",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+int8 b = HttpResponses.OK;`,
+            "cannot use HttpResponses as int8"),
+        lib.bad("no arithmetic",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+int x = HttpResponses.OK + 1;`,
+            "operator + is not defined on HttpResponses and int"),
+        lib.bad("no cross-enum equality",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+enum Other { A: 1 }
+bool b = HttpResponses.OK == Other.A;`,
+            "cannot compare HttpResponses and Other"),
+        lib.bad("no cross-enum ordering",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+enum Other { A: 1 }
+bool b = HttpResponses.OK < Other.A;`,
+            "operator < is not defined on HttpResponses and Other"),
+        lib.bad("no float comparison",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+bool b = HttpResponses.OK == 1.5;`,
+            "cannot compare HttpResponses and float"),
+        lib.bad("members are constants",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+HttpResponses.OK = 1;`,
+            "cannot assign to HttpResponses.OK: enum members are constants"),
+        lib.bad("members cannot be incremented",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+HttpResponses.OK++;`,
+            "cannot assign to HttpResponses.OK: enum members are constants"),
+        lib.bad("unknown member",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+HttpResponses r = HttpResponses.MISSING;`,
+            "enum HttpResponses has no member \"MISSING\""),
+        lib.bad("type is not a value",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+printInline(HttpResponses);`,
+            "HttpResponses is an enum type, not a value (name one of its members: HttpResponses.OK)"),
+        lib.bad("type cannot be assigned",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+HttpResponses = 1;`,
+            "cannot assign to enum \"HttpResponses\""),
+        lib.bad("type cannot be called",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+HttpResponses(200);`,
+            "HttpResponses is an enum type and cannot be called"),
+        lib.bad("member cannot be called",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+HttpResponses.OK(1);`,
+            "HttpResponses.OK is an enum member, not a function"),
+        lib.bad("no ?. on enum",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+HttpResponses r = HttpResponses?.OK;`,
+            "?. cannot be used on enum HttpResponses"),
+        lib.bad("no ++ on enum values",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+HttpResponses r = HttpResponses.OK;
+r++;`,
+            "operator ++ is not defined on HttpResponses"),
+        lib.bad("empty enum", "enum Empty { }", "enum \"Empty\" needs at least one member"),
+        lib.bad("duplicate member",
+            "enum E { A: 1, A: 2 }",
+            "enum \"E\" has duplicate member \"A\""),
+        lib.bad("duplicate enum",
+            `enum E { A: 1 }
+enum E { B: 2 }`,
+            "enum \"E\" already declared"),
+        lib.bad("record name taken by enum",
+            `enum E { A: 1 }
+type E { int x; }`,
+            "\"E\" is already declared as an enum"),
+        lib.bad("function name taken by enum",
+            `enum E { A: 1 }
+void E() {}`,
+            "\"E\" is already declared as an enum"),
+        lib.bad("variable name taken by enum",
+            `enum E { A: 1 }
+int E = 5;`,
+            "\"E\" is already declared as an enum"),
+        lib.bad("reserved name", "enum print { A: 1 }", "\"print\" is a reserved name"),
+        lib.bad("builtin type name",
+            "enum float { A: 1 }",
+            "cannot redefine built-in type \"float\""),
+        lib.bad("lower-case enum name",
+            "enum status { A: 1 }",
+            "enum name \"status\" must start with an upper-case letter (did you mean \"Status\"?)"),
+        lib.bad("not at top level",
+            `enum E { A: 1 }
+void f() { enum F { B: 2 } }`,
+            "enum declarations are only allowed at the top level"),
+        lib.bad("cannot print optional-free type mix",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+enum Other { A: 1 }
+Other? o = null;
+bool b = o == HttpResponses.OK;`,
+            "cannot compare Other? and HttpResponses"),
+    ]);
+});
+
+test.start("checker: the string library", void () -> {
+    lib.accepts([
+        lib.ok("every function types",
+            `import 'string';
+String s = "  hi  ";
+byte[] bs = string.toByteArray(s);
+String up = string.toUpperCaseAscii(s);
+String low = string.toLowerCaseAscii(s);
+String[] parts = string.split(s, "-");
+String rejoined = string.join(parts, "-");
+String trimmed = string.trim(s);
+bool has = string.contains(s, "hi");
+String dup = string.copy(s);
+String one = string.replace(s, "hi", "yo");
+String all = string.replaceAll(s, "hi", "yo");
+int at = string.find(s, "hi");
+int n = string.length(s);
+String joined = string.append(s, "!");
+String mid = string.substring(s, 1, 3);
+int parsed = string.toInt("42") catch 0;
+float approx = string.toFloat("1.5") catch 0.0;
+`),
+        lib.ok("from takes what print takes",
+            `import 'string';
+enum Status { OK: 200 }
+String a = string.from(1.5);
+String b = string.from(42);
+String c = string.from(true);
+String d = string.from("already text");
+String e = string.from(Status.OK);
+int? maybe = null;
+String f = string.from(maybe);
+printInline(a + b + c + d + e + f);
+`),
+        lib.ok("from round-trips a float",
+            `import 'string';
+float f = 0.1;
+printInline(string.toFloat(string.from(f)) catch 0.0);
+`),
+        lib.ok("from is total",
+            `import 'string';
+String show(int n) {
+    return string.from(n);      // no catch: formatting cannot fail
+}
+printInline(show(1));
+`),
+        lib.ok("the parsers are fallible and propagate",
+            `import 'string';
+int must(String text) {
+    return string.toInt(text);
+}
+int lenient(String text) {
+    return must(text) catch -1;
+}
+string.toFloat("x") catch e {
+    printInline(e.message);
+}
+printInline(lenient("12"));
+`),
+        lib.ok("results feed generic code",
+            `import 'string';
+import 'json';
+String t = json.toText(string.split("a-b", "-"));
+forEach(string.toByteArray("abc"), b) { printInline(b); }
+printInline(getType(string.split("a-b", "-")));    // String[]
+`),
+        lib.ok("alias via as",
+            `import 'string' as str;
+printInline(str.trim(" x "));
+`),
+    ]);
+});
+
+test.start("checker: string library errors", void () -> {
+    lib.rejects([
+        lib.bad("not imported",
+            "printInline(string.trim(\" x \"));",
+            "string is a built-in library; import it first: import 'string';"),
+        lib.bad("unknown function",
+            "import 'string'; string.reverse(\"x\");",
+            "string has no function \"reverse\" (available: append, bytesEqualConstantTime, contains, copy, equalsConstantTime, find, from, fromByteArray, fromRunes, isValidUtf8, join, length, replace, replaceAll, runeAt, runeCount, split, substring, toByteArray, toFloat, toInt, toLowerCaseAscii, toUint, toUpperCaseAscii, trim)"),
+        // string.from takes what print takes, and points at json.toText for the rest.
+        lib.bad("from refuses a record",
+            `import 'string'; type Car { int age; }
+Car c = { age: 1 };
+printInline(string.from(c));`,
+            "argument 1 of string.from: cannot use Car; from takes what print takes"),
+        lib.bad("from refuses an array",
+            "import 'string'; printInline(string.from([1, 2]));",
+            "argument 1 of string.from: cannot use int[]; from takes what print takes"),
+        lib.bad("from refuses a bare null",
+            "import 'string'; printInline(string.from(null));",
+            "argument 1 of string.from: cannot use a bare null"),
+        lib.bad("from refuses a void value",
+            `import 'string'; void nothing() {}
+printInline(string.from(nothing()));`,
+            "argument 1 of string.from: cannot use a void value"),
+        lib.bad("from refuses a function value",
+            `import 'string'; int id(int n) { return n; }
+Function(int)<int> f = id;
+printInline(string.from(f));`,
+            "argument 1 of string.from: cannot use a function value"),
+        lib.bad("from takes one argument",
+            "import 'string'; printInline(string.from(1, 2));",
+            "string.from takes 1 argument(s), got 2"),
+        lib.bad("from produces a String",
+            "import 'string'; int n = string.from(1);",
+            "cannot use String as int"),
+        // Formatting cannot fail, so there is nothing for a catch to handle.
+        lib.bad("nothing to catch over from",
+            "import 'string'; printInline(string.from(1) catch \"\");",
+            "nothing in this expression can fail"),
+        lib.bad("wrong argument type",
+            "import 'string'; string.trim(1);",
+            "argument 1 of string.trim: cannot use int as String"),
+        lib.bad("wrong argument count",
+            "import 'string'; string.split(\"a\");",
+            "string.split takes 2 argument(s), got 1"),
+        lib.bad("replace needs three",
+            "import 'string'; string.replace(\"a\", \"b\");",
+            "string.replace takes 3 argument(s), got 2"),
+        lib.bad("substring needs both bounds",
+            "import 'string'; printInline(string.substring(\"abc\", 1));",
+            "string.substring takes 3 argument(s), got 2"),
+        lib.bad("join takes an array of strings",
+            "import 'string'; printInline(string.join(\"abc\", \"-\"));",
+            "argument 1 of string.join: cannot use String as String[]"),
+        lib.bad("join will not take other elements",
+            `import 'string';
+int[] ns = [1, 2];
+printInline(string.join(ns, "-"));`,
+            "argument 1 of string.join: cannot use int[] as String[]"),
+        // A fixed-size array is a type of its own (§2.2), so joining one needs
+        // array.copy.
+        lib.bad("join takes a growable array",
+            `import 'string';
+String[2] fixed = ["a", "b"];
+printInline(string.join(fixed, "-"));`,
+            "argument 1 of string.join: cannot use String[2] as String[]"),
+        lib.bad("join needs a separator",
+            "import 'string'; printInline(string.join([\"a\"]));",
+            "string.join takes 2 argument(s), got 1"),
+        lib.bad("join produces a string",
+            "import 'string'; int n = string.join([\"a\"], \"-\");",
+            "cannot use String as int"),
+        lib.bad("substring bounds are ints",
+            "import 'string'; printInline(string.substring(\"abc\", 0, \"2\"));",
+            "argument 3 of string.substring: cannot use String as int"),
+        lib.bad("toInt takes a string",
+            "import 'string'; printInline(string.toInt(42) catch 0);",
+            "argument 1 of string.toInt: cannot use int as String"),
+        lib.bad("toInt produces an int",
+            "import 'string'; String s = string.toInt(\"1\") catch 0;",
+            "cannot use int as String"),
+        lib.bad("toFloat produces a float",
+            "import 'string'; int n = string.toFloat(\"1.5\") catch 0.0;",
+            "cannot use float as int"),
+        // substring is total: bad bounds panic, so a catch has nothing to handle.
+        lib.bad("nothing to catch over substring",
+            "import 'string'; printInline(string.substring(\"abc\", 0, 1) catch \"\");",
+            "nothing in this expression can fail"),
+        // An uncaught toInt makes its container fallible, so a container that
+        // declares otherwise is the error.
+        lib.bad("an uncaught toInt makes a function value fallible",
+            "import 'string'; Function(String)<int> parse = int (String s) -> string.toInt(s);",
+            "this function value can fail; its type must say so"),
+        lib.bad("function must be called",
+            "import 'string'; printInline(string.trim);",
+            "string.trim must be called: string.trim(...)"),
+        lib.bad("string as a variable needs the import gone",
+            "import 'string'; int string = 1;",
+            "\"string\" is already used as a module name"),
+        lib.bad("string as a function needs the import gone",
+            "import 'string'; void string() {}",
+            "\"string\" is already used as a module name"),
+        lib.bad("old type name points at String",
+            "string s = \"a\";",
+            "unknown type \"string\" (did you mean String?)"),
+        lib.bad("String cannot be redefined",
+            "type String { int x; }",
+            "cannot redefine built-in type \"String\""),
+        lib.bad("module name taken",
+            `import 'string'; type Thing { int x; }
+string Thing = "x";`,
+            "unknown type \"string\" (did you mean String?)"),
+    ]);
+});
+
+test.start("checker: the os library", void () -> {
+    lib.accepts([
+        lib.ok("platform and arch are strings",
+            `import 'os';
+String p = os.getPlatform();
+String a = os.getArch();
+printInline(p + a);
+`),
+        lib.ok("cpu list and its fields",
+            `import 'os';
+os.Cpu[] cpus = os.getCpus();
+printInline(cpus.length);
+os.Cpu first = cpus[0];
+if (first.model != null && first.speed != null) {
+    printInline(first.model, first.speed + 1);
+}
+`),
+        lib.ok("the record type in every type position",
+            `import 'os';
+os.Cpu? maybe = null;
+os.Cpu[] list = os.getCpus();
+maybe = list[0];
+if (maybe != null) {
+    printInline(maybe.model);
+}
+`),
+        lib.ok("an alias renames the module",
+            `import 'os' as machine;
+machine.Cpu c = machine.getCpus()[0];
+printInline(machine.getPlatform(), c.model);
+`),
+        lib.ok("forEach over the entries",
+            `import 'os';
+forEach(os.getCpus(), c) {
+    if (c.model != null) {
+        printInline(c.model);
+    }
+}
+`),
+        lib.ok("Cpu does not shadow a user type of the same name",
+            `import 'os';
+type Cpu { int cores; }
+Cpu mine = { cores: 2 };
+os.Cpu theirs = os.getCpus()[0];
+printInline(mine.cores, theirs.model);
+`),
+    ]);
+});
+
+test.start("checker: os library errors", void () -> {
+    lib.rejects([
+        lib.bad("not imported",
+            "printInline(os.getArch());",
+            "os is a built-in library; import it first: import 'os';"),
+        lib.bad("bare module", "printInline(os);", "os is a built-in library"),
+        lib.bad("unknown function",
+            "import 'os'; os.getMemory();",
+            "os has no function \"getMemory\" (available: getArch, getCpus, getPlatform)"),
+        // An unknown function's arguments are still checked.
+        lib.bad("unknown function with a bad argument",
+            "import 'os'; os.getMemory(nope);",
+            "undefined: nope"),
+        lib.bad("takes no arguments",
+            "import 'os'; printInline(os.getArch(\"x\"));",
+            "os.getArch takes 0 argument(s), got 1"),
+        lib.bad("function must be called",
+            "import 'os'; printInline(os.getArch);",
+            "os.getArch must be called: os.getArch(...)"),
+        lib.bad("the type is not a value",
+            "import 'os'; printInline(os.Cpu);",
+            "os.Cpu is a type, not a value"),
+        lib.bad("unknown type in the module",
+            "import 'os'; os.Memory m;",
+            "built-in library os has no exported type \"Memory\" (available: Cpu)"),
+        lib.bad("a module with no types at all",
+            "import 'time'; time.Thing t;",
+            "time is a built-in library and has no exported types"),
+        lib.bad("Cpu is not a bare type name",
+            "import 'os'; Cpu c;",
+            "unknown type \"Cpu\""),
+        lib.bad("os as a variable needs the import gone",
+            "import 'os'; int os = 1;",
+            "\"os\" is already used as a module name"),
+        lib.bad("os as a function needs the import gone",
+            "import 'os'; void os() {}",
+            "\"os\" is already used as a module name"),
+        lib.bad("the model field is optional",
+            "import 'os'; String m = os.getCpus()[0].model;",
+            "cannot use String? as String"),
+        lib.bad("the speed field is optional",
+            "import 'os'; int s = os.getCpus()[0].speed;",
+            "cannot use int? as int"),
+        lib.bad("no such field",
+            "import 'os'; printInline(os.getCpus()[0].cores);",
+            "cores"),
+        lib.bad("the result is not assignable to a user record",
+            `import 'os';
+type Cpu { String? model; int? speed; }
+Cpu c = os.getCpus()[0];`,
+            "cannot use os.Cpu as Cpu"),
+    ]);
+});
+
+test.start("checker: the path library", void () -> {
+    lib.accepts([
+        lib.ok("every function returns a string",
+            `import 'path';
+String cwd = path.getCwd();
+String here = path.localize("./dir/file");
+String full = path.join(cwd, "..", "file.txt");
+printInline(cwd + here + full);
+`),
+        lib.ok("join takes one element or many",
+            `import 'path';
+printInline(path.join("a"));
+printInline(path.join("a", "b"));
+printInline(path.join("a", "b", "c", "d", "e"));
+`),
+        lib.ok("the elements are ordinary string expressions",
+            `import 'path';
+String dir = "src";
+String[] parts = ["a", "b"];
+printInline(path.join(dir + "/lib", parts[0], path.localize(parts[1])));
+`),
+        lib.ok("an alias renames the module",
+            `import 'path' as p;
+printInline(p.join(p.getCwd(), p.localize("./x")));
+`),
+        lib.ok("the result composes with the string module",
+            `import 'path';
+import 'string';
+String[] parts = string.split(path.join("a", "b"), "/");
+printInline(parts.length, string.contains(path.getCwd(), "/"));
+`),
+    ]);
+});
+
+test.start("checker: path library errors", void () -> {
+    lib.rejects([
+        lib.bad("not imported",
+            "printInline(path.getCwd());",
+            "path is a built-in library; import it first: import 'path';"),
+        lib.bad("bare module", "printInline(path);", "path is a built-in library"),
+        lib.bad("unknown function",
+            "import 'path'; path.dirname(\"a\");",
+            "path has no function \"dirname\" (available: getCwd, join, localize, userData)"),
+        // An unknown function's arguments are still checked.
+        lib.bad("unknown function with a bad argument",
+            "import 'path'; path.dirname(nope);",
+            "undefined: nope"),
+        lib.bad("getCwd takes no arguments",
+            "import 'path'; printInline(path.getCwd(\"x\"));",
+            "path.getCwd takes 0 argument(s), got 1"),
+        lib.bad("localize takes exactly one",
+            "import 'path'; printInline(path.localize(\"a\", \"b\"));",
+            "path.localize takes 1 argument(s), got 2"),
+        lib.bad("join needs an element",
+            "import 'path'; printInline(path.join());",
+            "path.join takes at least 1 argument(s), got 0"),
+        lib.bad("a fixed argument must be a string",
+            "import 'path'; printInline(path.join(1, \"b\"));",
+            "argument 1 of path.join: cannot use int as String"),
+        lib.bad("a collected argument must be a string",
+            "import 'path'; printInline(path.join(\"a\", 2));",
+            "argument 2 of path.join: cannot use int as String"),
+        lib.bad("localize takes a string",
+            "import 'path'; printInline(path.localize(3));",
+            "argument 1 of path.localize: cannot use int as String"),
+        // join collects its elements, so passing the array itself is the mistake.
+        lib.bad("the array itself is not an element",
+            `import 'path';
+String[] parts = ["a", "b"];
+printInline(path.join("root", parts));`,
+            "path.join collects its arguments one by one"),
+        lib.bad("the result is a string, not an array",
+            "import 'path'; String[] p = path.join(\"a\", \"b\");",
+            "cannot use String as String[]"),
+        lib.bad("function must be called",
+            "import 'path'; printInline(path.getCwd);",
+            "path.getCwd must be called: path.getCwd(...)"),
+        lib.bad("a type the module does not export",
+            "import 'path'; path.Thing t;",
+            "built-in library path has no exported type \"Thing\" (available: ErrorCode)"),
+        lib.bad("path as a variable needs the import gone",
+            "import 'path'; String path = \"a\";",
+            "\"path\" is already used as a module name"),
+        lib.bad("path as a function needs the import gone",
+            "import 'path'; void path() {}",
+            "\"path\" is already used as a module name"),
+    ]);
+});
+
+test.start("checker: the fs library", void () -> {
+    lib.accepts([
+        lib.ok("every function, each failure caught",
+            `import 'fs';
+String[] names = fs.readDir("dir") catch [];
+byte[] bytes = fs.readFile("f") catch [];
+fs.writeFile("f", bytes) catch e {}
+fs.createDir("dir") catch e {}
+fs.delete("f") catch e {}
+bool there = fs.exists("f");
+printInline(names.length, bytes.length, there);
+`),
+        lib.ok("delete takes its options, or does without them",
+            `import 'fs';
+fs.delete("f") catch e {}
+fs.delete("d", {}) catch e {}
+fs.delete("d", { recursive: true }) catch e {}
+fs.delete("d", { recursive: false }) catch e {}
+fs.DeleteOptions opts = { recursive: true };
+fs.delete("d", opts) catch e {}
+// The field is bool?, so null is a value it can hold and a variable of that
+// type is what a program computing the choice would use.
+bool? maybe = null;
+fs.delete("d", { recursive: maybe }) catch e {}
+printInline(opts.recursive);
+`),
+        lib.ok("the Stat record and its fields",
+            `import 'fs';
+void show(String p) {
+    fs.Stat s = fs.stat(p) catch e { return; }
+    printInline(s.name, s.extension, s.size, s.isDirectory, s.isFile, s.permissions, s.modified);
+}
+show("f");
+`),
+        lib.ok("the record type in every type position",
+            `import 'fs';
+import 'array';
+fs.Stat[] all = [];
+fs.Stat? maybe = fs.stat("f") catch null;
+if (maybe != null) {
+    array.push(all, maybe);
+    printInline(maybe.name, all.length);
+}
+`),
+        lib.ok("an alias renames the module",
+            `import 'fs' as disk;
+void show(String p) {
+    disk.Stat s = disk.stat(p) catch e { return; }
+    printInline(disk.exists(p), s.size);
+}
+show("f");
+`),
+        lib.ok("Stat does not shadow a user type of the same name",
+            `import 'fs';
+type Stat { int count; }
+Stat mine = { count: 2 };
+void show() {
+    fs.Stat theirs = fs.stat("f") catch e { return; }
+    printInline(mine.count, theirs.name);
+}
+show();
+`),
+        lib.ok("fallibility is inferred and propagates",
+            `import 'fs';
+import 'string';
+String slurp(String p) {
+    return string.fromByteArray(fs.readFile(p));
+}
+String safe(String p) {
+    return slurp(p) catch "";
+}
+printInline(safe("f"));
+`),
+        lib.ok("a catch may rethrow",
+            `import 'fs';
+byte[] read(String p) {
+    return fs.readFile(p) catch e {
+        return e;
+    }
+}
+byte[] bytes = read("f") catch [];
+printInline(bytes.length);
+`),
+        lib.ok("exists needs no catch",
+            `import 'fs';
+if (fs.exists("f")) {
+    printInline("there");
+}
+`),
+        lib.ok("the bytes compose with the string module",
+            `import 'fs';
+import 'string';
+fs.writeFile("out", string.toByteArray(string.toUpperCaseAscii("body"))) catch e {}
+byte[] bytes = fs.readFile("out") catch [];
+printInline(string.fromByteArray(bytes));
+`),
+        lib.ok("inside an async function, the future carries the failure",
+            `import 'fs';
+import 'string';
+String async read(String p) {
+    return string.fromByteArray(fs.readFile(p));
+}
+Future<String!> f = read("x");
+printInline(await f catch "");
+`),
+        lib.ok("inside a function value, whose type says so",
+            `import 'fs';
+Function(String)<void!> del = void (String p) -> fs.delete(p);
+del("f") catch e {}
+`),
+        lib.ok("in a loop, with the handler continuing",
+            `import 'fs';
+forEach(["a", "b"], name) {
+    byte[] b = fs.readFile(name) catch e {
+        continue;
+    }
+    printInline(b.length);
+}
+`),
+    ]);
+});
+
+test.start("checker: fs library errors", void () -> {
+    lib.rejects([
+        lib.bad("not imported",
+            "printInline(fs.exists(\"f\"));",
+            "fs is a built-in library; import it first: import 'fs';"),
+        lib.bad("bare module", "printInline(fs);", "fs is a built-in library"),
+        lib.bad("unknown function",
+            "import 'fs'; fs.copyFile(\"a\", \"b\");",
+            "fs has no function \"copyFile\" (available: copy, createDir, createTempDir, delete, exists, readDir, readFile, rename, stat, writeFile)"),
+        // An unknown function's arguments are still checked.
+        lib.bad("unknown function with a bad argument",
+            "import 'fs'; fs.copyFile(nope);",
+            "undefined: nope"),
+        lib.bad("readFile takes exactly one",
+            "import 'fs'; printInline(fs.readFile(\"a\", \"b\") catch []);",
+            "fs.readFile takes 1 argument(s), got 2"),
+        lib.bad("exists takes exactly one",
+            "import 'fs'; printInline(fs.exists());",
+            "fs.exists takes 1 argument(s), got 0"),
+        lib.bad("writeFile takes two",
+            "import 'fs'; fs.writeFile(\"a\") catch e {}",
+            "fs.writeFile takes 2 argument(s), got 1"),
+        // delete has an optional argument, so its arity diagnostic names both forms.
+        lib.bad("delete takes one or two",
+            "import 'fs'; fs.delete(\"a\", {}, {}) catch e {}",
+            "fs.delete takes 1 or 2 argument(s), got 3"),
+        lib.bad("delete takes at least one",
+            "import 'fs'; fs.delete() catch e {}",
+            "fs.delete takes 1 or 2 argument(s), got 0"),
+        lib.bad("the options must be a DeleteOptions",
+            "import 'fs'; fs.delete(\"a\", true) catch e {}",
+            "argument 2 of fs.delete: cannot use bool as fs.DeleteOptions"),
+        lib.bad("an unknown option is not silently accepted",
+            `import 'fs';
+fs.delete("a", { recursive: true, force: true }) catch e {}`,
+            "type DeleteOptions has no field \"force\""),
+        lib.bad("the option is a bool",
+            "import 'fs'; fs.delete(\"a\", { recursive: 1 }) catch e {}",
+            "field \"recursive\": cannot use int as bool?"),
+        lib.bad("the path must be a string",
+            "import 'fs'; printInline(fs.exists(1));",
+            "argument 1 of fs.exists: cannot use int as String"),
+        // byte is uint8 (§2.1), so a diagnostic writes uint8[] where the
+        // documentation writes byte[].
+        lib.bad("the content must be bytes",
+            "import 'fs'; fs.writeFile(\"a\", \"text\") catch e {}",
+            "argument 2 of fs.writeFile: cannot use String as uint8[]"),
+        lib.bad("the content must be bytes, not another array",
+            `import 'fs';
+String[] lines = [];
+fs.writeFile("a", lines) catch e {}`,
+            "argument 2 of fs.writeFile: cannot use String[] as uint8[]"),
+        lib.bad("function must be called",
+            "import 'fs'; printInline(fs.exists);",
+            "fs.exists must be called: fs.exists(...)"),
+        lib.bad("the type is not a value",
+            "import 'fs'; printInline(fs.Stat);",
+            "fs.Stat is a type, not a value"),
+        lib.bad("unknown type in the module",
+            "import 'fs'; fs.Entry e;",
+            "built-in library fs has no exported type \"Entry\" (available: DeleteOptions, ErrorCode, Stat)"),
+        lib.bad("Stat is not a bare type name",
+            "import 'fs'; Stat s;",
+            "unknown type \"Stat\""),
+        lib.bad("fs as a variable needs the import gone",
+            "import 'fs'; int fs = 1;",
+            "\"fs\" is already used as a module name"),
+        lib.bad("fs as a function needs the import gone",
+            "import 'fs'; void fs() {}",
+            "\"fs\" is already used as a module name"),
+        lib.bad("no such field on Stat",
+            `import 'fs';
+void show() {
+    fs.Stat s = fs.stat("f") catch e { return; }
+    printInline(s.owner);
+}`,
+            "owner"),
+        lib.bad("the result is not assignable to a user record",
+            `import 'fs';
+type Stat { String name; }
+void show() {
+    Stat s = fs.stat("f") catch e { return; }
+    printInline(s.name);
+}`,
+            "cannot use fs.Stat as Stat"),
+        // An uncaught call makes its container fallible, so a container that
+        // declares otherwise is the error.
+        lib.bad("a fallible call needs a catch or a fallible signature",
+            "import 'fs'; Function(String)<void> del = void (String p) -> fs.delete(p);",
+            "this function value can fail; its type must say so"),
+        lib.bad("the future of a fallible async body says so",
+            `import 'fs';
+byte[] async read(String p) { return fs.readFile(p); }
+Future<byte[]> f = read("x");`,
+            "cannot use Future<uint8[]!> as Future<uint8[]>"),
+        // fs.exists cannot fail, so a catch over it has nothing to handle.
+        lib.bad("nothing to catch over exists",
+            "import 'fs'; printInline(fs.exists(\"f\") catch false);",
+            "nothing in this expression can fail"),
+        lib.bad("the size field is an int, not a String",
+            `import 'fs';
+void show() {
+    fs.Stat st = fs.stat("f") catch e { return; }
+    String s = st.size;
+}`,
+            "cannot use int as String"),
+    ]);
+});
+
+test.start("checker: the process library", void () -> {
+    lib.accepts([
+        lib.ok("exit and the stream writes",
+            `import 'process';
+process.stdout.write("out");
+process.stderr.write("err");
+process.exit(0);
+`),
+        lib.ok("exit accepts an int8",
+            `import 'process';
+int8 code = 3;
+process.exit(code);
+`),
+        lib.ok("stdin.read, each failure caught",
+            `import 'process';
+byte[] all = process.stdin.read() catch [];
+printInline(all.length);
+`),
+        lib.ok("stdin.readLine narrows like any optional",
+            `import 'process';
+String? line = process.stdin.readLine() catch null;
+while (line != null) {
+    printInline(line);
+    line = process.stdin.readLine() catch null;
+}
+`),
+        lib.ok("an alias renames the module",
+            `import 'process' as proc;
+proc.stdout.write("x");
+proc.exit(1);
+`),
+        lib.ok("fallibility is inferred and propagates",
+            `import 'process';
+String? prompt() {
+    return process.stdin.readLine();
+}
+String? answer = prompt() catch null;
+printInline(answer);
+`),
+        lib.ok("the bytes compose with the string module",
+            `import 'process';
+import 'string';
+process.stdout.write(string.fromByteArray(process.stdin.read() catch []));
+`),
+        lib.ok("getArgs and its element type",
+            `import 'process';
+String[] args = process.getArgs();
+forEach(args, a) { printInline(a); }
+printInline(args.length);
+`),
+        lib.ok("child.run and the ChildRunResult record",
+            `import 'process';
+import 'string';
+void show() {
+    process.ChildRunResult r = await process.child.run("echo", ["hi"]) catch e { return; }
+    printInline(string.fromByteArray(r.stdout), string.fromByteArray(r.stderr), r.code);
+}
+show();
+`),
+        lib.ok("the record type in every type position",
+            `import 'process';
+import 'array';
+process.ChildRunResult[] all = [];
+process.ChildRunResult? maybe = await process.child.run("true", []) catch null;
+if (maybe != null) {
+    array.push(all, maybe);
+    printInline(maybe.code, all.length);
+}
+`),
+        lib.ok("ChildRunResult does not shadow a user type of the same name",
+            `import 'process';
+type ChildRunResult { int count; }
+ChildRunResult mine = { count: 2 };
+void show() {
+    process.ChildRunResult theirs = await process.child.run("x", []) catch e { return; }
+    printInline(mine.count, theirs.code);
+}
+show();
+`),
+        lib.ok("child.run fallibility is inferred and propagates",
+            `import 'process';
+int run(String tool) {
+    return (await process.child.run(tool, [])).code;
+}
+int code = run("true") catch -1;
+printInline(code);
+`),
+    ]);
+});
+
+test.start("checker: process library errors", void () -> {
+    lib.rejects([
+        lib.bad("not imported",
+            "process.exit(0);",
+            "process is a built-in library; import it first: import 'process';"),
+        lib.bad("bare module", "printInline(process);", "process is a built-in library"),
+        lib.bad("unknown function",
+            "import 'process'; process.quit(0);",
+            "process has no function \"quit\" (available: exit, getArgs, and the stdout, stderr, stdin, child groups)"),
+        lib.bad("run is not on the module itself",
+            "import 'process'; await process.run(\"echo\", []) catch e {}",
+            "process has no function \"run\" (available: exit, getArgs, and the stdout, stderr, stdin, child groups)"),
+        lib.bad("getArgs takes nothing",
+            "import 'process'; printInline(process.getArgs(1).length);",
+            "process.getArgs takes 0 argument(s), got 1"),
+        lib.bad("nothing to catch over getArgs",
+            "import 'process'; String[] a = process.getArgs() catch [];",
+            "nothing in this expression can fail"),
+        lib.bad("run takes two or three",
+            "import 'process'; await process.child.run(\"echo\") catch e {}",
+            "process.child.run takes 2 or 3 argument(s), got 1"),
+        lib.bad("run takes no more than three",
+            "import 'process'; await process.child.run(\"echo\", [], {}, 1) catch e {}",
+            "process.child.run takes 2 or 3 argument(s), got 4"),
+        lib.bad("run arguments are an array",
+            "import 'process'; await process.child.run(\"echo\", \"hi\") catch e {}",
+            "argument 2 of process.child.run: cannot use String as String[]"),
+        lib.bad("the options are a ChildRunOptions",
+            "import 'process'; await process.child.run(\"echo\", [], 1) catch e {}",
+            "argument 3 of process.child.run: cannot use int as process.ChildRunOptions"),
+        lib.bad("an unknown option is not a field",
+            "import 'process'; await process.child.run(\"echo\", [], { timeout: 5 }) catch e {}",
+            "type ChildRunOptions has no field \"timeout\""),
+        lib.bad("stdin is bytes, not text",
+            "import 'process'; await process.child.run(\"cat\", [], { stdin: \"hi\" }) catch e {}",
+            "field \"stdin\": cannot use String as uint8[]?"),
+        lib.bad("the environment is a string map",
+            "import 'process'; await process.child.run(\"env\", [], { env: { \"N\": 1 } }) catch e {}",
+            "map value: cannot use int as String"),
+        lib.bad("child is not a function",
+            "import 'process'; process.child(\"echo\", []);",
+            "process.child is a group of functions, not a function; call one of them: process.child.run(...)"),
+        lib.bad("child is not a value",
+            "import 'process'; printInline(process.child);",
+            "process.child is a group of functions, not a value; call one of them: process.child.something(...)"),
+        lib.bad("unknown function in the child group",
+            "import 'process'; process.child.spawn(\"echo\", []);",
+            "process.child has no function \"spawn\" (available: run)"),
+        lib.bad("reaching into the future says to await it",
+            "import 'process'; printInline(process.child.run(\"echo\", []).code);",
+            "type Future<process.ChildRunResult!> has no properties; await it first: (await process.child.run(\"echo\", [])).code"),
+        lib.bad("the type is not a value",
+            "import 'process'; printInline(process.ChildRunResult);",
+            "process.ChildRunResult is a type, not a value"),
+        lib.bad("unknown type in the module",
+            "import 'process'; process.Result r;",
+            "built-in library process has no exported type \"Result\" (available: ChildRunOptions, ChildRunResult, ChildUsage, ErrorCode)"),
+        lib.bad("ChildRunResult is not a bare type name",
+            "import 'process'; ChildRunResult r;",
+            "unknown type \"ChildRunResult\""),
+        lib.bad("an uncaught child.run makes a function value fallible",
+            "import 'process'; Function(String)<int> run = int (String t) -> (await process.child.run(t, [])).code;",
+            "this function value can fail; its type must say so"),
+        lib.bad("the result is not assignable to a user record",
+            `import 'process';
+type ChildRunResult { int code; }
+void show() {
+    ChildRunResult r = await process.child.run("x", []) catch e { return; }
+    printInline(r.code);
+}`,
+            "cannot use process.ChildRunResult as ChildRunResult"),
+        lib.bad("a stream is not a function",
+            "import 'process'; process.stdout(\"hi\");",
+            "process.stdout is a group of functions, not a function; call one of them: process.stdout.write(...)"),
+        lib.bad("stdin is not a function either",
+            "import 'process'; process.stdin();",
+            "process.stdin is a group of functions, not a function; call one of them: process.stdin.read(...)"),
+        lib.bad("a stream is not a value",
+            "import 'process'; printInline(process.stdout);",
+            "process.stdout is a group of functions, not a value; call one of them: process.stdout.something(...)"),
+        lib.bad("unknown function in a write namespace",
+            "import 'process'; process.stdout.print(\"x\");",
+            "process.stdout has no function \"print\" (available: flush, write)"),
+        lib.bad("unknown function in stdin",
+            "import 'process'; process.stdin.readAll();",
+            "process.stdin has no function \"readAll\" (available: read, readBytes, readLine)"),
+        lib.bad("exit takes an int",
+            "import 'process'; process.exit(\"1\");",
+            "argument 1 of process.exit: cannot use String as int"),
+        lib.bad("exit takes exactly one",
+            "import 'process'; process.exit();",
+            "process.exit takes 1 argument(s), got 0"),
+        lib.bad("write takes a string",
+            "import 'process'; process.stdout.write(1);",
+            "argument 1 of process.stdout.write: cannot use int as String"),
+        lib.bad("read takes nothing",
+            "import 'process'; printInline((process.stdin.read(1) catch []).length);",
+            "process.stdin.read takes 0 argument(s), got 1"),
+        // The writes are total, so a catch over one has nothing to handle. The
+        // stdin reads are the module's fallible half.
+        lib.bad("nothing to catch over a write",
+            "import 'process'; process.stdout.write(\"x\") catch e {}",
+            "nothing in this expression can fail"),
+        lib.bad("readLine is optional and must be narrowed",
+            `import 'process';
+String line = process.stdin.readLine() catch null;`,
+            "cannot use String? as String"),
+        lib.bad("read produces bytes, not text",
+            `import 'process';
+byte[] all = process.stdin.read() catch [];
+String s = all;`,
+            "cannot use uint8[] as String"),
+        lib.bad("process as a variable needs the import gone",
+            "import 'process'; int process = 1;",
+            "\"process\" is already used as a module name"),
+        lib.bad("process as a function needs the import gone",
+            "import 'process'; void process() {}",
+            "\"process\" is already used as a module name"),
+    ]);
+});
+
+test.start("checker: maps", void () -> {
+    lib.accepts([
+        lib.ok("declaration, indexing, length",
+            `
+Map<String, int> ages;
+ages["alice"] = 31;
+ages["alice"] = 32;
+int? age = ages["alice"];
+if (age != null) {
+    printInline(age + 1);
+}
+printInline(ages.length);
+printInline(ages["carol"]);
+`),
+        lib.ok("literals",
+            `
+Map<String, int> ages = { "alice": 31, "bob": 27 };
+Map<int, String> codes = { 200: "ok", -1: "minus" };
+Map<String, float> empty = {};
+Map<String, int8> narrow = { "a": 100 };
+`),
+        lib.ok("module functions",
+            `import 'map';
+Map<String, int> m = { "a": 1 };
+bool has = map.has(m, "a");
+bool removed = map.remove(m, "a");
+String[] ks = map.keys(m);
+int[] vs = map.values(m);
+Map<String, int> dup = map.copy(m);
+forEach(map.keys(m), key) {
+    printInline(key);
+}
+`),
+        lib.ok("scalar and enum keys",
+            `
+enum Color { RED: 1, BLUE: 2 }
+Map<Color, String> names;
+names[Color.RED] = "red";
+Map<DateTime, int> byDay;
+Map<Duration, int> byGap;
+Map<bool, int> flags;
+flags[true] = 1;
+Map<int8, int> tiny;
+tiny[5] = 1;
+`),
+        lib.ok("records and nesting as values",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+
+Map<String, Car> fleet = { "g1": { make: "toyota", age: 4 } };
+printInline(fleet["g1"]?.owner);
+Map<String, Map<String, int>> nested;
+Map<String, int[]> lists;
+`),
+        lib.ok("json round trip",
+            `import 'json';
+Map<String, int> ages = { "alice": 31 };
+String text = json.toText(ages);
+Map<String, int> back = json.parse(text) as Map<String, int>;
+`),
+        lib.ok("optional maps and chains",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+
+type Garage { Map<String, Car>? cars; }
+Garage g = { cars: null };
+printInline(g.cars?.length);
+if (g.cars != null) {
+    Car? c = g.cars["slot"];
+}
+`),
+        lib.ok("getType names the map type",
+            `
+Map<String, int> m;
+printInline(getType(m));
+`),
+        lib.ok("maps in functions and function values",
+            `
+int count(Map<String, int> m) {
+    return m.length;
+}
+Map<String, int> make() {
+    Map<String, int> m = { "a": 1 };
+    return m;
+}
+printInline(count(make()));
+Function(Map<String, int>)<int> f = int (Map<String, int> m) -> m.length;
+`),
+        lib.ok("alias import",
+            `import 'map' as hashes;
+Map<String, int> m;
+bool b = hashes.has(m, "a");
+`),
+    ]);
+});
+
+test.start("checker: map errors", void () -> {
+    lib.rejects([
+        lib.bad("not imported",
+            "Map<String, int> m; map.has(m, \"a\");",
+            "map is a built-in library; import it first: import 'map';"),
+        lib.bad("as a variable needs the import gone",
+            "import 'map'; int map = 1;",
+            "\"map\" is already used as a module name"),
+        lib.bad("as a function needs the import gone",
+            "import 'map'; void map() {}",
+            "\"map\" is already used as a module name"),
+        lib.bad("float key",
+            "Map<float, int> m;",
+            "float cannot be a map key (keys are String, the integer types, bool, DateTime, Duration, and enums)"),
+        lib.bad("record key",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Map<Car, int> m;`,
+            "Car cannot be a map key"),
+        lib.bad("array key", "Map<int[], int> m;", "int[] cannot be a map key"),
+        lib.bad("optional key", "Map<String?, int> m;", "String? cannot be a map key"),
+        lib.bad("optional value",
+            "Map<String, int?> m;",
+            "a map value cannot be optional: m[k] already yields int? (use Map<String, int>)"),
+        lib.bad("lookup is optional",
+            "Map<String, int> m; int x = m[\"a\"];",
+            "cannot use int? as int in declaration"),
+        lib.bad("lookup needs narrowing",
+            "Map<String, int> m; printInline(m[\"a\"] + 1);",
+            "operator + is not defined on int? and int"),
+        lib.bad("cannot store null",
+            "Map<String, int> m; m[\"a\"] = null;",
+            "cannot assign null to int"),
+        lib.bad("wrong key on write",
+            "Map<String, int> m; m[1] = 2;",
+            "map key: cannot use int as String"),
+        lib.bad("wrong key on read",
+            "Map<String, int> m; printInline(m[true]);",
+            "map key: cannot use bool as String"),
+        lib.bad("wrong value",
+            "Map<String, int> m; m[\"a\"] = \"b\";",
+            "cannot assign String to int"),
+        lib.bad("inc dec on entries",
+            "Map<String, int> m; m[\"a\"]++;",
+            "cannot ++ a map entry (the key may be absent); read m[k] into a variable and store it back"),
+        lib.bad("identifier key in literal",
+            "int alice = 1; Map<String, int> m = { alice: 31 };",
+            "map keys are literals; \"alice\" is an identifier"),
+        lib.bad("string key in record literal",
+            `
+type Car {
+    String make;
+    int age;
+    String? owner;
+}
+Car c = { "make": "a", "age": 1 };`,
+            "record fields are named by identifiers, not string literals: write { field: ... } for Car"),
+        lib.bad("duplicate literal key",
+            "Map<String, int> m = { \"a\": 1, \"a\": 2 };",
+            "duplicate key \"a\" in map literal"),
+        lib.bad("duplicate int literal key",
+            "Map<int, int> m = { 1: 1, 1: 2 };",
+            "duplicate key 1 in map literal"),
+        lib.bad("literal key type",
+            "Map<int, int> m = { \"a\": 1 };",
+            "map key: cannot use String as int"),
+        lib.bad("literal needs context",
+            "printInline({ \"a\": 1 });",
+            "cannot determine the map type of this literal"),
+        lib.bad("length is read-only",
+            "Map<String, int> m; m.length = 3;",
+            "cannot assign to map length"),
+        lib.bad("unknown property",
+            "Map<String, int> m; printInline(m.size);",
+            "maps have no property \"size\" (available: length)"),
+        lib.bad("method call hint",
+            "Map<String, int> m; m.has(\"a\");",
+            "maps have no methods; has is a function of the map library: import 'map'; map.has(...)"),
+        lib.bad("forEach hint",
+            "Map<String, int> m; forEach(m, k) { printInline(k); }",
+            "forEach iterates over an array; iterate a map through its keys: forEach(map.keys(m), key) { ... }"),
+        lib.bad("cannot print",
+            "Map<String, int> m; print(m);",
+            "cannot print Map<String, int>; print takes strings, numbers, bools, DateTime and Duration values, and enums (serialize records, arrays, and maps with json.toText)"),
+        lib.bad("cannot compare",
+            "Map<String, int> a; Map<String, int> b; bool eq = a == b;",
+            "cannot compare Map<String, int> and Map<String, int>"),
+        lib.bad("json needs String keys",
+            `import 'json';
+Map<int, String> codes;
+printInline(json.toText(codes));`,
+            "cannot serialize Map<int, String>: JSON object keys are strings, so only Map<String, ...> has a JSON form"),
+        lib.bad("json parse needs String keys",
+            `import 'json';
+Map<int, String> codes = json.parse("{}") as Map<int, String>;`,
+            "cannot parse JSON into Map<int, String>: JSON object keys are strings; use Map<String, String>"),
+        lib.bad("json parse rejects fixed arrays inside",
+            `import 'json';
+Map<String, int[3]> m = json.parse("{}") as Map<String, int[3]>;`,
+            "a fixed-size array cannot be parsed"),
+        lib.bad("index optional map",
+            "Map<String, int>? m; printInline(m[\"a\"]);",
+            "cannot index optional type Map<String, int>? (compare with null first)"),
+        lib.bad("unknown function",
+            "import 'map'; Map<String, int> m; map.pop(m);",
+            "map has no function \"pop\" (available: copy, has, keys, remove, values)"),
+        lib.bad("wrong argument count",
+            "import 'map'; Map<String, int> m; map.has(m);",
+            "map.has takes 2 argument(s), got 1"),
+        lib.bad("wrong key argument",
+            "import 'map'; Map<String, int> m; map.remove(m, 1);",
+            "argument 2 of map.remove: cannot use int as String"),
+        lib.bad("not a map argument",
+            "import 'map'; map.keys([1, 2]);",
+            "argument 1 of map.keys must be a map, got int[]"),
+        lib.bad("assignability is exact",
+            "Map<String, int> a; Map<String, int64> b = a;",
+            "cannot use Map<String, int> as Map<String, int64>"),
+    ]);
+});
+
+test.start("checker: methods", void () -> {
+    lib.accepts([
+        lib.ok("reading and mutating the receiver",
+            `
+type Counter {
+    int n;
+    String label;
+
+    int bump() {
+        self.n = self.n + 1;
+        return self.n;
+    }
+
+    void reset() {
+        self.n = 0;
+    }
+}
+
+Counter c = { n: 0, label: "a" };
+int n = c.bump();
+c.reset();
+`),
+        lib.ok("a method calling another on self",
+            `
+type Counter {
+    int n;
+    String label;
+
+    int bump() {
+        self.n = self.n + 1;
+        return self.n;
+    }
+
+    void reset() {
+        self.n = 0;
+    }
+}
+
+type Wrapper {
+    Counter inner;
+    int twice() {
+        return self.inner.bump() + self.two();
+    }
+    int two() { return 2; }
+}
+`),
+        lib.ok("methods see functions declared later",
+            `
+type Counter {
+    int n;
+    String label;
+
+    int bump() {
+        self.n = self.n + 1;
+        return self.n;
+    }
+
+    void reset() {
+        self.n = 0;
+    }
+}
+
+type T {
+    int n;
+    int doubled() { return twice(self.n); }
+}
+int twice(int x) { return x * 2; }
+`),
+        lib.ok("receivers reached through fields, arrays and narrowing",
+            `
+type Counter {
+    int n;
+    String label;
+
+    int bump() {
+        self.n = self.n + 1;
+        return self.n;
+    }
+
+    void reset() {
+        self.n = 0;
+    }
+}
+
+type Garage { Counter[] counters; Counter? spare; }
+Garage g = { counters: [{ n: 1, label: "a" }] };
+int a = g.counters[0].bump();
+if (g.spare != null) {
+    int b = g.spare.bump();
+}
+`),
+        lib.ok("fallibility is inferred through methods",
+            `
+type Box {
+    int n;
+    int risky() {
+        if (self.n > 10) {
+            return Error("too big");
+        }
+        return self.n;
+    }
+    int safe() { return self.risky() catch 0; }
+}
+Box b = { n: 1 };
+int x = b.risky() catch -1;
+int y = b.safe();
+`),
+        lib.ok("mutual recursion between methods",
+            `
+type T {
+    int n;
+    int even(int k) { if (k == 0) { return 1; } return self.odd(k - 1); }
+    int odd(int k) { if (k == 0) { return 0; } return self.even(k - 1); }
+}
+`),
+        lib.ok("async methods produce futures",
+            `
+type T {
+    int n;
+    int async load() { return self.n; }
+    int async chained() { return await self.load(); }
+}
+T t = { n: 1 };
+Future<int> f = t.load();
+int v = await f;
+`),
+        lib.ok("a function value may capture the receiver",
+            `
+type T {
+    int n;
+    Function()<int> stepper() {
+        return int () -> {
+            self.n = self.n + 1;
+            return self.n;
+        };
+    }
+}
+`),
+        lib.ok("variadic methods",
+            `
+type T {
+    int n;
+    int addAll(...int parts) { return self.n; }
+}
+T t = { n: 0 };
+int x = t.addAll(1, 2, 3);
+`),
+        lib.ok("methods have their own namespace",
+            `
+type T {
+    int n;
+    int print() { return self.n; }
+    String getType() { return "T"; }
+    int date() { return self.n; }
+}
+T t = { n: 1 };
+int a = t.print();
+String b = t.getType();
+`),
+        lib.ok("methods leave the JSON form alone",
+            `import 'json';
+type Counter {
+    int n;
+    String label;
+
+    int bump() {
+        self.n = self.n + 1;
+        return self.n;
+    }
+
+    void reset() {
+        self.n = 0;
+    }
+}
+
+Counter c = { n: 1, label: "a" };
+String s = json.toText(c);
+`),
+    ]);
+});
+
+test.start("checker: method errors", void () -> {
+    lib.rejects([
+        lib.bad("method is not a value",
+            `
+type Counter {
+    int n;
+    String label;
+
+    int bump() {
+        self.n = self.n + 1;
+        return self.n;
+    }
+
+    void reset() {
+        self.n = 0;
+    }
+}
+Counter c = { n: 0, label: "a" };
+Function()<int> f = c.bump;`,
+            "method Counter.bump must be called: c.bump(...)"),
+        lib.bad("method cannot be assigned",
+            `
+type Counter {
+    int n;
+    String label;
+
+    int bump() {
+        self.n = self.n + 1;
+        return self.n;
+    }
+
+    void reset() {
+        self.n = 0;
+    }
+}
+Counter c = { n: 0, label: "a" };
+c.bump = int () -> 1;`,
+            "cannot assign to method Counter.bump"),
+        lib.bad("unknown method",
+            `
+type Counter {
+    int n;
+    String label;
+
+    int bump() {
+        self.n = self.n + 1;
+        return self.n;
+    }
+
+    void reset() {
+        self.n = 0;
+    }
+}
+Counter c = { n: 0, label: "a" };
+int x = c.spin();`,
+            "type Counter has no method \"spin\" (available: bump, reset)"),
+        lib.bad("argument count",
+            `
+type Counter {
+    int n;
+    String label;
+
+    int bump() {
+        self.n = self.n + 1;
+        return self.n;
+    }
+
+    void reset() {
+        self.n = 0;
+    }
+}
+Counter c = { n: 0, label: "a" };
+int x = c.bump(1);`,
+            "Counter.bump takes 0 argument(s), got 1"),
+        lib.bad("argument type",
+            `type T { int n; int add(int a) { return a; } }
+T t = { n: 0 };
+int x = t.add("s");`,
+            "cannot use String as int"),
+        lib.bad("field and method collide",
+            "type T { int n; int n() { return 1; } }",
+            "type \"T\" declares both a field and a method named \"n\""),
+        lib.bad("duplicate method",
+            "type T { int m() { return 1; } int m() { return 2; } }",
+            "type \"T\" already declares a method \"m\""),
+        lib.bad("duplicate method with more params",
+            "type T { int m() { return 1; } int m(int a) { return a; } }",
+            "type \"T\" already declares a method \"m\""),
+        lib.bad("a method colliding with a field is not checked twice",
+            "type T { int n; int n() { return self.n; } }",
+            "type \"T\" declares both a field and a method named \"n\""),
+        lib.bad("self outside a method",
+            "int f() { return self.n; }",
+            "self names the receiver and is only bound inside a method body"),
+        lib.bad("self is not a bare field scope",
+            "type T { int n; int get() { return n; } }",
+            "undefined: n"),
+        lib.bad("unknown field on the receiver",
+            "type T { int n; int get() { return self.missing; } }",
+            "type T has no field \"missing\""),
+        lib.bad("return type is enforced",
+            "type T { int n; int get() { return \"s\"; } }",
+            "cannot return String (function returns int)"),
+        lib.bad("a method on an optional needs narrowing",
+            `
+type Counter {
+    int n;
+    String label;
+
+    int bump() {
+        self.n = self.n + 1;
+        return self.n;
+    }
+
+    void reset() {
+        self.n = 0;
+    }
+}
+Counter? c = null;
+int x = c.bump();`,
+            "cannot access \"bump\" on optional type Counter?"),
+        lib.bad("no methods on arrays",
+            `int[] xs = [1];
+int n = xs.first();`,
+            "arrays have no method \"first\""),
+        // Fallibility is inferred, so it shows up where a type must spell it out.
+        lib.bad("a fallible method makes its caller fallible",
+            `type T {
+    int n;
+    int risky() { return Error("x"); }
+}
+T t = { n: 1 };
+Function()<int> f = int () -> { return t.risky(); };`,
+            "this function value can fail; its type must say so: Function()<int!>"),
+        lib.bad("an infallible method has nothing to catch",
+            `
+type Counter {
+    int n;
+    String label;
+
+    int bump() {
+        self.n = self.n + 1;
+        return self.n;
+    }
+
+    void reset() {
+        self.n = 0;
+    }
+}
+Counter c = { n: 0, label: "a" };
+int x = c.bump() catch -1;`,
+            "nothing in this expression can fail"),
+    ]);
+});
+
+test.start("checker: extending types", void () -> {
+    lib.accepts([
+        lib.ok("inherited fields and methods are the extending type's own",
+            `
+type Car {
+    String name;
+    String? color;
+    int wheels() { return 4; }
+    String describe() { return self.name; }
+}
+
+type Truck extends Car {
+    int load;
+    int override wheels() { return 6; }
+}
+
+Truck t = { name: "volvo", color: "red", load: 900 };
+String n = t.name;
+String? c = t.color;
+int l = t.load;
+int w = t.wheels();
+String d = t.describe();
+`),
+        lib.ok("a base declared after the type extending it",
+            `
+type B extends A { int y; }
+type A { int x; }
+B b = { x: 1, y: 2 };
+int n = b.x + b.y;
+`),
+        lib.ok("three levels of extension",
+            `
+type Car {
+    String name;
+    String? color;
+    int wheels() { return 4; }
+    String describe() { return self.name; }
+}
+
+type Truck extends Car {
+    int load;
+    int override wheels() { return 6; }
+}
+
+type Van extends Truck {
+    bool electric;
+    String override describe() { return "van"; }
+}
+Van v = { name: "ford", load: 1, electric: true };
+int w = v.wheels();
+String d = v.describe();
+`),
+        lib.ok("an override may change what can fail",
+            `
+type A {
+    int n;
+    int risky() { return Error("x"); }
+}
+type B extends A {
+    int override risky() { return self.n; }
+}
+A a = { n: 1 };
+B b = { n: 1 };
+int x = a.risky() catch -1;
+int y = b.risky();
+`),
+        lib.ok("an inherited method can be fallible",
+            `
+type A {
+    int n;
+    int risky() { if (self.n > 1) { return Error("x"); } return self.n; }
+}
+type B extends A { int m; }
+B b = { n: 1, m: 2 };
+int x = b.risky() catch -1;
+`),
+        lib.ok("an inherited async method",
+            `
+type A {
+    int n;
+    int async load() { return self.n; }
+}
+type B extends A { int m; }
+B b = { n: 1, m: 2 };
+Future<int> f = b.load();
+int v = await f;
+`),
+        lib.ok("overriding a method the base itself overrode",
+            `
+type Car {
+    String name;
+    String? color;
+    int wheels() { return 4; }
+    String describe() { return self.name; }
+}
+
+type Truck extends Car {
+    int load;
+    int override wheels() { return 6; }
+}
+
+type Bus extends Truck {
+    int override wheels() { return 8; }
+}
+`),
+    ]);
+});
+
+test.start("checker: extends errors", void () -> {
+    lib.rejects([
+        lib.bad("unknown base", "type B extends Nope { int n; }", "unknown type \"Nope\""),
+        lib.bad("built-in base",
+            "type B extends Error { int n; }",
+            "type \"Error\" is built in and cannot be extended"),
+        lib.bad("scalar base",
+            "type B extends int { int n; }",
+            "type \"int\" is built in and cannot be extended"),
+        lib.bad("enum base",
+            `enum E { A: 1 }
+type B extends E { int n; }`,
+            "\"E\" is an enum, and only a type declaration can be extended"),
+        lib.bad("self extension",
+            "type A extends A { int n; }",
+            "type \"A\" cannot extend itself"),
+        lib.bad("extends cycle",
+            `type A extends B { int n; }
+type B extends A { int m; }`,
+            "A extends B extends A form a cycle"),
+        lib.bad("a field cannot be redeclared",
+            `type A { int n; }
+type B extends A { int n; }`,
+            "type \"B\" inherits field \"n\" from A and cannot declare it again"),
+        lib.bad("a method needs override to be replaced",
+            `type A { int f() { return 1; } }
+type B extends A { int f() { return 2; } }`,
+            "type \"B\" inherits a method \"f\" from A: write `int override f(…)` to replace it"),
+        lib.bad("override needs something to override",
+            `type A { int f() { return 1; } }
+type B extends A { int override g() { return 2; } }`,
+            "method \"g\" overrides nothing: A has no method \"g\""),
+        lib.bad("override without a base type",
+            "type A { int override f() { return 1; } }",
+            "method \"f\" overrides nothing: type \"A\" extends no type"),
+        lib.bad("an async method needs override too",
+            `type A { int async f() { return 1; } }
+type B extends A { int async f() { return 2; } }`,
+            "write `int override async f(…)` to replace it"),
+        // A body is copied before it is checked, so a rejected one must still copy.
+        lib.bad("a rejected body is still copyable",
+            `type A { void f() { void g() { } } }
+type B extends A { int n; }`,
+            "function declarations are only allowed at the top level"),
+        lib.bad("an override keeps the signature",
+            `type A { int f(int n) { return n; } }
+type B extends A { String override f(String s) { return s; } }`,
+            "override of A.f must keep its signature Function(int)<int>, not Function(String)<String>"),
+        lib.bad("an inherited method collides with a new field",
+            `type A { int f() { return 1; } }
+type B extends A { int f; }`,
+            "type \"B\" declares a field \"f\" and inherits a method by that name from A"),
+        lib.bad("an inherited field collides with a new method",
+            `type A { int f; }
+type B extends A { int f() { return 1; } }`,
+            "type \"B\" inherits a field \"f\" from A and cannot declare a method by that name"),
+        // An extending type is a type of its own, and neither is assignable to
+        // the other.
+        lib.bad("an extending type is not its base",
+            `type A { int n; }
+type B extends A { int m; }
+B b = { n: 1, m: 2 };
+A a = b;`,
+            "cannot use B as A"),
+        // In the extending type self is the extending type, so a base body that
+        // names its own type cannot be inherited.
+        lib.bad("a base returning self as its own type",
+            `type A { int n; A me() { return self; } }
+type B extends A { int m; }`,
+            "B.me (inherited from A): cannot return B (function returns A)"),
+    ]);
+});
+
+test.start("checker: the regexp library", void () -> {
+    lib.accepts([
+        lib.ok("the shape the module is for",
+            `import 'regexp';
+RegExp mySearchRegexp = regexp.create("ab+c", "i");
+int at = regexp.find("xxabbbc", mySearchRegexp);
+bool found = regexp.match("xxabbbc", mySearchRegexp);
+`),
+        lib.ok("the flags may be left off",
+            `import 'regexp';
+RegExp re = regexp.create("[0-9]+");
+`),
+        lib.ok("a RegExp is an ordinary value",
+            `import 'regexp';
+RegExp make(String p) { return regexp.create(p); }
+bool anyMatch(String[] lines, RegExp re) {
+    forEach(lines, line) { if (regexp.match(line, re)) { return true; } }
+    return false;
+}
+RegExp[] all = [make("a"), make("b")];
+Map<String, RegExp> byName = { "digits": make("[0-9]") };
+RegExp? maybe = null;
+type Rule { String name; RegExp pattern; }
+`),
+        lib.ok("create is fallible, so a catch has something to handle",
+            `import 'regexp';
+RegExp? re = regexp.create("a(b") catch e {
+    print(e.message);
+    print(e.code == regexp.ErrorCode.INVALID);
+};
+`),
+        // One enum serves every raising module, so a regexp code equals the same
+        // code from string (§2.9).
+        lib.ok("its ErrorCode is the library's one enum",
+            `import 'regexp';
+import 'string';
+bool same = regexp.ErrorCode.INVALID == string.ErrorCode.INVALID;
+`),
+        lib.ok("an alias renames the module, not the type",
+            `import 'regexp' as rx;
+RegExp re = rx.create("a");
+bool b = rx.match("a", re);
+`),
+        lib.ok("a file that does not import it may use the name",
+            `int regexp = 1;
+void f(String regexp) { print(regexp); }
+`),
+        // RegExp is a built-in type name, so only the module's functions need
+        // the import.
+        lib.ok("the type alone needs no import",
+            `RegExp re;
+RegExp? maybe = null;
+type Rule { RegExp pattern; }
+`),
+    ]);
+});
+
+test.start("checker: regexp library errors", void () -> {
+    lib.rejects([
+        lib.bad("not imported",
+            "regexp.create(\"a\");",
+            "regexp is a built-in library; import it first: import 'regexp';"),
+        lib.bad("bare module", "printInline(regexp);", "regexp is a built-in library"),
+        lib.bad("unknown function",
+            "import 'regexp'; regexp.test(\"a\");",
+            "regexp has no function \"test\" (available: create, find, match)"),
+        lib.bad("replace is not here yet",
+            "import 'regexp'; regexp.replace(\"a\", \"b\");",
+            "regexp has no function \"replace\" (available: create, find, match)"),
+        lib.bad("create takes one or two",
+            "import 'regexp'; RegExp r = regexp.create();",
+            "regexp.create takes 1 or 2 argument(s), got 0"),
+        lib.bad("create takes no more than two",
+            "import 'regexp'; RegExp r = regexp.create(\"a\", \"i\", 1);",
+            "regexp.create takes 1 or 2 argument(s), got 3"),
+        lib.bad("the pattern is text",
+            "import 'regexp'; RegExp r = regexp.create(1);",
+            "argument 1 of regexp.create: cannot use int as String"),
+        lib.bad("the flags are text",
+            "import 'regexp'; RegExp r = regexp.create(\"a\", 1);",
+            "argument 2 of regexp.create: cannot use int as String"),
+        lib.bad("find takes the subject first",
+            `import 'regexp';
+RegExp re = regexp.create("a");
+int at = regexp.find(re, "abc");`,
+            "argument 1 of regexp.find: cannot use RegExp as String"),
+        lib.bad("find takes a compiled pattern, not text",
+            `import 'regexp';
+int at = regexp.find("abc", "a");`,
+            "argument 2 of regexp.find: cannot use String as RegExp"),
+        lib.bad("match answers a bool",
+            `import 'regexp';
+RegExp re = regexp.create("a");
+int n = regexp.match("abc", re);`,
+            "cannot use bool as int"),
+        lib.bad("find answers an int",
+            `import 'regexp';
+RegExp re = regexp.create("a");
+String at = regexp.find("abc", re);`,
+            "cannot use int as String"),
+        lib.bad("match cannot fail",
+            `import 'regexp';
+bool f(RegExp re) { return regexp.match("a", re) catch false; }`,
+            "nothing in this expression can fail"),
+        // A compiled pattern is opaque, so no generic operation reaches inside one.
+        lib.bad("a RegExp has no printed form",
+            `import 'regexp';
+print(regexp.create("a"));`,
+            "cannot print a RegExp; print the pattern it was created from"),
+        lib.bad("a RegExp has no equality",
+            `import 'regexp';
+RegExp a = regexp.create("x");
+RegExp b = regexp.create("x");
+bool same = a == b;`,
+            "cannot compare RegExp and RegExp"),
+        lib.bad("a RegExp has no JSON form",
+            `import 'regexp';
+import 'json';
+String s = json.toText(regexp.create("a"));`,
+            "cannot serialize RegExp: RegExps have no JSON form"),
+        lib.bad("nor does an array of them",
+            `import 'regexp';
+import 'json';
+RegExp[] all = [regexp.create("a")];
+String s = json.toText(all);`,
+            "RegExps have no JSON form"),
+        lib.bad("nor can one be parsed",
+            `import 'regexp';
+import 'json';
+RegExp? re = json.parse("\\"a\\"") as RegExp catch e { print(e.message); };`,
+            "RegExps have no JSON form (parse the pattern as a String and compile it with regexp.create)"),
+        lib.bad("a RegExp is not a map key",
+            `import 'regexp';
+Map<RegExp, int> m = {};`,
+            "cannot be a map key"),
+        lib.bad("unknown type in the module",
+            "import 'regexp'; regexp.Pattern p;",
+            "built-in library regexp has no exported type \"Pattern\" (available: ErrorCode)"),
+        lib.bad("the type cannot be redefined",
+            "import 'regexp'; type RegExp { int n; }",
+            "cannot redefine built-in type \"RegExp\""),
+        lib.bad("the type name is not a module alias",
+            "import 'regexp' as RegExp;",
+            "cannot use \"RegExp\" as a module name"),
+        lib.bad("regexp as a variable needs the import gone",
+            "import 'regexp'; int regexp = 1;",
+            "\"regexp\" is already used as a module name"),
+        lib.bad("the module is not the type",
+            "import 'regexp'; regexp re;",
+            "unknown type \"regexp\" (did you mean RegExp?)"),
+        lib.bad("nor is the other capitalisation",
+            "import 'regexp'; Regexp re;",
+            "unknown type \"Regexp\" (did you mean RegExp?)"),
+        lib.bad("nor the short spelling",
+            "import 'regexp'; Regex re;",
+            "unknown type \"Regex\" (did you mean RegExp?)"),
+    ]);
+});
+
+test.start("checker: switch errors", void () -> {
+    lib.rejects([
+        lib.bad("label of another type",
+            "switch (1) { case \"a\": print(0); }",
+            "cannot compare case value String with the switch subject's int"),
+        lib.bad("two enums never compare",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+enum Other { A: 1 }
+switch (HttpResponses.OK) { case Other.A: print(0); }`,
+            "cannot compare case value Other with the switch subject's HttpResponses"),
+        lib.bad("a record has no equality",
+            `type P { int x; }
+P p = { x: 1 };
+switch (p) { case 1: print(0); }`,
+            "cannot switch on P: clauses are matched with ==, which is not defined on it"),
+        lib.bad("an array has no equality",
+            "switch ([1, 2]) { case 1: print(0); }",
+            "cannot switch on int[]"),
+        lib.bad("a bare null has nothing to match",
+            "switch (null) { case null: print(0); }",
+            "cannot switch on null"),
+        lib.bad("a call is not a constant",
+            `int f() { return 1; }
+switch (1) { case f(): print(0); }`,
+            "a case value must be a constant"),
+        lib.bad("a variable is not a constant",
+            `int n = 1;
+switch (1) { case n: print(0); }`,
+            "a case value must be a constant"),
+        lib.bad("a duplicate label is dead code",
+            "switch (1) { case 1: print(1); case 1: print(2); }",
+            "duplicate case value 1"),
+        lib.bad("a duplicate string label too",
+            "switch (\"a\") { case \"a\": print(1); case \"a\": print(2); }",
+            "duplicate case value \"a\""),
+        lib.bad("an enum member and its value are one label",
+            `
+enum HttpResponses {
+    OK: 200,
+    NOT_FOUND: 404
+}
+
+switch (HttpResponses.OK) { case HttpResponses.OK: print(1); case 200: print(2); }`,
+            "duplicate case value 200"),
+        lib.bad("a stacked label counts as written",
+            "switch (1) { case 1: case 1: print(1); }",
+            "duplicate case value 1"),
+        lib.bad("continue in a switch outside a loop",
+            "switch (1) { case 1: continue; }",
+            "continue outside a loop"),
+    ]);
+});
+
+test.start("checker: switches that are fine", void () -> {
+    lib.accepts([
+        lib.ok("a break in a clause does not reach the loop outside",
+            `
+int? x = null;
+while (x == null) {
+    switch (1) { case 1: break; default: x = 1; }
+}
+print(x + 1);`),
+    ]);
+});
+
+test.start("checker: field renaming", void () -> {
+    lib.accepts([
+        lib.ok("renaming 1", "type E { int power 'json:engine_power'; }"),
+        lib.ok("renaming 2", "type E { float liters; int power 'json:engine_power'; }"),
+        // A renamed field may take another field's declared name, if no two
+        // fields end up on the same key.
+        lib.ok("renaming 3", "type E { int power 'json:liters'; float liters 'json:l'; }"),
+        // Keys need not be identifiers, and split at the first ':' only.
+        lib.ok("renaming 4", "type E { String ct 'json:Content-Type'; }"),
+        lib.ok("renaming 5", "type E { String id 'json:@id'; }"),
+        lib.ok("renaming 6", "type E { String ns 'json:a:b'; }"),
+        // Anonymous field types carry annotations too.
+        lib.ok("renaming 7", "type T { { int n 'json:num'; }[] xs; }"),
+        // "from" is contextual, so a field can still use it as a name.
+        lib.ok("renaming 8", "type Line { int from; int to; }"),
+        lib.ok("renaming 9", "type Line { int from 'json:src'; }"),
+    ]);
+});
+
+test.start("checker: field renaming errors", void () -> {
+    lib.rejects([
+        lib.bad("renaming 1",
+            "type E { int power 'engine_power'; }",
+            "field annotation \"engine_power\" is missing a target"),
+        lib.bad("renaming 2",
+            "type E { int power 'xml:engine_power'; }",
+            "unknown annotation target \"xml\""),
+        lib.bad("renaming 3",
+            "type E { int power 'json:'; }",
+            "'json:' needs a key after the target"),
+        lib.bad("renaming 4",
+            "type E { int power 'json:power'; }",
+            "\"json:power\" renames \"power\" to itself"),
+        lib.bad("renaming 5",
+            "type E { int power 'json:x'; int liters 'json:x'; }",
+            "type \"E\" maps both \"power\" and \"liters\" to the JSON key \"x\""),
+        lib.bad("renaming 6",
+            "type E { int x; int power 'json:x'; }",
+            "type \"E\" maps both \"x\" and \"power\" to the JSON key \"x\""),
+        lib.bad("renaming 7",
+            "type T { { int n 'json:n'; }[] xs; }",
+            "renames \"n\" to itself"),
+    ]);
+});
+
+// The declarations every json.parse case is checked against.
+String const JSON_DECL = `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+`;
+
+test.start("checker: json.parse", void () -> {
+    lib.accepts([
+        lib.ok("json.parse 1",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+Car c = json.parse("{}") as Car;`),
+        lib.ok("json.parse 2",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+int n = json.parse("1") as int;`),
+        lib.ok("json.parse 3",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+int8 n = json.parse("1") as int8;`),
+        lib.ok("json.parse 4",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+int16 n = json.parse("1") as int16;`),
+        lib.ok("json.parse 5",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+int32 n = json.parse("1") as int32;`),
+        lib.ok("json.parse 6",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+int64 n = json.parse("1") as int64;`),
+        lib.ok("json.parse 7",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+float f = json.parse("1") as float;`),
+        lib.ok("json.parse 8",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+float32 f = json.parse("1") as float32;`),
+        lib.ok("json.parse 9",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+float64 f = json.parse("1") as float64;`),
+        lib.ok("json.parse 10",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+bool b = json.parse("true") as bool;`),
+        lib.ok("json.parse 11",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+String s = json.parse("\\"x\\"") as String;`),
+        lib.ok("json.parse 12",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+DateTime d = json.parse("\\"2026-01-01\\"") as DateTime;`),
+        lib.ok("json.parse 13",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+Duration gap = json.parse("1000") as Duration;`),
+        lib.ok("json.parse 14",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+S s = json.parse("200") as S;`),
+        lib.ok("json.parse 15",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+int? n = json.parse("null") as int?;`),
+        lib.ok("json.parse 16",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+int[] xs = json.parse("[]") as int[];`),
+        lib.ok("json.parse 17",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+Part[][] p = json.parse("[]") as Part[][];`),
+        lib.ok("json.parse 18",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+Car? c = json.parse("null") as Car?;`),
+        // The parsed value is an ordinary expression of its type.
+        lib.ok("json.parse 19",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+printInline((json.parse("{}") as Car).make);`),
+        lib.ok("json.parse 20",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+String s = json.toText(json.parse("{}") as Car);`),
+        lib.ok("json.parse 21",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+bool b = (json.parse("{}") as Car).tow == null;`),
+        lib.ok("json.parse 22",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+Part p = (json.parse("{}") as Car).parts[0];`),
+    ]);
+});
+
+test.start("checker: json.parse errors", void () -> {
+    lib.rejects([
+        lib.bad("json.parse 1",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+String s = json.parse("1");`,
+            "cannot use Json as String"),
+        // §3.6 gives a String no conversion to a number, so it reaches this message.
+        lib.bad("json.parse 2",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+int x = "s" as int;`,
+            "'as' reads JSON into a type, so it needs json.parse(text) or a Json on its left"),
+        lib.bad("json.parse 3",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+int n = json.parse(5) as int;`,
+            "json.parse takes a String or a byte[], got int"),
+        lib.bad("json.parse 4",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+int n = json.parse("1", "2") as int;`,
+            "json.parse takes exactly 1 argument, got 2"),
+        lib.bad("json.parse 5",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+Function()<int> f = json.parse("1") as Function()<int>;`,
+            "cannot parse JSON into Function()<int>: function values have no JSON form"),
+        lib.bad("json.parse 6",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+Future<int> f = json.parse("1") as Future<int>;`,
+            "cannot parse JSON into Future<int>: futures have no JSON form"),
+        lib.bad("json.parse 7",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+int[3] a = json.parse("[]") as int[3];`,
+            "a fixed-size array cannot be parsed; use int[]"),
+        lib.bad("json.parse 8",
+            `import 'json';
+enum S { OK: 200 }
+type Part { String label; int? n; }
+type Car { String make; Part[] parts; Car? tow; Function()<int> f; }
+json.nope("x");`,
+            "json has no function \"nope\""),
+    ]);
+});
+
+test.start("checker: variadic signatures", void () -> {
+    lib.accepts([
+        lib.ok("variadic 1",
+            `void log(...String parts) { forEach(parts, p) { printInline(p); } }
+\t\t log(); log("a"); log("a", "b", "c");`),
+        // The collecting parameter is an ordinary array inside the body.
+        lib.ok("variadic 2",
+            `int sum(int seed, ...int ns) { return seed + ns.length; }
+\t\t printInline(sum(1)); printInline(sum(1, 2, 3));`),
+        lib.ok("variadic 3", "void log(...int xs) { int8 small = 1; log(small, 2); }"),
+        lib.ok("variadic 4", "void log(...int? xs) { } log(1, null);"),
+        lib.ok("variadic 5",
+            "Function(...String)<void> f = void (...String parts) -> { }; f(\"a\", \"b\");"),
+        lib.ok("variadic 6",
+            "Function(int, ...int)<int> f = int (int k, ...int ns) -> k; printInline(f(1, 2, 3));"),
+        lib.ok("variadic 7",
+            "int async total(...int ns) { return ns[0]; } printInline(await total(1, 2));"),
+        lib.ok("variadic 8",
+            `int first(...int ns) { if (ns[0] < 0) { return Error("neg"); } return ns[0]; }
+\t\t printInline(first(1) catch 0);`),
+    ]);
+});
+
+test.start("checker: variadic signature errors", void () -> {
+    lib.rejects([
+        lib.bad("too few arguments",
+            "void log(String tag, ...int ns) { } log();",
+            "log takes at least 1 argument(s), got 0"),
+        lib.bad("wrong collected type",
+            "void log(...String parts) { } log(\"a\", 1);",
+            "argument 2 of log: cannot use int as String"),
+        lib.bad("wrong fixed type",
+            "void log(int n, ...String parts) { } log(\"a\", \"b\");",
+            "argument 1 of log: cannot use String as int"),
+        lib.bad("an array is not a spread",
+            "void log(...String parts) { } String[] xs; log(xs);",
+            "log collects its arguments one by one, so it takes String, not the String[] array itself"),
+        lib.bad("variadic is part of the type",
+            "Function(...int)<void> f = void (int[] ns) -> { };",
+            "cannot use Function(int[])<void> as Function(...int)<void>"),
+        lib.bad("and so is its absence",
+            "Function(int[])<void> f = void (...int ns) -> { };",
+            "cannot use Function(...int)<void> as Function(int[])<void>"),
+        lib.bad("unknown element type",
+            "void log(...Nope parts) { }",
+            "unknown type \"Nope\""),
+        lib.bad("through a function value",
+            "Function(...int)<void> f; f(\"a\");",
+            "argument 1 of f: cannot use String as int"),
+    ]);
+});
+
+// ---- a 32-bit host ----
+//
+// `int` and `float` are as wide as the machine (§2.1). These tables set
+// types.naturalBits to 32 and put it back. They run by hand, because a raise
+// out of accepts/rejects leaves the width wrong for every later test.
+lib.Named[] const HOST32_OK = [
+    lib.ok("32-bit 1", "int n = 2147483647;"),
+    lib.ok("32-bit 2", "int n = -2147483648;"),
+    lib.ok("32-bit 3", "int32 a = 1; int b = a;"),
+    lib.ok("32-bit 4", "int a = 1; int32 b = a;"),
+    lib.ok("32-bit 5", "int32 a = 1; a++;"),
+    lib.ok("32-bit 6", "int32 a = 1; int32 b = a + a;"),
+    lib.ok("32-bit 7", "float32 f = 1.5; f++;"),
+    lib.ok("32-bit 8", "float32 f = 1.5; float g = f;"),
+    lib.ok("32-bit 9", "int64 big = 3000000000;"),
+    lib.ok("32-bit 10", "float64 big = 400000000000000000000000000000000000000.0;"),
+    lib.ok("32-bit 11", "int64 big = 1; big = big + 1;"),
+    lib.ok("32-bit 12", "int a = 1; int64 big = a;"),
+    lib.ok("32-bit 13", "int16 s = 1; int a = s;"),
+];
+
+lib.Named[] const HOST32_BAD = [
+    lib.bad("32-bit 1", "int n = 2147483648;", "cannot use int64 as int"),
+    lib.bad("32-bit 2", "int n = -2147483649;", "cannot use int64 as int"),
+    lib.bad("32-bit 3", "int64 big = 1; int n = big;", "cannot use int64 as int"),
+    lib.bad("32-bit 4",
+        "int64 big = 1; int64 c = big + big; int n = c;",
+        "cannot use int64 as int"),
+    lib.bad("32-bit 5", "float64 g = 1.5; float f = g;", "cannot use float64 as float"),
+    lib.bad("32-bit 6",
+        "float f = 400000000000000000000000000000000000000.0;",
+        "cannot use float64 as float"),
+    lib.bad("32-bit 7", "int16 s = 1; s++;", "int16 arithmetic widens to int"),
+    lib.bad("32-bit 8", "int16 a = 1; int16 b = a + a;", "cannot use int as int16"),
+];
+
+// These are the importer mistakes the geo module must catch.
+lib.Named[] const GEO_BAD = [
+    lib.bad("geo 1",
+        "import 'geo' as g; g.hidden();",
+        "\"hidden\" is not exported by module g"),
+    lib.bad("geo 2",
+        "import 'geo' as g; int x = g.internal;",
+        "\"internal\" is not exported by module g"),
+    lib.bad("geo 3",
+        "import 'geo' as g; g.missing();",
+        "module g has no exported name \"missing\""),
+    lib.bad("geo 4",
+        "import 'geo' as g; g.internal = 2;",
+        "\"internal\" is not exported by module g"),
+    lib.bad("geo 5",
+        "import 'geo' as g; g.limit = 2;",
+        "cannot assign to g.limit: it is declared const"),
+    lib.bad("geo 6",
+        "import 'geo' as g; g.limit++;",
+        "cannot assign to g.limit: it is declared const"),
+    lib.bad("geo 7",
+        "import 'geo' as g; g.origin = 1;",
+        "cannot assign to function g.origin"),
+    lib.bad("geo 8",
+        "import 'geo' as g; g.origin;",
+        "function g.origin must be called"),
+    lib.bad("geo 9", "import 'geo' as g; g.counter();", "g.counter is not a function"),
+    lib.bad("geo 10",
+        "import 'geo' as g; int x = g.Point;",
+        "g.Point is a type, not a value"),
+    lib.bad("geo 11",
+        "import 'geo' as g; g.Point();",
+        "g.Point is a type, not a function"),
+    lib.bad("geo 12",
+        "import 'geo' as g; g.hidden x;",
+        "\"hidden\" is not exported by module g"),
+    lib.bad("geo 13",
+        "import 'geo' as g; g.origin(1);",
+        "g.origin takes 0 argument(s), got 1"),
+    lib.bad("geo 14",
+        "import 'geo' as g; g;",
+        "g is a module; use g.name to access its exports"),
+];
+
+// HTTP_BAD holds the same mistakes for an imported enum.
+lib.Named[] const HTTP_BAD = [
+    lib.bad("http 1",
+        "import 'http' as h; int x = h.Status;",
+        "h.Status is an enum type, not a value (name one of its members: h.Status.OK)"),
+    lib.bad("http 2",
+        "import 'http' as h; h.Status = 1;",
+        "cannot assign to h.Status: it is a type"),
+    lib.bad("http 3",
+        "import 'http' as h; h.Status(1);",
+        "h.Status is a type, not a function"),
+    lib.bad("http 4",
+        "import 'http' as h; h.Status.OK = 1;",
+        "cannot assign to http.Status.OK: enum members are constants"),
+    lib.bad("http 5",
+        "import 'http' as h; int x = h.Status.MISSING;",
+        "enum http.Status has no member \"MISSING\""),
+    lib.bad("http 6",
+        "import 'http' as h; h.Hidden x;",
+        "\"Hidden\" is not exported by module h"),
+    lib.bad("http 7",
+        `import 'http' as h; enum Status { OK: 1 }
+Status s = h.Status.OK;`,
+        "cannot use http.Status as Status"),
+];
+
+test.start("checker: a 32-bit host", void () -> {
+    int saved = types.naturalBits;
+    types.naturalBits = 32;
+    String[] failures = [];
+    forEach(HOST32_OK, t) {
+        String[] errs = lib.check(t.src);
+        if (errs.length > 0) {
+            array.push(failures, t.name + ": unexpected errors:\n" + string.join(errs, "\n"));
+        }
+    }
+    forEach(HOST32_BAD, t) {
+        String[] errs = lib.check(t.src);
+        if (!lib.has(errs, t.want)) {
+            array.push(failures, t.name + ": no error containing \"" + t.want + "\" in:\n"
+                + string.join(errs, "\n"));
+        }
+    }
+    types.naturalBits = saved;
+    if (failures.length > 0) {
+        return Error(string.join(failures, "\n"));
+    }
+});
+
+// ---- what the checker records, rather than what it refuses ----
+
+test.start("checker: errors carry positions", void () -> {
+    String[] errs = lib.check("int x = 1;\nint y = \"a\";");
+    test.assert(errs.length > 0, "expected an error");
+    test.assert(string.contains(errs[0], "line 2:"),
+        "expected an error on line 2, got: " + errs[0]);
+});
+
+test.start("checker: Info is populated", void () -> {
+    lib.Checked c = lib.checkProg(CARTYPE + "\nCar c = { make: \"x\", age: 1 }\n"
+        + "int f(int a) { return a; }\nint n = f(c.age);\n");
+    test.assert(c.errs.length == 0, "unexpected errors: " + string.join(c.errs, "\n"));
+    types.Record? car = c.info.records["Car"];
+    if (car == null) {
+        return Error("expected a Car record in info.records");
+    }
+    test.expectInt(car.fields.length, 3);
+    types.FuncType? f = c.info.funcs["f"];
+    if (f == null) {
+        return Error("expected function f in info.funcs");
+    }
+    test.expectInt(f.params.length, 1);
+    test.assert(map.keys(c.info.types).length > 0, "expected expression types to be recorded");
+    test.assert(map.keys(c.info.declTypes).length > 0,
+        "expected declaration types to be recorded");
+});
+
+// Captures land in Info in first-use order, and each is marked for boxing.
+// Codegen builds closures from that contract.
+test.start("checker: capture analysis", void () -> {
+    lib.Checked c = lib.checkProg(`
+Function()<int> make(int seed) {
+    int n = seed;
+    int loose = 0;
+    return int () -> {
+        n = n + 1;
+        return n + seed;
+    };
+}
+`);
+    test.assert(c.errs.length == 0, "unexpected errors: " + string.join(c.errs, "\n"));
+    int[] lambdaIds = map.keys(c.info.lambdas);
+    test.expectInt(lambdaIds.length, 1);
+    forEach(lambdaIds, id) {
+        checker.Lambda? lam = c.info.lambdas[id];
+        if (lam == null) {
+            return Error("a lambda id with no lambda");
+        }
+        test.expectInt(lam.captures.length, 2);
+        test.expectString(lam.captures[0].name, "n");
+        test.expectString(lam.captures[1].name, "seed");
+    }
+    test.expectInt(map.keys(c.info.boxedVars).length, 1);
+    test.expectInt(map.keys(c.info.boxedParams).length, 1);
+});
+
+test.start("checker: enum Info is populated", void () -> {
+    lib.Checked c = lib.checkProg(HTTPENUM + "\nHttpResponses r = HttpResponses.NOT_FOUND;\n");
+    test.assert(c.errs.length == 0, "unexpected errors: " + string.join(c.errs, "\n"));
+    types.Enum? en = c.info.enums["HttpResponses"];
+    if (en == null) {
+        return Error("expected HttpResponses in info.enums");
+    }
+    test.expectInt(en.members.length, 2);
+    int? v = en.memberValue("NOT_FOUND");
+    if (v == null) {
+        return Error("memberValue(NOT_FOUND) is not there");
+    }
+    test.expectInt(v, 404);
+    bool found = false;
+    forEach(map.values(c.info.enumMembers), value) {
+        if (value == 404) {
+            found = true;
+        }
+    }
+    test.assert(found, "expected the member access to be recorded in info.enumMembers");
+});
+
+// A variadic parameter is an array, and the signature keeps the `...` spelling
+// for diagnostics and getType.
+test.start("checker: a variadic parameter is an array", void () -> {
+    lib.Checked c = lib.checkProg("void log(String tag, ...int ns) { }");
+    test.assert(c.errs.length == 0, "unexpected errors: " + string.join(c.errs, "\n"));
+    types.FuncType? sig = c.info.funcs["log"];
+    if (sig == null) {
+        return Error("no signature for log");
+    }
+    test.assert(sig.variadic, "signature should be variadic");
+    test.assert(types.equal(sig.params[1], types.newArray(types.IntT)),
+        "collecting parameter is " + types.typeString(sig.params[1]) + ", want int[]");
+    test.expectString(types.typeString(sig), "Function(String, ...int)<void>");
+});
+
+test.start("checker: method calls are recorded", void () -> {
+    lib.Checked c = lib.checkProg(COUNTERTYPE + "\nCounter c = { n: 0, label: \"a\" };\nint x = c.bump();\n");
+    test.assert(c.errs.length == 0, "unexpected errors: " + string.join(c.errs, "\n"));
+    types.Record? rec = c.info.records["Counter"];
+    if (rec == null) {
+        return Error("no Counter record");
+    }
+    test.expectInt(rec.methods.length, 2);
+    // Methods must not become fields.
+    test.expectInt(rec.fields.length, 2);
+    int[] callIds = map.keys(c.info.methodCalls);
+    test.expectInt(callIds.length, 1);
+    forEach(callIds, id) {
+        checker.MethodRef? m = c.info.methodCalls[id];
+        if (m == null) {
+            return Error("a method-call id with no method");
+        }
+        test.assert(types.equal(m.owner, rec), "call resolved to another type");
+        test.expectString(m.name, "bump");
+        test.assert(types.equal(m.sig.return, types.IntT),
+            "bump returns " + types.typeString(m.sig.return) + ", want int");
+    }
+});
+
+// ---- modules ----
+
+String const GEO_LIB = `
+export type Point { int x; int y; }
+export int counter = 0;
+export int const limit = 100;
+export Point origin() { return { x: 0, y: 0 }; }
+void hidden() {}
+int internal = 1;
+`;
+
+checker.ModuleExports exportsFrom(String src, String qual) {
+    ast.Program prog = lib.parseOrRaise(src);
+    checker.CheckResult res = checker.checkModule(prog, qual, {});
+    if (res.errs.length > 0) {
+        return Error("check errors in " + qual + ":\n" + string.join(res.errs, "\n"));
+    }
+    return checker.exportsOf(prog, res.info, qual);
+}
+
+test.start("checker: user modules", void () -> {
+    checker.ModuleExports exp = exportsFrom(GEO_LIB, "geo");
+    test.assert(exp.funcs["origin"] != null, "origin is not exported");
+    test.assert(exp.vars["counter"] != null, "counter is not exported");
+    test.assert(exp.records["Point"] != null, "Point is not exported");
+    test.assert(exp.funcs["hidden"] == null, "hidden leaked into exports");
+    test.assert(exp.vars["internal"] == null, "internal leaked into exports");
+    test.assert(exp.consts["limit"] != null, "limit is not recorded as const");
+    test.assert(exp.consts["counter"] == null, "counter is recorded as const");
+    test.assert(exp.names["hidden"] != null, "names should include unexported declarations");
+    test.assert(exp.names["internal"] != null, "names should include unexported declarations");
+
+    Map<String, checker.ModuleExports> deps = { "geo": exp };
+    lib.Checked c = lib.checkModuleWith(`
+import 'geo' as g;
+g.Point p = g.origin();
+p.x = 5;
+g.counter = g.counter + p.x;
+int n = g.counter + g.limit;
+`, "", deps);
+    test.assert(c.errs.length == 0, "unexpected errors:\n" + string.join(c.errs, "\n"));
+
+    forEach(GEO_BAD, t) {
+        String[] errs = lib.checkModuleWith(t.src, "", deps).errs;
+        if (errs.length == 0) {
+            return Error(t.src + ": expected an error containing \"" + t.want + "\", got none");
+        }
+        if (!lib.has(errs, t.want)) {
+            return Error(t.src + ": no error containing \"" + t.want + "\" in:\n"
+                + string.join(errs, "\n"));
+        }
+    }
+});
+
+String const HTTP_LIB = `
+export enum Status { OK: 200, NOT_FOUND: 404 }
+enum Hidden { A: 1 }
+export Status defaultStatus = Status.OK;
+`;
+
+test.start("checker: enums across modules", void () -> {
+    checker.ModuleExports exp = exportsFrom(HTTP_LIB, "http");
+    test.assert(exp.enums["Status"] != null, "the exported enum is missing from exports");
+    test.assert(exp.enums["Hidden"] == null, "an unexported enum leaked into exports");
+    test.assert(exp.names["Hidden"] != null, "names should include unexported enums");
+
+    Map<String, checker.ModuleExports> deps = { "http": exp };
+    lib.Checked c = lib.checkModuleWith(`
+import 'http' as h;
+h.Status s = h.Status.NOT_FOUND;
+h.Status? maybe = h.defaultStatus;
+int code = h.Status.OK;
+bool b = s == h.Status.NOT_FOUND && s == 404;
+`, "", deps);
+    test.assert(c.errs.length == 0, "unexpected errors:\n" + string.join(c.errs, "\n"));
+
+    forEach(HTTP_BAD, t) {
+        String[] errs = lib.checkModuleWith(t.src, "", deps).errs;
+        if (!lib.has(errs, t.want)) {
+            return Error(t.src + ": no error containing \"" + t.want + "\" in:\n"
+                + string.join(errs, "\n"));
+        }
+    }
+});
+
+// Methods travel with the record, so an importer calls them on an imported type.
+String const SHAPES_LIB = `
+export type Rect {
+    int w;
+    int h;
+    int area() { return self.w * self.h; }
+    int checked() {
+        if (self.w <= 0) {
+            return Error("empty");
+        }
+        return self.area();
+    }
+}
+`;
+
+test.start("checker: methods across modules", void () -> {
+    checker.ModuleExports exp = exportsFrom(SHAPES_LIB, "shapes");
+    types.Record? rect = exp.records["Rect"];
+    if (rect == null) {
+        return Error("Rect is not exported");
+    }
+    types.FuncType? sig = rect.methodSig("checked");
+    if (sig == null) {
+        return Error("checked is not exported as a method");
+    }
+    test.assert(sig.fallible, "checked should be exported as a fallible method");
+
+    Map<String, checker.ModuleExports> deps = { "shapes": exp };
+    lib.Checked c = lib.checkModuleWith(`
+import 'shapes' as s;
+s.Rect r = { w: 2, h: 3 };
+int a = r.area();
+int b = r.checked() catch -1;
+`, "", deps);
+    test.assert(c.errs.length == 0, "unexpected errors:\n" + string.join(c.errs, "\n"));
+
+    // The importer sees which of the two can fail.
+    String[] errs = lib.checkModuleWith(`
+import 'shapes' as s;
+s.Rect r = { w: 2, h: 3 };
+int a = r.area() catch -1;
+`, "", deps).errs;
+    test.assert(lib.has(errs, "nothing in this expression can fail"),
+        "expected area to be infallible for the importer, got:\n" + string.join(errs, "\n"));
+});
+
+// ---- extending types ----
+
+test.start("checker: a base's own errors are reported once", void () -> {
+    String[] errs = lib.check(`
+type A { int n; int f() { return "s"; } }
+type B extends A { int b; }
+type C extends B { int c; }
+`);
+    if (errs.length != 1) {
+        return Error("expected exactly 1 error, got " + string.from(errs.length) + ":\n"
+            + string.join(errs, "\n"));
+    }
+    test.assert(!string.contains(errs[0], "inherited"),
+        "the base's own body should report it: " + errs[0]);
+});
+
+// Extending copies the base fields with their indices, and the extending type's
+// own follow, so a body compiled for either finds each field in place.
+test.start("checker: extends field layout", void () -> {
+    lib.Checked c = lib.checkModuleWith(VEHICLETYPES, "", {});
+    test.assert(c.errs.length == 0, "unexpected errors:\n" + string.join(c.errs, "\n"));
+    types.Record? car = c.info.records["Car"];
+    types.Record? truck = c.info.records["Truck"];
+    if (car == null || truck == null) {
+        return Error("Car or Truck is missing");
+    }
+    types.Record? base = truck.base;
+    if (base == null || !types.equal(base, car)) {
+        return Error("Truck.base is not Car");
+    }
+    String[] names = [];
+    forEach(truck.fields, f) {
+        array.push(names, f.name);
+    }
+    test.expectString(string.join(names, ","), "name,color,load");
+    for (int i = 0; i < car.fields.length; i++) {
+        if (truck.fields[i].name != car.fields[i].name) {
+            return Error("field " + string.from(i) + " is \"" + car.fields[i].name
+                + "\" in Car and \"" + truck.fields[i].name + "\" in Truck");
+        }
+    }
+    // Both types have every method, and the override is Truck's own entry.
+    test.expectInt(car.methods.length, 2);
+    test.expectInt(truck.methods.length, 2);
+});
+
+// A copied body resolves its names in the module that wrote it, so it still
+// reaches that module's private declarations.
+String const NOTE_LIB = `
+enum Level { LOW: 1 }
+String prefix = "lib>";
+String decorate(String s) { return prefix + s; }
+type Note { String text; }
+
+export type Item {
+    String name;
+    Note note;
+    String show() {
+        Note n = self.note;
+        if (self.level() > 1) {
+            return decorate(n.text) + "!";
+        }
+        return decorate(n.text);
+    }
+    int level() { return Level.LOW; }
+}
+`;
+
+test.start("checker: extends across modules", void () -> {
+    checker.ModuleExports exp = exportsFrom(NOTE_LIB, "lib");
+    Map<String, checker.ModuleExports> deps = { "lib": exp };
+    lib.Checked c = lib.checkModuleWith(`
+import 'lib';
+type Fancy extends lib.Item {
+    String[] tags;
+    int override level() { return 9; }
+}
+Fancy f = { name: "f", note: { text: "t" }, tags: ["a"] };
+String s = f.show();
+int n = f.level();
+`, "", deps);
+    test.assert(c.errs.length == 0, "unexpected errors:\n" + string.join(c.errs, "\n"));
+    types.Record? fancy = c.info.records["Fancy"];
+    if (fancy == null) {
+        return Error("Fancy is missing");
+    }
+    types.Record? base = fancy.base;
+    types.Record? item = exp.records["Item"];
+    if (base == null || item == null || !types.equal(base, item)) {
+        return Error("Fancy.base is not lib.Item");
+    }
+    test.expectInt(fancy.fields.length, 3);
+    test.expectString(fancy.fields[0].name, "name");
+    test.assert(fancy.methodSig("show") != null, "Fancy should have inherited show");
+});
+
+// ---- the float range check ----
+
+// fitsFloat32 implements §2.1's float32 range rule. §7 has no float32
+// conversion, so it compares against the exact overflow threshold instead.
+test.start("checker: fitsFloat32", void () -> {
+    float maxFloat32 = 340282346638528859811704183484516925440.0;
+    float smallestFloat32 = 0.000000000000000000000000000000000000000000001;
+    float[] vs = [0.0, -0.0, 1.0, -1.0, 0.1, maxFloat32, -maxFloat32, smallestFloat32];
+    forEach(vs, v) {
+        test.assert(checker.fitsFloat32(v),
+            "fitsFloat32(" + string.from(v) + ") = false, want true");
+    }
+    float huge = maxFloat32 * 2.0;
+    float[] over = [huge, -huge, maxFloat32 * 1.0000001, -(maxFloat32 * 1.0000001)];
+    forEach(over, v) {
+        test.assert(!checker.fitsFloat32(v),
+            "fitsFloat32(" + string.from(v) + ") = true, want false");
+    }
+});
+
+// The math module (§6.21). abs, min, max, clamp and toFloat have no fixed
+// signature: they take any number type and keep the families apart the way an
+// operator does. PI and E are constants the module exports.
+test.start("checker: math takes numbers and keeps the families apart", void () -> {
+    lib.accepts([
+        lib.ok("floats", "import 'math';\nfloat r = math.sqrt(2.0) + math.pow(2.0, 0.5) + math.PI;\nprint(r);"),
+        lib.ok("generic over int", "import 'math';\nint n = -3;\nprint(math.abs(n), math.min(n, 2), math.max(n, 2), math.clamp(n, 0, 10));"),
+        lib.ok("a literal takes the unsigned family", "import 'math';\nuint u = 5;\nuint m = math.max(u, 0);\nprint(m);"),
+        lib.ok("narrow types widen", "import 'math';\nbyte b = 200;\nuint w = math.abs(b);\nint8 s = -5;\nint t = math.abs(s);\nprint(w, t);"),
+        lib.ok("either integer family converts", "import 'math';\nuint u = 5;\nint n = 5;\nprint(math.toFloat(u) + math.toFloat(n));"),
+        lib.ok("a float32 is a float", "import 'math';\nfloat32 s = 2.0;\nprint(math.sqrt(s), math.isNaN(s));"),
+        lib.ok("noalloc may call it", "import 'math';\nfloat noalloc f(float x) {\n    return math.sqrt(x) * math.PI;\n}\nprint(f(4.0));"),
+    ]);
+    lib.rejects([
+        lib.bad("an int literal is not a float", "import 'math';\nprint(math.sqrt(4));", "cannot use int as float"),
+        lib.bad("families do not mix", "import 'math';\nint n = 1;\nprint(math.min(n, 1.5));", "int and float do not mix"),
+        lib.bad("not a number", "import 'math';\nprint(math.abs(\"x\"));", "cannot use String as a number"),
+        lib.bad("toFloat wants an integer", "import 'math';\nprint(math.toFloat(1.5));", "cannot use float as an integer"),
+        lib.bad("a constant is not assignable", "import 'math';\nmath.PI = 3.0;", "cannot assign to math.PI"),
+        lib.bad("arity", "import 'math';\nprint(math.min(1));", "math.min takes 2 argument(s), got 1"),
+        lib.bad("unknown", "import 'math';\nprint(math.sqroot(4.0));", "math has no function \"sqroot\""),
+        lib.bad("must be imported", "print(math.sqrt(4.0));", "import"),
+    ]);
+});
+
+// The random module (§6.22). shuffle and pick take any array and have no
+// fixed signature; the rest are ordinary signatures.
+test.start("checker: random takes arrays where it is generic", void () -> {
+    lib.accepts([
+        lib.ok("the fixed ones", "import 'random';\nrandom.seed(1);\nint n = random.int(1, 6);\nfloat f = random.float();\nprint(n, f);"),
+        lib.ok("generic over the element", "import 'random';\nString[] a = [\"x\"];\nrandom.shuffle(a);\nString s = random.pick(a);\nbyte[] b = [1];\nbyte c = random.pick(b);\nprint(s, c);"),
+        lib.ok("noalloc may call it", "import 'random';\nint noalloc roll() {\n    return random.int(1, 6);\n}\nprint(roll());"),
+    ]);
+    lib.rejects([
+        lib.bad("shuffle wants an array", "import 'random';\nrandom.shuffle(5);", "argument 1 of random.shuffle must be an array, got int"),
+        lib.bad("pick wants an array", "import 'random';\nprint(random.pick(\"abc\"));", "must be an array"),
+        lib.bad("arity", "import 'random';\nprint(random.int(1));", "random.int takes 2 argument(s), got 1"),
+        lib.bad("a seed is an int", "import 'random';\nrandom.seed(\"x\");", "cannot use String as int"),
+        lib.bad("unknown", "import 'random';\nprint(random.next());", "random has no function \"next\""),
+    ]);
+});
+
+// map, filter, reduce, find, some, every, contains, reverse, fill, concat and
+// flatten (§6.5). The six that take a function value hold it to the signature
+// the loop calls it with, and refuse a fallible one as sort does. The rest
+// follow the element type.
+test.start("checker: the array functions that take a function value", void () -> {
+    lib.accepts([
+        lib.ok("map changes the element type", "import 'array';\nint[] a = [1];\nString[] s = array.map(a, String (int n) -> \"x\");\nprint(s.length);"),
+        lib.ok("filter, find, some, every", "import 'array';\nint[] a = [1];\nint[] f = array.filter(a, bool (int n) -> true);\nint? x = array.find(a, bool (int n) -> true);\nbool s = array.some(a, bool (int n) -> true);\nbool e = array.every(a, bool (int n) -> true);\nprint(f.length, s, e);"),
+        lib.ok("reduce takes the starting value's type", "import 'array';\nint[] a = [1];\nString r = array.reduce(a, \"\", String (String acc, int n) -> acc);\nprint(r);"),
+        lib.ok("a function value held in a variable", "import 'array';\nFunction(int)<bool> odd = bool (int n) -> n % 2 == 1;\nint[] a = [1];\nprint(array.filter(a, odd).length);"),
+        lib.ok("contains, reverse, fill, concat, flatten", "import 'array';\nint[] a = [1];\nint[3] f = [1, 2, 3];\nint[][] n = [a];\nprint(array.contains(f, 2));\narray.reverse(f);\narray.fill(f, 0);\nint[] c = array.concat(a, a);\nint[] d = array.flatten(n);\nprint(c.length, d.length);"),
+    ]);
+    lib.rejects([
+        lib.bad("map wants one parameter", "import 'array';\nint[] a = [1];\nprint(array.map(a, int (int x, int y) -> x).length);", "must be a function of one int"),
+        lib.bad("map wants a function", "import 'array';\nint[] a = [1];\nprint(array.map(a, 5).length);", "must be a function of one int"),
+        lib.bad("map wants the element type", "import 'array';\nint[] a = [1];\nprint(array.map(a, int (String s) -> 1).length);", "must take int"),
+        lib.bad("map wants a value back", "import 'array';\nint[] a = [1];\narray.map(a, void (int n) -> { print(n); });", "must answer a value"),
+        lib.bad("a fallible callback is refused", "import 'array';\nimport 'string';\nString[] a = [\"1\"];\nprint(array.filter(a, bool (String s) -> string.toInt(s) > 0).length);", "cannot be fallible"),
+        lib.bad("filter wants a test", "import 'array';\nint[] a = [1];\nprint(array.filter(a, int (int n) -> n).length);", "argument 2 of array.filter must be Function(int)<bool>"),
+        lib.bad("reduce holds the function to the start", "import 'array';\nint[] a = [1];\nprint(array.reduce(a, 0, String (String acc, int n) -> acc));", "argument 3 of array.reduce must be Function(int, int)<int>"),
+        lib.bad("reduce refuses a bare null", "import 'array';\nint[] a = [1];\nprint(array.reduce(a, null, int (int acc, int n) -> acc));", "cannot use null as the starting value"),
+        lib.bad("contains follows ==", "import 'array';\ntype P { int x; }\nP[] ps = [];\nP p = { x: 1 };\nprint(array.contains(ps, p));", "cannot be compared with =="),
+        lib.bad("concat wants the same element", "import 'array';\nint[] a = [1];\nString[] s = [\"x\"];\nprint(array.concat(a, s).length);", "argument 2 of array.concat: cannot use String[] as int[]"),
+        lib.bad("flatten wants nesting", "import 'array';\nint[] a = [1];\nprint(array.flatten(a).length);", "must be an array of arrays, got int[]"),
+        lib.bad("fill wants the element type", "import 'array';\nint[] a = [1];\narray.fill(a, \"x\");", "argument 2 of array.fill: cannot use String as int"),
+        lib.bad("arity", "import 'array';\nint[] a = [1];\nprint(array.reduce(a, 0));", "array.reduce takes 3 argument(s), got 2"),
+    ]);
+});
+
+// The "no such function" hint is prose in a table of its own, because several
+// modules end it with a sentence a list cannot carry ("and the tcp, udp, unix
+// groups"). A member added without a line there is a function the compiler has
+// and the hint denies. This test finds such a member.
+test.start("checker: what a module offers names every member it has", void () -> {
+    forEach(map.keys(builtins.builtinMemberNames), owner) {
+        String have = builtins.available(owner);
+        if (have == "") {
+            continue;    // array, map, json, async and time word their own
+        }
+        String flat = string.replaceAll(have, "and the ", "");
+        flat = string.replaceAll(string.replaceAll(flat, " groups", ""), " group", "");
+        String[] offered = string.split(flat, ", ");
+        forEach(builtins.members(owner), name) {
+            bool found = false;
+            forEach(offered, one) {
+                if (one == name) {
+                    found = true;
+                }
+            }
+            test.assert(found, `${owner}.${name} is a member and is not in what `
+                + `the "no such function" hint offers: ${have}`);
+        }
+    }
+});

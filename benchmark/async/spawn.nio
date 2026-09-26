@@ -1,0 +1,23 @@
+// 100 waves of 10,000 concurrent tasks: measures task creation, scheduling
+// and the churn of a million short-lived futures and frames.
+import 'array';
+
+int async work(int x) {
+    return x % 7;
+}
+
+int total = 0;
+int w = 0;
+while (w < 100) {
+    Future<int>[] fs = [];
+    int i = 0;
+    while (i < 10000) {
+        array.push(fs, work(w + i));
+        i = i + 1;
+    }
+    forEach(fs, f) {
+        total = (total + await f) % 1000000;
+    }
+    w = w + 1;
+}
+printInline(total);

@@ -1,0 +1,64 @@
+// Where the repository is, for the tests that read checked-in data.
+//
+// `nio run tests/all.nio` runs in the caller's directory. The root is the
+// first directory above it that holds both src/nio.nio and tests/golden.
+import 'fs';
+import 'path';
+import 'string';
+import 'array';
+
+String? found = null;
+
+// Answers the repository root, or raises when the suite runs outside it.
+export String root() {
+    String? f = found;
+    if (f != null) {
+        return f;
+    }
+    String dir = path.getCwd();
+    // Bounded, because the parent of a root is the root itself.
+    for (int i = 0; i < 64; i++) {
+        if (fs.exists(path.join(dir, path.localize("src/nio.nio")))
+            && fs.exists(path.join(dir, path.localize("tests/golden")))) {
+            found = dir;
+            return dir;
+        }
+        String up = parentOf(dir);
+        if (up == dir) {
+            break;
+        }
+        dir = up;
+    }
+    return Error("cannot find the repository root above " + path.getCwd()
+        + "; run the suite from inside the checkout");
+}
+
+// Joins a repository-relative slash path onto the root.
+export String at(String rel) {
+    return path.join(root(), path.localize(rel));
+}
+
+// Reads a repository-relative file as text.
+export String readText(String rel) {
+    return string.fromByteArray(fs.readFile(at(rel)));
+}
+
+// Returns the directory that holds p. The tests do not import the compiler
+// for its dirOf.
+String parentOf(String p) {
+    String sep = path.localize("/");
+    int cut = -1;
+    for (int i = 0; i < string.length(p); i++) {
+        String c = string.substring(p, i, i + 1);
+        if (c == sep || c == "/") {
+            cut = i;
+        }
+    }
+    if (cut < 0) {
+        return ".";
+    }
+    if (cut == 0) {
+        return sep;
+    }
+    return string.substring(p, 0, cut);
+}

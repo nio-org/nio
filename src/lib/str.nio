@@ -1,0 +1,20 @@
+// The two string predicates that §6.6 does not have. The alias is `str`,
+// because the compiler uses `text` for the source text.
+import 'string';
+
+export bool hasPrefix(String s, String prefix) {
+    int n = string.length(prefix);
+    if (string.length(s) < n) {
+        return false;
+    }
+    return string.substring(s, 0, n) == prefix;
+}
+
+export bool hasSuffix(String s, String suffix) {
+    int n = string.length(suffix);
+    int len = string.length(s);
+    if (len < n) {
+        return false;
+    }
+    return string.substring(s, len - n, len) == suffix;
+}

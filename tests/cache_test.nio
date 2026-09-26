@@ -1,0 +1,121 @@
+// The object cache. These cases do not time a build, because a timed case
+// fails on a loaded machine. They check that a build which reuses an object
+// gives the same result as a build that compiles it. A stale cache entry gives
+// a binary that does not match its sources, and a clean build hides the fault.
+// Thus each case compares what the cache gave with what clang gives directly.
+import 'test';
+import 'string';
+import 'array';
+import 'fs';
+import 'path';
+import './harness' as h;
+import '../src/cache' as cache;
+import '../src/lib/hash' as hash;
+
+// A name no real toolchain answers, so a case's entries are its own.
+String ident(String tag) {
+    return "test clang " + tag;
+}
+
+test.start("cache: the hash is FNV-1a", void () -> {
+    // The published vectors. A hash change renames every entry, which costs
+    // only a rebuild. A hash that differs by host stops two machines from
+    // sharing cache entries, and these checks catch that.
+    test.expectString(hash.hex(hash.of("")), "cbf29ce484222325");
+    test.expectString(hash.hex(hash.of("a")), "af63dc4c8601ec8c");
+    test.expectString(hash.hex(hash.of("foobar")), "85944171f73967e8");
+    // Hashing in pieces gives the hash of the whole. A key can thus mix in a
+    // flag and a file without building the joined string.
+    test.expectString(hash.hex(hash.add(hash.of("foo"), "bar")),
+        hash.hex(hash.of("foobar")));
+});
+
+test.start("cache: the key answers every input that changes an object", void () -> {
+    String base = cache.key("-O0", false, ident("a"));
+    test.expectString(cache.key("-O0", false, ident("a")), base);
+    test.assert(cache.key("-O2", false, ident("a")) != base,
+        "the optimization level must reach the key");
+    test.assert(cache.key("-O0", true, ident("a")) != base,
+        "debug information must reach the key");
+    test.assert(cache.key("-O0", false, ident("b")) != base,
+        "clang's own version must reach the key: an object outlives the "
+        + "compiler that wrote it");
+    test.expectInt(string.length(base), 16);
+});
+
+// The main property: the object that the cache gives the linker is the object
+// clang writes for that source and those flags. The case compiles the source
+// again, separately, and compares the two byte for byte.
+test.start("cache: a reused object is the object clang writes", void () -> {
+    String root = h.scratch();
+    cache.Runtime? got = await cache.runtimeIn(root, ["runtime.c"], "-O0", false,
+        ident("fresh"));
+    test.assert(got != null, "the cache answered nothing");
+    if (got == null) {
+        return;
+    }
+    cache.Runtime hit = got;
+    test.expectInt(hit.objs.length, 1);
+
+    String mine = path.join(h.scratch(), "runtime.o");
+    h.Run r = h.runBinary("clang",
+        ["-O0", "-I", hit.dir, "-c", path.join(hit.dir, "runtime.c"), "-o", mine]);
+    test.assert(r.code == 0, "clang: " + r.err);
+
+    byte[] cached = fs.readFile(hit.objs[0]);
+    byte[] direct = fs.readFile(mine);
+    test.assert(string.bytesEqualConstantTime(cached, direct),
+        "the cached object is not what clang writes for the same source");
+});
+
+test.start("cache: an entry is written once and read after", void () -> {
+    String root = h.scratch();
+    cache.Runtime? first = await cache.runtimeIn(root, ["runtime.c"], "-O0", false,
+        ident("twice"));
+    test.assert(first != null, "the cache answered nothing");
+    if (first == null) {
+        return;
+    }
+    cache.Runtime one = first;
+    DateTime written = fs.stat(one.objs[0]).modified;
+
+    cache.Runtime? second = await cache.runtimeIn(root, ["runtime.c"], "-O0", false,
+        ident("twice"));
+    test.assert(second != null, "the second call answered nothing");
+    if (second == null) {
+        return;
+    }
+    cache.Runtime two = second;
+    test.expectString(two.dir, one.dir);
+    test.expectString(two.objs[0], one.objs[0]);
+    // A recompile rewrites the file, so an unchanged write time shows that
+    // the second build reused the object of the first.
+    test.assert(fs.stat(two.objs[0]).modified == written,
+        "the object was written again on a second ask");
+});
+
+test.start("cache: a different key is a different entry", void () -> {
+    String root = h.scratch();
+    cache.Runtime? a = await cache.runtimeIn(root, ["runtime.c"], "-O0", false, ident("x"));
+    cache.Runtime? b = await cache.runtimeIn(root, ["runtime.c"], "-O0", true, ident("x"));
+    test.assert(a != null && b != null, "the cache answered nothing");
+    if (a == null || b == null) {
+        return;
+    }
+    test.assert(a.dir != b.dir, "-g and no -g must not share an entry");
+});
+
+// End to end: the same program, built twice, gives the same output. The
+// binaries are not compared. A debug link is not reproducible on macOS,
+// because the linker changes the Mach-O UUID and the ad-hoc signature over it
+// between two identical links. tests/fixpoint_test.nio builds with --release
+// for this reason.
+test.start("cache: a program built again runs the same", void () -> {
+    String dir = h.scratch();
+    String src = h.writeTo(dir, "prog.nio", "import 'string';\n"
+        + "print(string.toUpperCaseAscii(\"cached\"));\n");
+    String first = h.buildEntry(src, false);
+    test.expectString(h.runBinary(first, []).out, "CACHED\n");
+    String second = h.buildEntry(src, false);
+    test.expectString(h.runBinary(second, []).out, "CACHED\n");
+});

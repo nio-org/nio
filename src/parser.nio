@@ -1,0 +1,2310 @@
+// An AST from tokens: recursive descent, with Pratt-style expression parsing.
+//
+// A parse function that can fail returns an optional. Callers drop a
+// statement whose parse recorded an error, so an exprOrBad placeholder
+// reaches neither the printer nor the checker.
+//
+// Token-type tests are if/else chains because a case label must be a
+// literal (§4.9).
+import 'token';
+import 'lexer';
+import 'ast';
+import 'diag';
+import 'lib/quote';
+import 'lib/fmt';
+import 'string';
+import 'array';
+
+// Operator precedence, lowest to highest.
+int const LOWEST = 1;
+int const PREC_CATCH = 2;
+int const PREC_OR = 3;
+int const PREC_AND = 4;
+int const PREC_EQUALS = 5;
+int const PREC_COMPARE = 6;
+int const PREC_SUM = 7;
+int const PREC_PRODUCT = 8;
+int const PREC_PREFIX = 9;
+int const PREC_AS = 10;
+int const PREC_CALL = 11;
+
+Map<String, int> infixPrec = {};
+infixPrec[token.OR] = PREC_OR;
+infixPrec[token.AND] = PREC_AND;
+infixPrec[token.EQ] = PREC_EQUALS;
+infixPrec[token.NOTEQ] = PREC_EQUALS;
+infixPrec[token.LT] = PREC_COMPARE;
+infixPrec[token.GT] = PREC_COMPARE;
+infixPrec[token.LTE] = PREC_COMPARE;
+infixPrec[token.GTE] = PREC_COMPARE;
+infixPrec[token.PLUS] = PREC_SUM;
+infixPrec[token.MINUS] = PREC_SUM;
+infixPrec[token.ASTERISK] = PREC_PRODUCT;
+infixPrec[token.SLASH] = PREC_PRODUCT;
+infixPrec[token.PERCENT] = PREC_PRODUCT;
+// The bitwise operators bind above equality: `x & 1 == 0` means
+// `(x & 1) == 0`.
+infixPrec[token.BITOR] = PREC_SUM;
+infixPrec[token.CARET] = PREC_SUM;
+infixPrec[token.BITAND] = PREC_PRODUCT;
+infixPrec[token.SHL] = PREC_PRODUCT;
+// `>>` has no entry: parseExpression joins two adjacent `>` tokens.
+
+// Result of parseTypeMember. Exactly one field is set.
+type Member {
+    ast.FieldDef? field;
+    ast.FunctionDeclStatement? method;
+}
+
+type Members {
+    ast.FieldDef[] fields;
+    ast.FunctionDeclStatement[] methods;
+}
+
+type TypeCase {
+    ast.NamedType type;
+    String bind;
+    token.Token bindTok;
+}
+
+// Contextual modifiers before a method name. count is how many tokens they
+// cover.
+type Modifiers {
+    bool async;
+    bool override;
+    bool noalloc;
+    int count;
+
+    String text() {
+        String s = "";
+        if (self.override) {
+            s = s + "override ";
+        }
+        if (self.async) {
+            s = s + "async ";
+        }
+        if (self.noalloc) {
+            s = s + "noalloc ";
+        }
+        return s;
+    }
+}
+
+// The contextual `async` modifier. It is not a keyword because it is also
+// the name of the built-in async module.
+bool isAsyncTok(token.Token tok) {
+    return tok.type == token.IDENT && tok.literal == "async";
+}
+
+// The contextual `override` modifier (§2.4); not a keyword.
+bool isOverrideTok(token.Token tok) {
+    return tok.type == token.IDENT && tok.literal == "override";
+}
+
+// The contextual `extends` word, read only between a type name and its body.
+bool isExtendsTok(token.Token tok) {
+    return tok.type == token.IDENT && tok.literal == "extends";
+}
+
+// The contextual `noalloc` modifier (§2.12); not a keyword.
+bool isNoallocTok(token.Token tok) {
+    return tok.type == token.IDENT && tok.literal == "noalloc";
+}
+
+// Returns the tag a union member takes from its own type, "" when the type
+// gives none. Only a single capitalized name qualifies.
+String defaultTag(ast.TypeNode t) {
+    ast.NamedType? n = t as ast.NamedType;
+    if (n == null) {
+        return "";
+    }
+    if (n.name == "") {
+        return "";
+    }
+    String first = string.substring(n.name, 0, 1);
+    if (first < "A" || first > "Z") {
+        return "";
+    }
+    return n.name;
+}
+
+// Makes the module name from an import path: the file base name without
+// .nio. Returns null when that is not a valid identifier; the import then
+// needs an explicit `as`.
+String? defaultAlias(String path) {
+    String base = path;
+    byte[] bs = string.toByteArray(base);
+    int slash = -1;
+    forEach(bs, b, i) {
+        if (b == 47) {    // '/'
+            slash = i;
+        }
+    }
+    if (slash >= 0) {
+        base = string.substring(base, slash + 1, string.length(base));
+    }
+    int n = string.length(base);
+    if (n >= 4 && string.substring(base, n - 4, n) == ".nio") {
+        base = string.substring(base, 0, n - 4);
+    }
+    if (base == "") {
+        return null;
+    }
+    byte[] bb = string.toByteArray(base);
+    if (bb[0] >= 48 && bb[0] <= 57) {
+        return null;    // cannot start with a digit
+    }
+    bool ok = true;
+    forEach(bb, ch) {
+        bool good = ch == 95 || (ch >= 97 && ch <= 122) || (ch >= 65 && ch <= 90) || (ch >= 48 && ch <= 57);
+        if (!good) {
+            ok = false;
+        }
+    }
+    if (!ok) {
+        return null;
+    }
+    if (token.lookupIdent(base) != token.IDENT) {
+        return null;    // keywords cannot be module names
+    }
+    return base;
+}
+
+String retSpelling(ast.TypeNode? ret) {
+    if (ret == null) {
+        return "void";
+    }
+    return ast.typeNodeString(ret);
+}
+
+// Parser reads the full token stream of a lexer and produces an AST.
+export type Parser {
+    token.Token[] toks;
+    int pos;
+    // errs holds the sentence form, diags the structured form. Only errorf
+    // writes them, so the two agree (src/diag.nio).
+    String[] errs;
+    diag.Diagnostic[] diags;
+    // Comments the lexer collected, passed through to the tree unread.
+    token.Comment[] comments;
+
+    // Extra declarations a statement expands into. Only `union` fills it,
+    // one extender per member; parseProgram drains it after each statement.
+    ast.Statement[] pending;
+
+    // How many grouping parens wrapped each expression, by node id. The
+    // compiler does not read it. ast.Program keeps it for the formatter.
+    Map<int, int> parens;
+    // The root of each desugared interpolated string, for the formatter.
+    Map<int, bool> templates;
+
+    token.Token cur() {
+        return self.toks[self.pos];
+    }
+
+    token.Token peek(int n) {
+        int i = self.pos + n;
+        if (i >= self.toks.length) {
+            i = self.toks.length - 1;    // EOF
+        }
+        return self.toks[i];
+    }
+
+    // True at `>>`: two `>` tokens with nothing between them. Type parsing
+    // never calls it, so `Map<String, Future<int>>` still closes.
+    bool shrHere() {
+        token.Token a = self.cur();
+        token.Token b = self.peek(1);
+        return a.type == token.GT && b.type == token.GT
+            && b.line == a.line && b.col == a.col + 1;
+    }
+
+    void next() {
+        if (self.pos < self.toks.length - 1) {
+            self.pos++;
+        }
+    }
+
+    void skip(int n) {
+        for (int i = 0; i < n; i++) {
+            self.next();
+        }
+    }
+
+    void errorf(token.Token tok, String format, ...String args) {
+        String msg = fmt.fmtArr(format, args);
+        // The lexer's note names the real cause of a bad token. Two callers
+        // can describe the same gap, so an exact repeat is dropped.
+        if (tok.note != "") {
+            msg = tok.note;
+        }
+        diag.Diagnostic d = diag.atTok(tok, msg);
+        String line = diag.format(d);
+        int n = self.errs.length;
+        if (n > 0 && self.errs[n - 1] == line) {
+            return;
+        }
+        array.push(self.errs, line);
+        array.push(self.diags, d);
+    }
+
+    token.Token expect(String t) {
+        token.Token tok = self.cur();
+        if (tok.type != t) {
+            self.errorf(tok, "expected %s, got %s (%s)", t, tok.type, quote.quote(tok.literal));
+            return tok;
+        }
+        self.next();
+        return tok;
+    }
+
+    // A field name can be a keyword; see token.isFieldName.
+    token.Token expectFieldName() {
+        token.Token tok = self.cur();
+        if (!token.isFieldName(tok.type)) {
+            self.errorf(tok, "expected a field name, got %s (%s)", tok.type, quote.quote(tok.literal));
+            return tok;
+        }
+        self.next();
+        return tok;
+    }
+
+    // A statement whose last token is '}' needs no ';'.
+    void endStatement() {
+        if (self.cur().type == token.SEMICOLON) {
+            self.next();
+            return;
+        }
+        if (self.pos > 0 && self.toks[self.pos - 1].type == token.RBRACE) {
+            return;
+        }
+        self.errorf(self.cur(), "expected ';', got %s (%s)", self.cur().type, quote.quote(self.cur().literal));
+    }
+
+    // Skips tokens after a syntax error, to the next statement boundary.
+    void synchronize() {
+        if (self.pos > 0) {
+            String prev = self.toks[self.pos - 1].type;
+            if (prev == token.SEMICOLON || prev == token.RBRACE) {
+                return;
+            }
+        }
+        while (true) {
+            String t = self.cur().type;
+            if (t == token.EOF || t == token.RBRACE) {
+                return;
+            }
+            // Stop at a clause boundary: an error in one switch clause must
+            // not take the next one.
+            if (t == token.CASE || t == token.DEFAULT) {
+                return;
+            }
+            if (t == token.SEMICOLON) {
+                self.next();
+                return;
+            }
+            self.next();
+        }
+    }
+
+    ast.Program parseProgram() {
+        ast.Program prog = {
+            imports: [], statements: [], comments: self.comments, parens: self.parens,
+            templates: self.templates,
+        };
+        while (self.cur().type == token.IMPORT) {
+            int nerr = self.errs.length;
+            ast.ImportStatement imp = self.parseImport();
+            if (self.errs.length == nerr) {
+                array.push(prog.imports, imp);
+            } else {
+                self.synchronize();
+            }
+        }
+        while (self.cur().type != token.EOF) {
+            int start = self.pos;
+            int nerr = self.errs.length;
+            ast.Statement? stmt = self.parseStatement();
+            if (stmt != null && self.errs.length == nerr) {
+                array.push(prog.statements, stmt);
+            }
+            // A union's members must follow its base, for their `extends`.
+            forEach(self.pending, extra) {
+                if (self.errs.length == nerr) {
+                    array.push(prog.statements, extra);
+                }
+            }
+            self.pending = [];
+            if (self.errs.length > nerr) {
+                self.synchronize();
+            }
+            if (self.pos == start) {
+                self.next();    // always make progress
+            }
+        }
+        return prog;
+    }
+
+    ast.Statement? parseStatement() {
+        if (self.looksLikeSealedType()) {
+            return self.parseTypeDecl();
+        }
+        if (self.looksLikeUnionDecl()) {
+            return self.parseUnionDecl();
+        }
+        if (self.looksLikeExternDecl()) {
+            return self.parseExternDecl();
+        }
+        if (self.looksLikeNativeStmt()) {
+            return self.parseNativeStmt();
+        }
+        String t = self.cur().type;
+        if (t == token.IMPORT) {
+            self.errorf(self.cur(), "imports must appear at the top of the file");
+            self.parseImport();    // consume it, to keep parsing
+            return null;
+        }
+        if (t == token.EXPORT) {
+            return self.parseExport();
+        }
+        if (t == token.TYPE) {
+            return self.parseTypeDecl();
+        }
+        if (t == token.ENUM) {
+            return self.parseEnumDecl();
+        }
+        if (t == token.FUNCTION) {
+            return self.parseFunctionDecl();    // reports the keyword's removal, then recovers
+        }
+        if (t == token.VOID) {
+            if (self.looksLikeFuncDecl()) {
+                return self.parseFunctionDecl();
+            }
+            if (self.looksLikeTypedFuncLit()) {
+                return self.parseExpressionOrAssign();
+            }
+            self.errorf(self.cur(), "void is not a type; it marks a function that returns nothing: void name(...) { ... }");
+            self.next();
+            return null;
+        }
+        if (t == token.RETURN) {
+            return self.parseReturn();
+        }
+        if (t == token.IF) {
+            return self.parseIf();
+        }
+        if (t == token.SWITCH) {
+            return self.parseSwitch();
+        }
+        if (t == token.WHILE) {
+            return self.parseWhile();
+        }
+        if (t == token.FOR) {
+            return self.parseFor();
+        }
+        if (t == token.FOREACH) {
+            return self.parseForEach();
+        }
+        if (t == token.BREAK) {
+            token.Token btok = self.cur();
+            self.next();
+            self.endStatement();
+            ast.BreakStatement bs = { id: ast.newID(), tok: btok };
+            return bs;
+        }
+        if (t == token.CONTINUE) {
+            token.Token ctok = self.cur();
+            self.next();
+            self.endStatement();
+            ast.ContinueStatement cs = { id: ast.newID(), tok: ctok };
+            return cs;
+        }
+        if (t == token.CONST) {
+            self.errorf(self.cur(), "'const' goes after the type: String const name = ...;");
+            self.next();
+            return self.parseStatement();
+        }
+        if (t == token.FUNCTYPE || t == token.FUTURE || t == token.MAP) {
+            if (self.looksLikeFuncDecl()) {
+                return self.parseFunctionDecl();
+            }
+            if (self.looksLikeTypedFuncLit()) {
+                return self.parseExpressionOrAssign();
+            }
+            // Anything else that starts with a type keyword is a declaration.
+            // The type parser reports a bad type.
+            return self.parseVarDecl();
+        }
+        if (t == token.IDENT) {
+            if (self.looksLikeFuncDecl()) {
+                return self.parseFunctionDecl();
+            }
+            if (self.looksLikeVarDecl()) {
+                return self.parseVarDecl();
+            }
+            return self.parseExpressionOrAssign();
+        }
+        return self.parseExpressionOrAssign();
+    }
+
+    // Scans past a type at offset i and returns the offset after it, or -1
+    // when the tokens there do not form a type.
+    int skipTypeShape(int i) {
+        if (self.peek(i).type == token.FUNCTYPE) {
+            i++;
+            if (self.peek(i).type != token.LPAREN) {
+                return -1;
+            }
+            i++;
+            while (self.peek(i).type != token.RPAREN) {
+                if (self.peek(i).type == token.ELLIPSIS) {
+                    i++;    // a variadic parameter: `Function(...String)<void>`
+                }
+                int j = self.skipTypeShape(i);
+                if (j < 0) {
+                    return -1;
+                }
+                i = j;
+                if (self.peek(i).type != token.COMMA) {
+                    break;
+                }
+                i++;
+            }
+            if (self.peek(i).type != token.RPAREN) {
+                return -1;
+            }
+            i++;
+            if (self.peek(i).type != token.LT) {
+                return -1;
+            }
+            i++;
+            if (self.peek(i).type == token.VOID) {
+                i++;
+            } else {
+                int j2 = self.skipTypeShape(i);
+                if (j2 < 0) {
+                    return -1;
+                }
+                i = j2;
+            }
+            if (self.peek(i).type == token.BANG) {
+                i++;
+            }
+            if (self.peek(i).type != token.GT) {
+                return -1;
+            }
+            return self.skipTypeSuffixShape(i + 1);
+        }
+        if (self.peek(i).type == token.FUTURE) {
+            i++;
+            if (self.peek(i).type != token.LT) {
+                return -1;
+            }
+            i++;
+            if (self.peek(i).type == token.VOID) {
+                i++;
+            } else {
+                int j3 = self.skipTypeShape(i);
+                if (j3 < 0) {
+                    return -1;
+                }
+                i = j3;
+            }
+            if (self.peek(i).type == token.BANG) {
+                i++;
+            }
+            if (self.peek(i).type != token.GT) {
+                return -1;
+            }
+            return self.skipTypeSuffixShape(i + 1);
+        }
+        if (self.peek(i).type == token.MAP) {
+            i++;
+            if (self.peek(i).type != token.LT) {
+                return -1;
+            }
+            int j4 = self.skipTypeShape(i + 1);
+            if (j4 < 0 || self.peek(j4).type != token.COMMA) {
+                return -1;
+            }
+            j4 = self.skipTypeShape(j4 + 1);
+            if (j4 < 0 || self.peek(j4).type != token.GT) {
+                return -1;
+            }
+            return self.skipTypeSuffixShape(j4 + 1);
+        }
+        if (self.peek(i).type != token.IDENT) {
+            return -1;
+        }
+        i++;
+        if (self.peek(i).type == token.DOT) {
+            if (self.peek(i + 1).type != token.IDENT) {
+                return -1;
+            }
+            i = i + 2;
+        }
+        return self.skipTypeSuffixShape(i);
+    }
+
+    // A return type is an ordinary type, or `void`.
+    int skipReturnTypeShape(int i) {
+        if (self.peek(i).type == token.VOID) {
+            return i + 1;
+        }
+        return self.skipTypeShape(i);
+    }
+
+    int skipTypeSuffixShape(int i) {
+        while (true) {
+            if (self.peek(i).type == token.LBRACKET && self.peek(i + 1).type == token.RBRACKET) {
+                i = i + 2;
+            } else if (self.peek(i).type == token.LBRACKET && self.peek(i + 1).type == token.INT
+                && self.peek(i + 2).type == token.RBRACKET) {
+                i = i + 3;
+            } else if (self.peek(i).type == token.QUESTION) {
+                i++;
+            } else {
+                return i;
+            }
+        }
+    }
+
+    // A declaration is a type, an optional `const`, then a name with no `(`
+    // after it.
+    bool looksLikeVarDecl() {
+        int i = self.skipTypeShape(0);
+        if (i < 0) {
+            return false;
+        }
+        if (self.peek(i).type == token.CONST) {
+            return true;    // a `const` after a type can only start a declaration
+        }
+        return self.peek(i).type == token.IDENT && self.peek(i + 1).type != token.LPAREN;
+    }
+
+    // A function declaration: a return type, optional modifiers, a name and
+    // `(`. It also matches the removed forms, which parseFunctionDecl
+    // reports one by one.
+    bool looksLikeFuncDecl() {
+        if (self.cur().type == token.IDENT && self.peek(1).type == token.LPAREN) {
+            int i = self.skipBalancedParens(2);
+            if (i >= 0) {
+                return self.peek(i).type == token.LBRACE || self.peek(i).type == token.COLON;
+            }
+            return false;
+        }
+        // `async int sum(...)`: modifier before the return type;
+        // parseFunctionDecl reports the correct order.
+        if (isAsyncTok(self.cur())) {
+            int j = self.skipReturnTypeShape(1);
+            if (j >= 0 && self.peek(j).type == token.IDENT && self.peek(j + 1).type == token.LPAREN) {
+                return true;
+            }
+        }
+        int i2 = self.skipReturnTypeShape(0);
+        if (i2 < 0) {
+            return false;
+        }
+        if (self.peek(i2).type == token.FUNCTION) {
+            return true;    // removed keyword; reported by parseFunctionDecl
+        }
+        // Modifiers come in either order. One counts only when a name
+        // follows, so `int async(...)` stays a function named `async`.
+        int i3 = i2;
+        while (true) {
+            if ((isAsyncTok(self.peek(i3)) || isNoallocTok(self.peek(i3)))
+                && self.peek(i3 + 1).type == token.IDENT) {
+                i3++;
+            } else {
+                break;
+            }
+        }
+        return self.peek(i3).type == token.IDENT && self.peek(i3 + 1).type == token.LPAREN;
+    }
+
+    // Scans from offset i, inside a `(`, to after the matching `)`. Returns
+    // -1 when it does not close before a ';' or EOF.
+    int skipBalancedParens(int i) {
+        int depth = 1;
+        while (depth > 0) {
+            String t = self.peek(i).type;
+            if (t == token.LPAREN) {
+                depth++;
+            } else if (t == token.RPAREN) {
+                depth--;
+            } else if (t == token.SEMICOLON || t == token.EOF) {
+                return -1;
+            }
+            i++;
+        }
+        return i;
+    }
+
+    // True when the tokens at offset i, inside a `(`, form a function-value
+    // parameter list: `)` then `->`, or a leading `type name` pair, which
+    // `...` can precede. No expression has either shape.
+    bool funcLitParamsAt(int i) {
+        if (self.peek(i).type == token.RPAREN) {
+            return self.peek(i + 1).type == token.ARROW;
+        }
+        if (self.peek(i).type == token.ELLIPSIS) {
+            i++;
+        }
+        int j = self.skipTypeShape(i);
+        return j >= 0 && self.peek(j).type == token.IDENT;
+    }
+
+    ast.ImportStatement parseImport() {
+        token.Token tok = self.expect(token.IMPORT);
+        token.Token pathTok = self.expect(token.STRING);
+        token.Token noAlias = { type: "", literal: "", line: 0, col: 0, note: "", quote: "", endLine: 0, endCol: 0 };
+        ast.ImportStatement stmt = {
+            id: ast.newID(), tok: tok, path: pathTok.literal, alias: "",
+            pathTok: pathTok, aliasTok: noAlias,
+        };
+        if (pathTok.type != token.STRING) {
+            return stmt;    // error already reported
+        }
+        if (pathTok.literal == "") {
+            self.errorf(pathTok, "import path cannot be empty");
+        }
+        if (self.cur().type == token.AS) {
+            self.next();
+            token.Token name = self.expect(token.IDENT);
+            stmt.alias = name.literal;
+            stmt.aliasTok = name;
+        } else {
+            String? alias = defaultAlias(pathTok.literal);
+            if (alias == null) {
+                self.errorf(pathTok, "cannot derive a module name from '%s'; use: import '%s' as name", pathTok.literal, pathTok.literal);
+            } else {
+                stmt.alias = alias;
+            }
+        }
+        self.endStatement();
+        return stmt;
+    }
+
+    ast.Statement? parseExport() {
+        token.Token tok = self.cur();
+        self.next();
+        if (self.looksLikeReExport()) {
+            return self.parseReExport(tok);
+        }
+        if (self.cur().type == token.TYPE || self.looksLikeSealedType()) {
+            ast.TypeDeclStatement td = self.parseTypeDecl();
+            td.exported = true;
+            return td;
+        }
+        if (self.looksLikeUnionDecl()) {
+            ast.TypeDeclStatement ud = self.parseUnionDecl();
+            ud.exported = true;
+            // An importer that can name the union must also name its members.
+            forEach(self.pending, arm) {
+                ast.TypeDeclStatement? at = arm as ast.TypeDeclStatement;
+                if (at != null) {
+                    at.exported = true;
+                }
+            }
+            return ud;
+        }
+        if (self.cur().type == token.ENUM) {
+            ast.EnumDeclStatement ed = self.parseEnumDecl();
+            ed.exported = true;
+            return ed;
+        }
+        if (self.looksLikeExternDecl()) {
+            self.errorf(tok, "an extern function cannot be exported; wrap it in a Nio function (§5.8)");
+            return self.parseExternDecl();
+        }
+        if (self.looksLikeNativeStmt()) {
+            self.errorf(tok, "a native declaration cannot be exported; it is a build input of its own module");
+            return self.parseNativeStmt();
+        }
+        if (self.cur().type == token.FUNCTION || self.looksLikeFuncDecl()) {
+            ast.FunctionDeclStatement fd = self.parseFunctionDecl();
+            fd.exported = true;
+            return fd;
+        }
+        if (self.looksLikeVarDecl()) {
+            ast.VarDeclStatement vd = self.parseVarDecl();
+            vd.exported = true;
+            return vd;
+        }
+        self.errorf(tok, "export must be followed by a type, enum, function, or variable declaration, or by an import alias to republish");
+        return null;
+    }
+
+    // `export alias;`, `export alias show A;` or `export alias hide A;` (§5.4).
+    // `show` and `hide` are contextual words. A variable declaration named
+    // `show` has `;` or `=` after the word, and a re-export has a name.
+    bool looksLikeReExport() {
+        if (self.cur().type != token.IDENT) {
+            return false;
+        }
+        if (self.peek(1).type == token.SEMICOLON) {
+            return true;
+        }
+        if (self.peek(1).type != token.IDENT) {
+            return false;
+        }
+        String word = self.peek(1).literal;
+        if (word != "show" && word != "hide") {
+            return false;
+        }
+        return self.peek(2).type == token.IDENT;
+    }
+
+    ast.ReExportStatement parseReExport(token.Token tok) {
+        token.Token aliasTok = self.expect(token.IDENT);
+        ast.ReExportStatement stmt = {
+            id: ast.newID(), tok: tok, alias: aliasTok.literal, aliasTok: aliasTok,
+            mode: "all", names: [], nameToks: [],
+        };
+        if (self.cur().type == token.IDENT) {
+            stmt.mode = self.cur().literal;
+            self.next();
+            while (true) {
+                token.Token nameTok = self.expect(token.IDENT);
+                array.push(stmt.names, nameTok.literal);
+                array.push(stmt.nameToks, nameTok);
+                if (self.cur().type != token.COMMA) {
+                    break;
+                }
+                self.next();
+            }
+        }
+        self.endStatement();
+        return stmt;
+    }
+
+    ast.TypeNode parseTypeNode() {
+        if (self.cur().type == token.FUNCTYPE) {
+            return self.parseFuncType();
+        }
+        if (self.cur().type == token.FUTURE) {
+            return self.parseFutureType();
+        }
+        if (self.cur().type == token.MAP) {
+            return self.parseMapType();
+        }
+        if (self.cur().type == token.VOID) {
+            self.errorf(self.cur(), "void is not a type; it only marks a return slot: void name(...) { ... }, Function(...)<void>");
+            token.Token vtok = self.cur();
+            self.next();
+            ast.NamedType vt = { tok: vtok, module: "", name: "void", member: "" };
+            return vt;
+        }
+        token.Token tok = self.expect(token.IDENT);
+        ast.NamedType named = { tok: tok, module: "", name: tok.literal, member: "" };
+        if (self.cur().type == token.DOT && self.peek(1).type == token.IDENT) {
+            self.next();
+            named.module = tok.literal;
+            named.name = self.expect(token.IDENT).literal;
+            // A third segment is an imported union's member,
+            // `alias.Union.Tag`. The checker tells it from `alias.Type`.
+            if (self.cur().type == token.DOT && self.peek(1).type == token.IDENT) {
+                self.next();
+                named.member = self.expect(token.IDENT).literal;
+            }
+        }
+        return self.parseTypeSuffix(named);
+    }
+
+    ast.TypeNode parseFuncType() {
+        token.Token tok = self.expect(token.FUNCTYPE);
+        ast.FuncTypeNode ft = { tok: tok, params: [], return: null, fallible: false, variadic: false };
+        self.expect(token.LPAREN);
+        while (self.cur().type != token.RPAREN && self.cur().type != token.EOF) {
+            token.Token dots = self.cur();
+            bool variadic = false;
+            if (self.cur().type == token.ELLIPSIS) {
+                variadic = true;
+                self.next();
+            }
+            ast.TypeNode pt = self.parseTypeNode();
+            if (variadic && self.cur().type == token.COMMA) {
+                self.errorf(dots, "a variadic parameter must be the last one: ...%s goes at the end", ast.typeNodeString(pt));
+                variadic = false;
+            }
+            array.push(ft.params, pt);
+            ft.variadic = variadic;
+            if (self.cur().type == token.COMMA) {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        self.expect(token.RPAREN);
+        self.expect(token.LT);
+        if (self.cur().type == token.VOID) {
+            self.next();
+        } else {
+            ft.return = self.parseTypeNode();
+        }
+        if (self.cur().type == token.BANG) {
+            ft.fallible = true;
+            self.next();
+        }
+        self.expect(token.GT);
+        return self.parseTypeSuffix(ft);
+    }
+
+    ast.TypeNode parseFutureType() {
+        token.Token tok = self.expect(token.FUTURE);
+        ast.FutureTypeNode ft = { tok: tok, elem: null, fallible: false };
+        self.expect(token.LT);
+        if (self.cur().type == token.VOID) {
+            self.next();
+        } else {
+            ft.elem = self.parseTypeNode();
+        }
+        if (self.cur().type == token.BANG) {
+            ft.fallible = true;
+            self.next();
+        }
+        self.expect(token.GT);
+        return self.parseTypeSuffix(ft);
+    }
+
+    ast.TypeNode parseMapType() {
+        token.Token tok = self.expect(token.MAP);
+        self.expect(token.LT);
+        ast.TypeNode key = self.parseTypeNode();
+        self.expect(token.COMMA);
+        ast.TypeNode value = self.parseTypeNode();
+        ast.MapTypeNode mt = { tok: tok, key: key, value: value };
+        self.expect(token.GT);
+        return self.parseTypeSuffix(mt);
+    }
+
+    ast.TypeNode parseTypeSuffix(ast.TypeNode t) {
+        while (true) {
+            if (self.cur().type == token.LBRACKET && self.peek(1).type == token.RBRACKET) {
+                token.Token lb = self.cur();
+                self.next();
+                self.next();
+                ast.ArrayTypeNode at = { tok: lb, elem: t, size: null };
+                t = at;
+            } else if (self.cur().type == token.LBRACKET && self.peek(1).type == token.INT
+                && self.peek(2).type == token.RBRACKET) {
+                token.Token lb2 = self.cur();
+                self.next();
+                token.Token sizeTok = self.cur();
+                self.next();
+                self.next();
+                int v = lexer.intValue(sizeTok.literal) catch e {
+                    self.errorf(sizeTok, "invalid array size %s", quote.quote(sizeTok.literal));
+                    ast.ArrayTypeNode bad = { tok: lb2, elem: t, size: null };
+                    t = bad;
+                    continue;
+                };
+                ast.IntLiteral size = { id: ast.newID(), tok: sizeTok, value: v };
+                ast.ArrayTypeNode at2 = { tok: lb2, elem: t, size: size };
+                t = at2;
+            } else if (self.cur().type == token.QUESTION) {
+                token.Token q = self.cur();
+                self.next();
+                ast.OptionalTypeNode ot = { tok: q, inner: t };
+                t = ot;
+            } else {
+                return t;
+            }
+        }
+    }
+
+    // Unlike other type positions, a field type accepts a record type
+    // written in place.
+    ast.TypeNode parseFieldType() {
+        if (self.cur().type != token.LBRACE) {
+            return self.parseTypeNode();
+        }
+        token.Token lb = self.cur();
+        self.next();
+        Members ms = self.parseMembers("");
+        forEach(ms.methods, m) {
+            self.errorf(m.tok, "an inline record type cannot declare methods; declare a named type to give %s one", quote.quote(m.name));
+        }
+        ast.RecordTypeNode rec = { tok: lb, fields: ms.fields };
+        self.expect(token.RBRACE);
+        return self.parseTypeSuffix(rec);
+    }
+
+    // A string literal after a field name renames it for serialization
+    // (§2.4). owner is "" for an unnamed record type, whose methods the
+    // caller rejects.
+    Members parseMembers(String owner) {
+        Members out = { fields: [], methods: [] };
+        while (self.cur().type != token.RBRACE && self.cur().type != token.EOF) {
+            int start = self.pos;
+            Member m = self.parseTypeMember(owner);
+            ast.FunctionDeclStatement? method = m.method;
+            ast.FieldDef? field = m.field;
+            if (method != null) {
+                array.push(out.methods, method);
+                if (self.cur().type == token.SEMICOLON) {
+                    self.next();    // a ';' after a method body is allowed
+                }
+            } else if (field != null) {
+                array.push(out.fields, field);
+                if (self.cur().type == token.SEMICOLON) {
+                    self.next();
+                } else if (self.cur().type != token.RBRACE) {
+                    self.errorf(self.cur(), "expected ';' or '}' after field, got %s (%s)", self.cur().type, quote.quote(self.cur().literal));
+                }
+            }
+            if (self.pos == start) {
+                self.next();    // always make progress
+            }
+        }
+        return out;
+    }
+
+    // A member is a method when a '(' follows its name, and a field in every
+    // other case. The two forms share the `[type] name` prefix, so the test
+    // needs no lookahead.
+    Member parseTypeMember(String owner) {
+        token.Token tok = self.cur();
+        if (self.looksLikeLegacyField()) {
+            String name = tok.literal;
+            // Name the type in the hint only when it is one token. A
+            // compound type makes the message unclear.
+            token.Token t2 = self.peek(2);
+            if (t2.type == token.IDENT && self.peek(3).type == token.SEMICOLON) {
+                self.errorf(tok, "the type goes before the field name: %s %s;", t2.literal, name);
+            } else {
+                self.errorf(tok, "the type goes before the field name: write the type of %s before its name", quote.quote(name));
+            }
+            // Read the old form, so that one out-of-date declaration gives
+            // one error only.
+            self.next();
+            self.next();    // the ':'
+            ast.FieldDef lf = {
+                name: name, nameTok: tok, type: self.parseFieldType(),
+                rename: "", renameTok: tok,
+            };
+            Member lm = { field: lf, method: null };
+            return lm;
+        }
+        // `void` opens a method and nothing else. A `void` with no method
+        // after it goes to parseFieldType, which names the mistake.
+        if (self.cur().type == token.VOID) {
+            Modifiers? vmods = self.methodModifiersAt(1);
+            if (vmods != null) {
+                self.next();
+                self.skip(vmods.count);
+                Member vm = { field: null, method: self.parseMethodDecl(owner, tok, null, self.expect(token.IDENT), vmods) };
+                return vm;
+            }
+        }
+        // The old form of a void method, matched so that an out-of-date type
+        // body gives one error for each method.
+        Modifiers? bare = self.methodModifiers();
+        if (bare != null) {
+            self.errorf(tok, "a method needs a return type: void %s%s(...) { ... }", bare.text(), self.peek(bare.count).literal);
+            self.skip(bare.count);
+            Member bm = { field: null, method: self.parseMethodDecl(owner, tok, null, self.expect(token.IDENT), bare) };
+            return bm;
+        }
+        ast.TypeNode fieldType = self.parseFieldType();
+        Modifiers? mods = self.methodModifiers();
+        if (mods != null) {
+            self.skip(mods.count);
+            Member mm = { field: null, method: self.parseMethodDecl(owner, tok, fieldType, self.expect(token.IDENT), mods) };
+            return mm;
+        }
+        token.Token name2 = self.expectFieldName();
+        ast.FieldDef f = {
+            name: name2.literal, nameTok: name2, type: fieldType,
+            rename: "", renameTok: tok,
+        };
+        if (self.cur().type == token.STRING) {
+            f.renameTok = self.cur();
+            f.rename = self.expect(token.STRING).literal;
+        }
+        Member fm = { field: f, method: null };
+        return fm;
+    }
+
+    // Answers the modifiers before a method name, or null when no `name(`
+    // follows them. That test is what separates a method from a field, and
+    // it keeps each modifier spelling free: `int override;` is a field and
+    // `void override(int n) { ... }` is a method named `override`.
+    Modifiers? methodModifiers() {
+        return self.methodModifiersAt(0);
+    }
+
+    // methodModifiers from offset off. A `void` return type reads past
+    // itself before it commits.
+    Modifiers? methodModifiersAt(int off) {
+        Modifiers m = { async: false, override: false, noalloc: false, count: 0 };
+        while (true) {
+            token.Token tok = self.peek(off + m.count);
+            // A name wins over a modifier of the same spelling, so `async(`
+            // and `override(` declare methods with those names.
+            if (tok.type == token.IDENT && self.peek(off + m.count + 1).type == token.LPAREN) {
+                return m;
+            }
+            if (isAsyncTok(tok) && !m.async) {
+                m.async = true;
+            } else if (isOverrideTok(tok) && !m.override) {
+                m.override = true;
+            } else if (isNoallocTok(tok) && !m.noalloc) {
+                m.noalloc = true;
+            } else {
+                return null;
+            }
+            m.count++;
+        }
+    }
+
+    // The parser generates the receiver, because the source writes none.
+    // Only the parser knows which type body holds the method.
+    ast.FunctionDeclStatement parseMethodDecl(String owner, token.Token tok, ast.TypeNode? ret, token.Token name, Modifiers mods) {
+        ast.NamedType ownerType = { tok: name, module: "", name: owner, member: "" };
+        ast.Param recv = {
+            id: ast.newID(), tok: name, type: ownerType, name: "self",
+            nameTok: name, variadic: false,
+        };
+        ast.FunctionDeclStatement stmt = {
+            id: ast.newID(), tok: tok, name: name.literal, nameTok: name, params: [],
+            returnType: ret,
+            body: emptyBlockAt(tok), exported: false, async: mods.async, recv: recv,
+            override: mods.override, noalloc: mods.noalloc, extern: false, from: null,
+        };
+        self.expect(token.LPAREN);
+        stmt.params = self.parseParams();
+        self.expect(token.RPAREN);
+        stmt.body = self.parseBlock();
+        return stmt;
+    }
+
+    // True at the old `name: type` field form. A current field opens with a
+    // type, so it never has ':' as its second token.
+    bool looksLikeLegacyField() {
+        return token.isFieldName(self.cur().type) && self.peek(1).type == token.COLON;
+    }
+
+    ast.VarDeclStatement parseVarDecl() {
+        ast.VarDeclStatement stmt = self.parseVarDeclCore();
+        self.endStatement();
+        return stmt;
+    }
+
+    // Stops at the terminator and does not read it, because a for header
+    // supplies its own.
+    ast.VarDeclStatement parseVarDeclCore() {
+        token.Token tok = self.cur();
+        ast.TypeNode typ = self.parseTypeNode();
+        bool isConst = false;
+        if (self.cur().type == token.CONST) {
+            self.next();
+            isConst = true;
+        }
+        token.Token name = self.expect(token.IDENT);
+        ast.VarDeclStatement stmt = {
+            id: ast.newID(), tok: tok, type: typ, name: name.literal, nameTok: name,
+            value: null, exported: false, const: isConst,
+        };
+        if (self.cur().type == token.ASSIGN) {
+            self.next();
+            stmt.value = self.parseExpression(LOWEST);
+        } else if (isConst) {
+            self.errorf(name, "const variable '%s' must be initialized", name.literal);
+        }
+        return stmt;
+    }
+
+    // Parses `enum Name { MEMBER: value, ... }`. A comma after the last
+    // member is allowed.
+    ast.EnumDeclStatement parseEnumDecl() {
+        token.Token tok = self.cur();
+        self.next();
+        token.Token name = self.expect(token.IDENT);
+        ast.EnumDeclStatement stmt = {
+            id: ast.newID(), tok: tok, name: name.literal, nameTok: name,
+            members: [], exported: false,
+        };
+        self.expect(token.LBRACE);
+        while (self.cur().type != token.RBRACE && self.cur().type != token.EOF) {
+            int start = self.pos;
+            token.Token mname = self.expect(token.IDENT);
+            self.expect(token.COLON);
+            bool neg = false;
+            if (self.cur().type == token.MINUS) {
+                neg = true;
+                self.next();
+            }
+            int val = 0;
+            if (self.cur().type != token.INT) {
+                self.errorf(self.cur(), "enum member %s needs an integer value, got %s (%s)",
+                    quote.quote(mname.literal), self.cur().type, quote.quote(self.cur().literal));
+            } else {
+                token.Token vtok = self.cur();
+                self.next();
+                // The token is an unsigned run of digits, so it never parses
+                // to a negative number and -1 is a safe failure marker.
+                val = lexer.intValue(vtok.literal) catch -1;
+                if (val == -1) {
+                    self.errorf(vtok, "invalid integer literal %s", quote.quote(vtok.literal));
+                    val = 9223372036854775807;
+                }
+                if (neg) {
+                    val = -val;
+                }
+            }
+            ast.EnumMemberDef md = { tok: mname, name: mname.literal, value: val };
+            array.push(stmt.members, md);
+            if (self.cur().type == token.COMMA) {
+                self.next();
+            } else if (self.cur().type != token.RBRACE) {
+                self.errorf(self.cur(), "expected ',' or '}' after enum member, got %s (%s)", self.cur().type, quote.quote(self.cur().literal));
+            }
+            if (self.pos == start) {
+                self.next();    // always make progress
+            }
+        }
+        self.expect(token.RBRACE);
+        return stmt;
+    }
+
+    // True at `union Name {`. No other statement has that three-token shape,
+    // so `union` stays an ordinary identifier everywhere else (§1.4).
+    bool looksLikeUnionDecl() {
+        return self.cur().type == token.IDENT && self.cur().literal == "union"
+            && self.peek(1).type == token.IDENT && self.peek(2).type == token.LBRACE;
+    }
+
+    // Parses `union Name { T Tag, ... }`. It answers the sealed base and
+    // pushes one extender per member onto pending. A union is thus a sealed
+    // type (§2.11), and the stages after the checker do not see unions.
+    //
+    // The generated names carry a `$`, which §1.3 keeps out of every
+    // identifier, so a program can name neither an extender nor its payload
+    // field. typeString writes them back as `Name.Tag`.
+    ast.TypeDeclStatement parseUnionDecl() {
+        token.Token tok = self.cur();
+        self.next();
+        token.Token name = self.expect(token.IDENT);
+        ast.TypeDeclStatement base = {
+            id: ast.newID(), tok: tok, name: name.literal, nameTok: name, extends: null,
+            fields: [], methods: [], inherited: [], exported: false, sealed: true,
+        };
+        self.expect(token.LBRACE);
+        Map<String, bool> tags = {};
+        int members = 0;
+        while (self.cur().type != token.RBRACE && self.cur().type != token.EOF) {
+            token.Token mtok = self.cur();
+            ast.TypeNode mt = self.parseTypeNode();
+            String tag = "";
+            token.Token tagTok = mtok;
+            if (self.cur().type == token.IDENT) {
+                tagTok = self.cur();
+                tag = tagTok.literal;
+                self.next();
+            } else {
+                tag = defaultTag(mt);
+                if (tag == "") {
+                    self.errorf(mtok, "union member %s needs a tag: only a member whose type is a single capitalized name takes one from the type (write %s Some, and match it as %s.Some)",
+                        ast.typeNodeString(mt), ast.typeNodeString(mt), base.name);
+                }
+            }
+            if (tag != "" && tags[tag] != null) {
+                self.errorf(tagTok, "duplicate tag %s in union %s", tag, base.name);
+            }
+            if (tag != "") {
+                tags[tag] = true;
+                ast.NamedType ext = { tok: mtok, module: "", name: base.name, member: "" };
+                ast.FieldDef payload = {
+                    name: ast.unionPayload, nameTok: mtok, type: mt, rename: "", renameTok: mtok,
+                };
+                ast.TypeDeclStatement arm = {
+                    id: ast.newID(), tok: mtok, name: ast.unionArmName(base.name, tag), nameTok: tagTok,
+                    extends: ext, fields: [payload], methods: [], inherited: [],
+                    exported: false, sealed: false,
+                };
+                array.push(self.pending, arm);
+            }
+            members = members + 1;
+            if (self.cur().type == token.COMMA) {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        self.expect(token.RBRACE);
+        if (members == 0) {
+            self.errorf(tok, "union %s needs at least one member", base.name);
+        }
+        return base;
+    }
+
+    // True at `sealed type`. Nothing else stands between the start of a
+    // statement and `type`, so `sealed` stays an ordinary identifier
+    // everywhere else (§1.4).
+    bool looksLikeSealedType() {
+        return self.cur().type == token.IDENT && self.cur().literal == "sealed"
+            && self.peek(1).type == token.TYPE;
+    }
+
+    ast.TypeDeclStatement parseTypeDecl() {
+        bool sealed = false;
+        if (self.looksLikeSealedType()) {
+            sealed = true;
+            self.next();
+        }
+        token.Token tok = self.cur();
+        self.next();
+        token.Token name = self.expect(token.IDENT);
+        ast.TypeDeclStatement stmt = {
+            id: ast.newID(), tok: tok, name: name.literal, nameTok: name, extends: null,
+            fields: [], methods: [], inherited: [], exported: false, sealed: sealed,
+        };
+        if (isExtendsTok(self.cur()) && self.peek(1).type == token.IDENT) {
+            self.next();
+            token.Token base = self.expect(token.IDENT);
+            ast.NamedType ext = { tok: base, module: "", name: base.literal, member: "" };
+            stmt.extends = ext;
+            // A qualified name parses here. The checker rejects it, because
+            // only the checker can give the reason.
+            if (self.cur().type == token.DOT && self.peek(1).type == token.IDENT) {
+                self.next();
+                ext.module = base.literal;
+                ext.name = self.expect(token.IDENT).literal;
+            }
+        }
+        self.expect(token.LBRACE);
+        Members ms = self.parseMembers(name.literal);
+        stmt.fields = ms.fields;
+        stmt.methods = ms.methods;
+        self.expect(token.RBRACE);
+        return stmt;
+    }
+
+    // Parses `type [async] name(params) { ... }`. It also reads the removed
+    // forms, a declaration with no return type and one with the `function`
+    // keyword, and gives each its own error.
+    ast.FunctionDeclStatement parseFunctionDecl() {
+        token.Token tok = self.cur();
+        bool async = false;
+        bool noalloc = false;
+        ast.TypeNode? ret = null;
+        if (tok.type == token.FUNCTION) {
+            self.errorf(tok, "the 'function' keyword was removed: write 'void name(...) { ... }' or 'int name(...) { ... }'");
+            self.next();
+        } else if (isAsyncTok(tok) && self.peek(1).type == token.IDENT && self.peek(2).type == token.LPAREN) {
+            self.errorf(tok, "a function needs a return type: void async %s(...) { ... }", self.peek(1).literal);
+            self.next();
+            async = true;
+        } else if (tok.type == token.IDENT && self.peek(1).type == token.LPAREN) {
+            self.errorf(tok, "a function needs a return type: void %s(...) { ... }", tok.literal);
+        } else {
+            if (isAsyncTok(tok)) {
+                self.errorf(tok, "'async' goes after the return type: %s async %s(...) { ... }", self.peek(1).literal, self.peek(2).literal);
+                self.next();
+                async = true;
+            }
+            if (self.cur().type == token.VOID) {
+                self.next();    // void leaves ret null
+            } else {
+                ret = self.parseTypeNode();
+            }
+            if (self.cur().type == token.FUNCTION) {
+                self.errorf(self.cur(), "the 'function' keyword was removed: write '%s %s(...) { ... }'", retSpelling(ret), self.peek(1).literal);
+                self.next();
+            }
+            // A modifier counts only when a name follows it, so
+            // `void noalloc(...)` still declares a function named `noalloc`.
+            while (true) {
+                if (isAsyncTok(self.cur()) && !async && self.peek(1).type == token.IDENT) {
+                    self.next();
+                    async = true;
+                } else if (isNoallocTok(self.cur()) && !noalloc && self.peek(1).type == token.IDENT) {
+                    self.next();
+                    noalloc = true;
+                } else {
+                    break;
+                }
+            }
+        }
+        token.Token name = self.expect(token.IDENT);
+        ast.FunctionDeclStatement stmt = {
+            id: ast.newID(), tok: tok, name: name.literal, nameTok: name, params: [],
+            returnType: ret,
+            body: emptyBlockAt(tok), exported: false, async: async, recv: null,
+            override: false, noalloc: noalloc, extern: false, from: null,
+        };
+        self.expect(token.LPAREN);
+        stmt.params = self.parseParams();
+        self.expect(token.RPAREN);
+        if (self.cur().type == token.COLON) {
+            self.errorf(self.cur(), "the return type goes before the name: %s %s(...) { ... }", self.peek(1).literal, name.literal);
+            self.next();
+            self.parseTypeNode();    // consume the stale suffix type, to keep parsing
+        }
+        stmt.body = self.parseBlock();
+        return stmt;
+    }
+
+    // Stops at the closing ')' and does not read it. Only the last parameter
+    // can be variadic; after a `...` in the wrong place the parser continues,
+    // so it still checks the rest of the list.
+    ast.Param[] parseParams() {
+        ast.Param[] params = [];
+        while (self.cur().type != token.RPAREN && self.cur().type != token.EOF) {
+            token.Token ptok = self.cur();
+            bool variadic = false;
+            if (self.cur().type == token.ELLIPSIS) {
+                variadic = true;
+                self.next();
+            }
+            ast.TypeNode ptype = self.parseTypeNode();
+            if (self.cur().type == token.CONST) {
+                self.errorf(self.cur(), "function parameters cannot be declared const");
+                self.next();
+            }
+            token.Token pname = self.expect(token.IDENT);
+            if (variadic && self.cur().type == token.COMMA) {
+                self.errorf(ptok, "a variadic parameter must be the last one: ...%s %s goes at the end", ast.typeNodeString(ptype), pname.literal);
+                variadic = false;
+            }
+            ast.Param prm = {
+                id: ast.newID(), tok: ptok, type: ptype, name: pname.literal,
+                nameTok: pname, variadic: variadic,
+            };
+            array.push(params, prm);
+            if (self.cur().type == token.COMMA) {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        return params;
+    }
+
+    // True at `extern`, a return type, a name and `(` (§5.8). The word is
+    // contextual, so `extern = 5;` still assigns to a variable.
+    bool looksLikeExternDecl() {
+        if (!(self.cur().type == token.IDENT && self.cur().literal == "extern")) {
+            return false;
+        }
+        int i = self.skipReturnTypeShape(1);
+        if (i < 0) {
+            return false;
+        }
+        return self.peek(i).type == token.IDENT && self.peek(i + 1).type == token.LPAREN;
+    }
+
+    // Parses `extern int name(int a);`, a declaration with no body that
+    // names a C symbol the program links against (§5.8). It reuses
+    // FunctionDeclStatement with the extern flag set.
+    ast.FunctionDeclStatement parseExternDecl() {
+        token.Token tok = self.cur();
+        self.next();
+        ast.TypeNode? ret = null;
+        if (self.cur().type == token.VOID) {
+            self.next();
+        } else {
+            ret = self.parseTypeNode();
+        }
+        token.Token name = self.expect(token.IDENT);
+        ast.FunctionDeclStatement stmt = {
+            id: ast.newID(), tok: tok, name: name.literal, nameTok: name, params: [],
+            returnType: ret,
+            body: emptyBlockAt(tok), exported: false, async: false, recv: null,
+            override: false, noalloc: false, extern: true, from: null,
+        };
+        self.expect(token.LPAREN);
+        stmt.params = self.parseParams();
+        self.expect(token.RPAREN);
+        if (self.cur().type == token.LBRACE) {
+            self.errorf(self.cur(), "an extern function has no body; its definition is in a native source");
+            self.parseBlock();    // consume it, to keep parsing
+            return stmt;
+        }
+        self.endStatement();
+        return stmt;
+    }
+
+    // True at `native source '...'`, `native flags '...'` or
+    // `native flags os '...'` (§5.8). Nothing else has that shape, so
+    // `native` stays an ordinary identifier everywhere else.
+    bool looksLikeNativeStmt() {
+        if (!(self.cur().type == token.IDENT && self.cur().literal == "native")) {
+            return false;
+        }
+        if (self.peek(1).type != token.IDENT) {
+            return false;
+        }
+        String k = self.peek(1).literal;
+        if (k != "source" && k != "flags") {
+            return false;
+        }
+        if (self.peek(2).type == token.STRING) {
+            return true;
+        }
+        return k == "flags" && self.peek(2).type == token.IDENT && self.peek(3).type == token.STRING;
+    }
+
+    ast.NativeStatement parseNativeStmt() {
+        token.Token tok = self.cur();
+        self.next();
+        token.Token kindTok = self.cur();    // `source` or `flags`
+        self.next();
+        String os = "";
+        if (kindTok.literal == "flags" && self.cur().type == token.IDENT) {
+            os = self.cur().literal;
+            self.next();
+        }
+        token.Token valueTok = self.expect(token.STRING);
+        ast.NativeStatement stmt = {
+            id: ast.newID(), tok: tok, kind: kindTok.literal, os: os,
+            value: valueTok.literal, valueTok: valueTok,
+        };
+        if (valueTok.type == token.STRING && valueTok.literal == "") {
+            self.errorf(valueTok, "native %s cannot be empty", kindTok.literal);
+        }
+        self.endStatement();
+        return stmt;
+    }
+
+    ast.ReturnStatement parseReturn() {
+        token.Token tok = self.cur();
+        self.next();
+        if (self.cur().type == token.SEMICOLON) {
+            self.next();
+            ast.ReturnStatement bare = { id: ast.newID(), tok: tok, value: null };
+            return bare;
+        }
+        ast.ReturnStatement stmt = { id: ast.newID(), tok: tok, value: self.parseExpression(LOWEST) };
+        self.endStatement();
+        return stmt;
+    }
+
+    ast.IfStatement parseIf() {
+        token.Token tok = self.cur();
+        self.next();
+        self.expect(token.LPAREN);
+        ast.Expression cond = exprOrBad(self.parseExpression(LOWEST), tok);
+        self.expect(token.RPAREN);
+        ast.IfStatement stmt = { id: ast.newID(), tok: tok, cond: cond, then: self.parseBlock(), else: null };
+        if (self.cur().type == token.ELSE) {
+            self.next();
+            if (self.cur().type == token.IF) {
+                token.Token elseTok = self.cur();
+                ast.IfStatement elseIf = self.parseIf();
+                ast.BlockStatement wrap = { id: ast.newID(), tok: elseTok, statements: [elseIf], endLine: elseTok.line };
+                stmt.else = wrap;
+            } else {
+                stmt.else = self.parseBlock();
+            }
+        }
+        return stmt;
+    }
+
+    // A clause with an empty body stacks onto the clause after it. Thus
+    // several labels share a block (§4.9). The parser folds the stack
+    // away, so the AST holds one clause per body with every label that
+    // reaches it. It rejects a default clause that is not last, and an empty
+    // clause at the end with nothing after it to run.
+    ast.SwitchStatement parseSwitch() {
+        token.Token tok = self.cur();
+        self.next();
+        self.expect(token.LPAREN);
+        ast.Expression subject = exprOrBad(self.parseExpression(LOWEST), tok);
+        ast.SwitchStatement stmt = { id: ast.newID(), tok: tok, subject: subject, cases: [], exhaustive: false };
+        self.expect(token.RPAREN);
+        self.expect(token.LBRACE);
+
+        ast.Expression[] pending = [];    // labels of stacked empty clauses
+        bool pendingDefault = false;
+        ast.NamedType? pendingType = null;    // the `case Type name:` form, which never stacks
+        String pendingBind = "";
+        token.Token pendingBindTok = { type: "", literal: "", line: 0, col: 0, note: "", quote: "", endLine: 0, endCol: 0 };
+        token.Token stackTok = tok;    // where the stack that is open began
+        bool closedDefault = false;
+        while (self.cur().type == token.CASE || self.cur().type == token.DEFAULT) {
+            token.Token clauseTok = self.cur();
+            if (pending.length == 0 && !pendingDefault && pendingType == null) {
+                stackTok = clauseTok;
+            }
+            bool isDefault = clauseTok.type == token.DEFAULT;
+            self.next();
+            if (isDefault) {
+                if (closedDefault || pendingDefault) {
+                    self.errorf(clauseTok, "a switch has at most one default clause");
+                }
+                pendingDefault = true;
+            } else if (self.looksLikeTypeCase()) {
+                // A type case binds a name of its own, so it cannot share a
+                // body with another label (§4.9).
+                TypeCase tc = self.parseTypeCase();
+                pendingType = tc.type;
+                pendingBind = tc.bind;
+                pendingBindTok = tc.bindTok;
+                if (pending.length > 0) {
+                    self.errorf(clauseTok, "a `case %s %s:` clause matches a type and binds a name, so it cannot share a body with another label",
+                        ast.typeNodeString(tc.type), tc.bind);
+                }
+            } else {
+                // A label parses as an ordinary expression. The checker
+                // requires a constant, so the error for `case f():` names
+                // that rule.
+                ast.Expression? v = self.parseExpression(LOWEST);
+                if (v != null) {
+                    array.push(pending, v);
+                }
+            }
+            self.expect(token.COLON);
+            ast.BlockStatement body = self.parseCaseBody();
+            if (body.statements.length == 0) {
+                if (self.cur().type == token.CASE || self.cur().type == token.DEFAULT) {
+                    continue;    // stacks onto the next clause
+                }
+                self.errorf(stackTok, "this clause has an empty body and no clause after it to run; write `break;` to match and do nothing");
+            }
+            // A second default clause is already reported as a duplicate.
+            // To report it as out of order too would name one mistake twice.
+            if (closedDefault && !pendingDefault) {
+                self.errorf(stackTok, "the default clause must be the last one in a switch");
+            }
+            ast.SwitchCase cl = {
+                id: ast.newID(), tok: stackTok, values: pending, default: pendingDefault,
+                body: body, typeName: pendingType, bind: pendingBind,
+                bindTok: pendingBindTok,
+            };
+            array.push(stmt.cases, cl);
+            closedDefault = closedDefault || pendingDefault;
+            pending = [];
+            pendingDefault = false;
+            pendingType = null;
+            pendingBind = "";
+            pendingBindTok = { type: "", literal: "", line: 0, col: 0, note: "", quote: "", endLine: 0, endCol: 0 };
+        }
+        self.expect(token.RBRACE);
+        return stmt;
+    }
+
+    // True at a `case Type name:` label (§4.9). Two names together cannot
+    // start an expression, so the forms never overlap. The binding is
+    // required, so a bare `case Foo:` stays a value label.
+    bool looksLikeTypeCase() {
+        if (self.cur().type != token.IDENT) {
+            return false;
+        }
+        int at = 1;
+        if (self.peek(1).type == token.DOT && self.peek(2).type == token.IDENT) {
+            at = 3;    // an imported type: `case shapes.Circle c:`
+            if (self.peek(3).type == token.DOT && self.peek(4).type == token.IDENT) {
+                at = 5;    // an imported union's member: `case ops.Opcode.ADC m:`
+            }
+        }
+        return self.peek(at).type == token.IDENT && self.peek(at + 1).type == token.COLON;
+    }
+
+    // Reads the `Type name` of a type case and stops at the ':'.
+    TypeCase parseTypeCase() {
+        token.Token first = self.expect(token.IDENT);
+        ast.NamedType nt = { tok: first, module: "", name: first.literal, member: "" };
+        if (self.cur().type == token.DOT) {
+            self.next();
+            nt.module = first.literal;
+            nt.name = self.expect(token.IDENT).literal;
+            // A third segment names the member of an imported union, as in
+            // `ops.Opcode.ADC`. No other name has three segments.
+            if (self.cur().type == token.DOT) {
+                self.next();
+                nt.member = self.expect(token.IDENT).literal;
+            }
+        }
+        token.Token name = self.expect(token.IDENT);
+        TypeCase tc = { type: nt, bind: name.literal, bindTok: name };
+        return tc;
+    }
+
+    // parseBlock with no braces: a clause body still has a scope of its own.
+    ast.BlockStatement parseCaseBody() {
+        ast.BlockStatement blk = { id: ast.newID(), tok: self.cur(), statements: [], endLine: 0 };
+        while (true) {
+            String t = self.cur().type;
+            if (t == token.CASE || t == token.DEFAULT || t == token.RBRACE || t == token.EOF) {
+                blk.endLine = self.cur().line;
+                return blk;
+            }
+            int start = self.pos;
+            int nerr = self.errs.length;
+            ast.Statement? stmt = self.parseStatement();
+            if (stmt != null && self.errs.length == nerr) {
+                array.push(blk.statements, stmt);
+            }
+            if (self.errs.length > nerr) {
+                self.synchronize();
+            }
+            if (self.pos == start) {
+                self.next();
+            }
+        }
+    }
+
+    ast.WhileStatement parseWhile() {
+        token.Token tok = self.cur();
+        self.next();
+        self.expect(token.LPAREN);
+        ast.Expression cond = exprOrBad(self.parseExpression(LOWEST), tok);
+        self.expect(token.RPAREN);
+        ast.WhileStatement stmt = { id: ast.newID(), tok: tok, cond: cond, body: self.parseBlock(), tail: [] };
+        return stmt;
+    }
+
+    ast.ForEachStatement parseForEach() {
+        token.Token tok = self.cur();
+        self.next();
+        self.expect(token.LPAREN);
+        ast.Expression arr = exprOrBad(self.parseExpression(LOWEST), tok);
+        ast.ForEachStatement stmt = {
+            id: ast.newID(), tok: tok, array: arr,
+            elemTok: tok, elemName: "", indexTok: tok, indexName: "",
+            body: emptyBlockAt(tok),
+        };
+        self.expect(token.COMMA);
+        stmt.elemTok = self.expect(token.IDENT);
+        stmt.elemName = stmt.elemTok.literal;
+        if (self.cur().type == token.COMMA) {
+            self.next();
+            stmt.indexTok = self.expect(token.IDENT);
+            stmt.indexName = stmt.indexTok.literal;
+        }
+        self.expect(token.RPAREN);
+        stmt.body = self.parseBlock();
+        return stmt;
+    }
+
+    ast.BlockStatement parseBlock() {
+        token.Token lb = self.expect(token.LBRACE);
+        ast.BlockStatement blk = { id: ast.newID(), tok: lb, statements: [], endLine: 0 };
+        while (self.cur().type != token.RBRACE && self.cur().type != token.EOF) {
+            int start = self.pos;
+            int nerr = self.errs.length;
+            ast.Statement? stmt = self.parseStatement();
+            if (stmt != null && self.errs.length == nerr) {
+                array.push(blk.statements, stmt);
+            }
+            if (self.errs.length > nerr) {
+                self.synchronize();
+            }
+            if (self.pos == start) {
+                self.next();
+            }
+        }
+        blk.endLine = self.cur().line;
+        self.expect(token.RBRACE);
+        return blk;
+    }
+
+    ast.Statement? parseExpressionOrAssign() {
+        ast.Statement? stmt = self.parseSimpleStatement();
+        if (stmt == null) {
+            return null;
+        }
+        self.endStatement();
+        return stmt;
+    }
+
+    // An assignment, an increment, a decrement or a bare expression. It
+    // stops at the terminator and does not read it, for a for header.
+    ast.Statement? parseSimpleStatement() {
+        token.Token tok = self.cur();
+        ast.Expression? expr = self.parseExpression(LOWEST);
+        if (expr == null) {
+            return null;
+        }
+        if (self.cur().type == token.ASSIGN) {
+            self.checkAssignTarget(expr, tok, "assignment");
+            self.next();
+            ast.Expression val = exprOrBad(self.parseExpression(LOWEST), tok);
+            ast.AssignStatement asn = { id: ast.newID(), tok: tok, target: expr, value: val };
+            return asn;
+        }
+        if (self.cur().type == token.INC || self.cur().type == token.DEC) {
+            token.Token op = self.cur();
+            self.checkAssignTarget(expr, op, op.literal);
+            self.next();
+            ast.IncDecStatement inc = { id: ast.newID(), tok: op, target: expr, op: op.literal };
+            return inc;
+        }
+        ast.ExpressionStatement es = { id: ast.newID(), tok: tok, expression: expr };
+        return es;
+    }
+
+    // `=`, `++` and `--` can write only a variable, an array element or a
+    // record field.
+    void checkAssignTarget(ast.Expression expr, token.Token tok, String what) {
+        if ((expr as ast.Identifier) == null && (expr as ast.IndexExpression) == null
+            && (expr as ast.MemberExpression) == null) {
+            self.errorf(tok, "invalid %s target", what);
+        }
+    }
+
+    // Parses `for (init; cond; post) { ... }`. init and post can be empty;
+    // the condition is required.
+    ast.ForStatement parseFor() {
+        token.Token tok = self.cur();
+        self.next();
+        self.expect(token.LPAREN);
+        ast.ForStatement stmt = {
+            id: ast.newID(), tok: tok, init: null, cond: exprOrBad(null, tok), post: null,
+            body: emptyBlockAt(tok),
+        };
+        if (self.cur().type != token.SEMICOLON) {
+            if (self.looksLikeVarDecl()) {
+                stmt.init = self.parseVarDeclCore();
+            } else {
+                stmt.init = self.parseSimpleStatement();
+            }
+        }
+        self.expect(token.SEMICOLON);
+        if (self.cur().type == token.SEMICOLON) {
+            self.errorf(self.cur(), "a for loop needs a condition; for an endless loop, use while (true) { ... }");
+        } else {
+            stmt.cond = exprOrBad(self.parseExpression(LOWEST), tok);
+        }
+        self.expect(token.SEMICOLON);
+        if (self.cur().type != token.RPAREN) {
+            if (self.looksLikeVarDecl()) {
+                self.errorf(self.cur(), "cannot declare a variable in the post clause of a for loop");
+                self.parseVarDeclCore();    // consume it, to keep parsing
+            } else {
+                stmt.post = self.parseSimpleStatement();
+            }
+        }
+        self.expect(token.RPAREN);
+        stmt.body = self.parseBlock();
+        return stmt;
+    }
+
+    ast.Expression? parseExpression(int prec) {
+        ast.Expression? first = self.parsePrefix();
+        if (first == null) {
+            return null;
+        }
+        ast.Expression left = first;
+        while (true) {
+            token.Token cur = self.cur();
+            if (cur.type == token.LPAREN && PREC_CALL > prec) {
+                left = self.parseCall(left);
+            } else if (cur.type == token.LBRACKET && PREC_CALL > prec) {
+                left = self.parseIndex(left);
+            } else if ((cur.type == token.DOT || cur.type == token.QDOT) && PREC_CALL > prec) {
+                left = self.parseMember(left);
+            } else if (cur.type == token.AS && PREC_AS > prec) {
+                self.next();
+                ast.AsExpression ax = { id: ast.newID(), tok: cur, value: left, type: self.parseTypeNode(), strict: false };
+                left = ax;
+            } else if (cur.type == token.IDENT && cur.literal == "strict"
+                && self.peek(1).type == token.AS && PREC_AS > prec) {
+                // `strict as T` (§3.6). The parser reads `strict` only
+                // directly before an `as`, so a variable may still carry
+                // that name.
+                self.next();
+                token.Token asTok = self.cur();
+                self.next();
+                ast.AsExpression sx = { id: ast.newID(), tok: asTok, value: left, type: self.parseTypeNode(), strict: true };
+                left = sx;
+            } else if (cur.type == token.CATCH && PREC_CATCH > prec) {
+                ast.Expression? ce = self.parseCatch(left);
+                if (ce == null) {
+                    return null;
+                }
+                left = ce;
+            } else if (cur.type == token.GT && self.shrHere()) {
+                // `>>`, which the lexer cannot join (see token.SHL). This
+                // test must come before the infixPrec lookup below, or the
+                // first `>` reads as a comparison.
+                if (PREC_PRODUCT <= prec) {
+                    return left;
+                }
+                self.next();
+                self.next();
+                ast.Expression? shifted = self.parseExpression(PREC_PRODUCT);
+                if (shifted == null) {
+                    return left;
+                }
+                ast.InfixExpression sr = {
+                    id: ast.newID(), tok: cur, left: left, operator: ">>", right: shifted,
+                };
+                left = sr;
+            } else {
+                int? ip = infixPrec[cur.type];
+                if (ip == null) {
+                    return left;
+                }
+                if (ip <= prec) {
+                    return left;
+                }
+                self.next();
+                ast.Expression? right = self.parseExpression(ip);
+                if (right == null) {
+                    return left;
+                }
+                ast.InfixExpression ie = { id: ast.newID(), tok: cur, left: left, operator: cur.literal, right: right };
+                left = ie;
+            }
+        }
+    }
+
+    // An interpolated string, `\`text ${expr} text\`` (§1.6). The lexer gives
+    // the text in TSTR tokens, with each expression's tokens between them.
+    // This desugars the literal into a concatenation: each piece of text is
+    // a string literal, and each expression is wrapped in a call to
+    // `string.from`. The call goes through ast.templateAlias, so the file
+    // needs no import and no name in the file can shadow the call. Later
+    // stages do not see templates. The formatter reads the root's id from
+    // Program.templates to write one back.
+    ast.Expression? parseTemplate(token.Token start) {
+        ast.Expression[] parts = [];
+        self.templatePiece(parts, start);
+        self.next();
+        while (true) {
+            token.Token at = self.cur();
+            if (at.type == token.TSTR_MID || at.type == token.TSTR_END) {
+                self.errorf(at, "empty ${} in a string: write the value to put there");
+                self.skipTemplate();
+                return null;
+            }
+            ast.Expression? e = self.parseExpression(LOWEST);
+            if (e == null) {
+                return null;
+            }
+            array.push(parts, self.templateFrom(e, start));
+            token.Token t = self.cur();
+            if (t.type == token.TSTR_MID) {
+                self.templatePiece(parts, t);
+                self.next();
+                continue;
+            }
+            if (t.type == token.TSTR_END) {
+                self.templatePiece(parts, t);
+                self.next();
+                break;
+            }
+            self.errorf(t, "expected '}' to close the ${ in this string, got %s (%s)",
+                t.type, quote.quote(t.literal));
+            self.skipTemplate();
+            return null;
+        }
+        ast.Expression root = parts[0];
+        for (int i = 1; i < parts.length; i++) {
+            ast.InfixExpression ie = {
+                id: ast.newID(), tok: start, left: root, operator: "+", right: parts[i],
+            };
+            root = ie;
+        }
+        self.templates[root.id] = true;
+        return root;
+    }
+
+    // Skips to the end of the template being parsed, so that one bad hole
+    // gives one error only. A template inside the hole opens and closes on
+    // the way.
+    void skipTemplate() {
+        int depth = 1;
+        while (self.cur().type != token.EOF) {
+            String t = self.cur().type;
+            if (t == token.TSTR_START) {
+                depth++;
+            } else if (t == token.TSTR_END) {
+                depth--;
+                if (depth == 0) {
+                    self.next();
+                    return;
+                }
+            }
+            self.next();
+        }
+    }
+
+    // A piece of a template's text. An empty piece adds nothing, so a
+    // template that opens with `${` starts at its first expression.
+    void templatePiece(ast.Expression[] parts, token.Token t) {
+        if (t.literal == "") {
+            return;
+        }
+        ast.StringLiteral sl = { id: ast.newID(), tok: t, value: t.literal };
+        array.push(parts, sl);
+    }
+
+    ast.Expression templateFrom(ast.Expression e, token.Token at) {
+        ast.Identifier mod = { id: ast.newID(), tok: at, name: ast.templateAlias };
+        ast.MemberExpression callee = {
+            id: ast.newID(), tok: at, object: mod, property: "from", optional: false,
+        };
+        ast.CallExpression call = { id: ast.newID(), tok: at, callee: callee, args: [e] };
+        return call;
+    }
+
+    // `left catch e { ... }` binds the Error and runs a block; every other
+    // form is `left catch <default value>`. One token separates them: a name
+    // with `{` after it can only be the binding, because a block never
+    // continues an expression.
+    ast.Expression? parseCatch(ast.Expression left) {
+        token.Token tok = self.cur();
+        self.next();
+        ast.CatchExpr ce = { id: ast.newID(), tok: tok, value: left, name: "", nameTok: tok, body: null, default: null };
+        if (self.cur().type == token.IDENT && self.peek(1).type == token.LBRACE) {
+            ce.nameTok = self.cur();
+            ce.name = self.cur().literal;
+            self.next();
+            ce.body = self.parseBlock();
+            return ce;
+        }
+        ast.Expression? def = self.parseExpression(PREC_CATCH);
+        if (def == null) {
+            return null;
+        }
+        ce.default = def;
+        return ce;
+    }
+
+    ast.Expression? parsePrefix() {
+        token.Token tok = self.cur();
+        String t = tok.type;
+        if (t == token.IDENT) {
+            if (self.looksLikeTypedFuncLit()) {
+                return self.parseFuncLit(tok, self.parseTypeNode());
+            }
+            self.next();
+            ast.Identifier id = { id: ast.newID(), tok: tok, name: tok.literal };
+            return id;
+        }
+        if (t == token.FUNCTYPE) {
+            if (self.looksLikeTypedFuncLit()) {
+                return self.parseFuncLit(tok, self.parseTypeNode());
+            }
+            self.errorf(tok, "Function(...) names a type; a function value is written [type] (params) -> body");
+            return null;
+        }
+        if (t == token.FUTURE) {
+            if (self.looksLikeTypedFuncLit()) {
+                return self.parseFuncLit(tok, self.parseTypeNode());
+            }
+            self.errorf(tok, "Future<...> names a type; a future comes from calling an async function");
+            return null;
+        }
+        if (t == token.MAP) {
+            if (self.looksLikeTypedFuncLit()) {
+                return self.parseFuncLit(tok, self.parseTypeNode());
+            }
+            self.errorf(tok, "Map<...> names a type; a map comes from a declaration or a literal: Map<String, int> m = {};");
+            return null;
+        }
+        if (t == token.VOID) {
+            if (self.looksLikeTypedFuncLit()) {
+                self.next();
+                return self.parseFuncLit(tok, null);    // null return type: void
+            }
+            self.errorf(tok, "void is not a value; it marks a function value that returns nothing: void (params) -> body");
+            return null;
+        }
+        if (t == token.AWAIT) {
+            self.next();
+            ast.Expression? right = self.parseExpression(PREC_PREFIX);
+            if (right == null) {
+                return null;
+            }
+            ast.AwaitExpr aw = { id: ast.newID(), tok: tok, value: right };
+            return aw;
+        }
+        if (t == token.INT) {
+            self.next();
+            int v = lexer.intValue(tok.literal) catch e {
+                self.errorf(tok, "invalid integer literal %s", quote.quote(tok.literal));
+                return null;
+            };
+            ast.IntLiteral il = { id: ast.newID(), tok: tok, value: v };
+            return il;
+        }
+        if (t == token.FLOAT) {
+            self.next();
+            float f = string.toFloat(tok.literal) catch e {
+                self.errorf(tok, "invalid float literal %s", quote.quote(tok.literal));
+                return null;
+            };
+            ast.FloatLiteral fl = { id: ast.newID(), tok: tok, value: f };
+            return fl;
+        }
+        if (t == token.STRING) {
+            self.next();
+            ast.StringLiteral sl = { id: ast.newID(), tok: tok, value: tok.literal };
+            return sl;
+        }
+        if (t == token.TSTR_START) {
+            return self.parseTemplate(tok);
+        }
+        if (t == token.TSTR_MID || t == token.TSTR_END) {
+            self.errorf(tok, "a '}' with no '${' before it in this string");
+            self.next();
+            return null;
+        }
+        if (t == token.TRUE || t == token.FALSE) {
+            self.next();
+            ast.BoolLiteral bl = { id: ast.newID(), tok: tok, value: tok.type == token.TRUE };
+            return bl;
+        }
+        if (t == token.NULL) {
+            self.next();
+            ast.NullLiteral nl = { id: ast.newID(), tok: tok };
+            return nl;
+        }
+        if (t == token.MINUS || t == token.BANG || t == token.TILDE) {
+            self.next();
+            ast.Expression? right2 = self.parseExpression(PREC_PREFIX);
+            if (right2 == null) {
+                return null;
+            }
+            ast.PrefixExpression pe = { id: ast.newID(), tok: tok, operator: tok.literal, right: right2 };
+            return pe;
+        }
+        if (t == token.LPAREN) {
+            if (self.funcLitParamsAt(1)) {
+                // The old form of a void function value, matched here so
+                // that it gives one error only.
+                self.errorf(tok, "a function value needs a return type: void (params) -> body");
+                return self.parseFuncLit(tok, null);
+            }
+            self.next();
+            ast.Expression? inner = self.parseExpression(LOWEST);
+            if (inner == null) {
+                return null;
+            }
+            self.expect(token.RPAREN);
+            if (self.cur().type == token.ARROW) {
+                self.errorf(self.cur(), "function value parameters need a type: void (int x) -> ...");
+                return null;
+            }
+            int? wrapped = self.parens[inner.id];
+            if (wrapped == null) {
+                self.parens[inner.id] = 1;
+            } else {
+                self.parens[inner.id] = wrapped + 1;
+            }
+            return inner;
+        }
+        if (t == token.LBRACKET) {
+            return self.parseArrayLiteral();
+        }
+        if (t == token.LBRACE) {
+            // One token separates the two brace literals: a name opens a
+            // record field, a constant a map key. `{}` parses as an empty
+            // record literal, which the checker reads as a map where a map
+            // type is expected.
+            String p1 = self.peek(1).type;
+            if (p1 == token.STRING || p1 == token.INT || p1 == token.FLOAT || p1 == token.MINUS) {
+                return self.parseMapLiteral();
+            }
+            return self.parseRecordLiteral();
+        }
+        self.errorf(tok, "unexpected token %s (%s)", tok.type, quote.quote(tok.literal));
+        return null;
+    }
+
+    // True at a function value with a leading return type, `int (int b) ->`.
+    // The parenthesized list must look like parameters, which separates it
+    // from the call `int(x)`.
+    bool looksLikeTypedFuncLit() {
+        int i = self.skipReturnTypeShape(0);
+        if (i < 0 || self.peek(i).type != token.LPAREN) {
+            return false;
+        }
+        return self.funcLitParamsAt(i + 1);
+    }
+
+    // The caller has read the return type, which is null for `void`. After
+    // `->` a `{` always opens a block body and never a record literal; a
+    // record literal returned from an expression body needs parentheses.
+    ast.Expression? parseFuncLit(token.Token tok, ast.TypeNode? ret) {
+        ast.FuncLit lit = { id: ast.newID(), tok: tok, returnType: ret, params: [], exprBody: null, blockBody: null };
+        self.expect(token.LPAREN);
+        lit.params = self.parseParams();
+        self.expect(token.RPAREN);
+        self.expect(token.ARROW);
+        if (self.cur().type == token.LBRACE) {
+            lit.blockBody = self.parseBlock();
+        } else {
+            ast.Expression? body = self.parseExpression(LOWEST);
+            if (body == null) {
+                return null;
+            }
+            lit.exprBody = body;
+        }
+        return lit;
+    }
+
+    ast.Expression parseArrayLiteral() {
+        token.Token tok = self.cur();
+        self.next();
+        ast.ArrayLiteral lit = { id: ast.newID(), tok: tok, elements: [], endLine: tok.line };
+        while (self.cur().type != token.RBRACKET && self.cur().type != token.EOF) {
+            ast.Expression? e = self.parseExpression(LOWEST);
+            if (e == null) {
+                break;
+            }
+            array.push(lit.elements, e);
+            if (self.cur().type == token.COMMA) {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        lit.endLine = self.cur().line;
+        self.expect(token.RBRACKET);
+        return lit;
+    }
+
+    ast.Expression parseRecordLiteral() {
+        token.Token tok = self.cur();
+        self.next();
+        ast.RecordLiteral lit = { id: ast.newID(), tok: tok, fields: [], endLine: tok.line };
+        while (self.cur().type != token.RBRACE && self.cur().type != token.EOF) {
+            int start = self.pos;
+            token.Token name = self.expectFieldName();
+            self.expect(token.COLON);
+            ast.Expression? val = self.parseExpression(LOWEST);
+            if (val != null) {
+                ast.RecordField rf = { name: name.literal, value: val };
+                array.push(lit.fields, rf);
+            }
+            if (self.cur().type == token.COMMA) {
+                self.next();
+            } else if (self.pos == start) {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        lit.endLine = self.cur().line;
+        self.expect(token.RBRACE);
+        return lit;
+    }
+
+    ast.Expression parseMapLiteral() {
+        token.Token tok = self.cur();
+        self.next();
+        ast.MapLiteral lit = { id: ast.newID(), tok: tok, entries: [], endLine: tok.line };
+        while (self.cur().type != token.RBRACE && self.cur().type != token.EOF) {
+            int start = self.pos;
+            ast.Expression? key = self.parseMapKey();
+            self.expect(token.COLON);
+            ast.Expression? val = self.parseExpression(LOWEST);
+            if (key != null && val != null) {
+                ast.MapEntry me = { key: key, value: val };
+                array.push(lit.entries, me);
+            }
+            if (self.cur().type == token.COMMA) {
+                self.next();
+            } else if (self.pos == start) {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        lit.endLine = self.cur().line;
+        self.expect(token.RBRACE);
+        return lit;
+    }
+
+    // A key is a string literal or a number literal, which can carry a minus
+    // sign. A computed key goes through an indexed assignment.
+    ast.Expression? parseMapKey() {
+        token.Token tok = self.cur();
+        if (tok.type == token.STRING || tok.type == token.INT || tok.type == token.FLOAT) {
+            return self.parsePrefix();
+        }
+        if (tok.type == token.MINUS) {
+            String pt = self.peek(1).type;
+            if (pt == token.INT || pt == token.FLOAT) {
+                self.next();
+                ast.Expression? num = self.parsePrefix();
+                if (num == null) {
+                    return null;
+                }
+                ast.PrefixExpression pe = { id: ast.newID(), tok: tok, operator: tok.literal, right: num };
+                return pe;
+            }
+        }
+        self.errorf(tok, "map literal keys are literals, got %s (%s); a computed key is written through indexing: m[key] = value", tok.type, quote.quote(tok.literal));
+        return null;
+    }
+
+    ast.Expression parseCall(ast.Expression callee) {
+        token.Token tok = self.cur();
+        self.next();
+        ast.CallExpression call = { id: ast.newID(), tok: tok, callee: callee, args: [] };
+        while (self.cur().type != token.RPAREN && self.cur().type != token.EOF) {
+            ast.Expression? a = self.parseExpression(LOWEST);
+            if (a == null) {
+                break;
+            }
+            array.push(call.args, a);
+            if (self.cur().type == token.COMMA) {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        self.expect(token.RPAREN);
+        return call;
+    }
+
+    ast.Expression parseIndex(ast.Expression left) {
+        token.Token tok = self.cur();
+        self.next();
+        ast.Expression idx = exprOrBad(self.parseExpression(LOWEST), tok);
+        self.expect(token.RBRACKET);
+        ast.IndexExpression ie = { id: ast.newID(), tok: tok, left: left, index: idx };
+        return ie;
+    }
+
+    ast.Expression parseMember(ast.Expression left) {
+        token.Token tok = self.cur();
+        self.next();
+        token.Token name = self.expectFieldName();
+        ast.MemberExpression me = {
+            id: ast.newID(), tok: tok, object: left, property: name.literal,
+            optional: tok.type == token.QDOT,
+        };
+        return me;
+    }
+}
+
+export Parser newParser(lexer.Lexer l) {
+    Parser p = {
+        toks: [], pos: 0, errs: [], diags: [], comments: [], pending: [], parens: {},
+        templates: {},
+    };
+    while (true) {
+        token.Token t = l.nextToken();
+        array.push(p.toks, t);
+        if (t.type == token.EOF) {
+            break;
+        }
+    }
+    p.comments = l.comments;
+    return p;
+}
+
+// A placeholder for a null expression in a field the AST requires. Every
+// such null follows a recorded error, and callers drop a statement whose
+// parse recorded one, so nothing prints or checks the placeholder.
+ast.Expression exprOrBad(ast.Expression? e, token.Token tok) {
+    if (e != null) {
+        return e;
+    }
+    ast.Identifier bad = { id: ast.newID(), tok: tok, name: "" };
+    return bad;
+}
+
+// The statement form of exprOrBad, for a body field with no block yet.
+ast.BlockStatement emptyBlockAt(token.Token tok) {
+    ast.BlockStatement b = { id: ast.newID(), tok: tok, statements: [], endLine: tok.line };
+    return b;
+}

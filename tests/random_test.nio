@@ -1,0 +1,120 @@
+// The random module (§6.22): a seed makes the stream repeatable, a bounded
+// integer is unbiased and reaches both bounds, and shuffle and pick work at
+// every element width.
+import 'test';
+import 'random';
+import 'array';
+import 'string';
+
+test.start("random: a seed makes the stream repeatable", void () -> {
+    random.seed(42);
+    int a1 = random.int(0, 1000000);
+    int a2 = random.int(0, 1000000);
+    float a3 = random.float();
+    random.seed(42);
+    test.expectInt(random.int(0, 1000000), a1);
+    test.expectInt(random.int(0, 1000000), a2);
+    test.expectFloat(random.float(), a3);
+    // Another seed is another stream.
+    random.seed(43);
+    test.expectBool(random.int(0, 1000000) == a1 && random.int(0, 1000000) == a2, false);
+});
+
+test.start("random: int stays in its bounds and reaches both", void () -> {
+    random.seed(1);
+    int lowest = 100;
+    int highest = -100;
+    for (int i = 0; i < 2000; i++) {
+        int v = random.int(-3, 3);
+        test.expectBool(v >= -3 && v <= 3, true);
+        if (v < lowest) {
+            lowest = v;
+        }
+        if (v > highest) {
+            highest = v;
+        }
+    }
+    test.expectInt(lowest, -3);
+    test.expectInt(highest, 3);
+    test.expectInt(random.int(7, 7), 7);
+    // The full range holds every value. It is not a range of zero width.
+    int min = -9223372036854775807 - 1;
+    int any = random.int(min, 9223372036854775807);
+    test.expectBool(any >= min, true);
+    // A bound at the edge of the range works too.
+    int high = random.int(9223372036854775800, 9223372036854775807);
+    test.expectBool(high >= 9223372036854775800, true);
+});
+
+test.start("random: float is in [0, 1)", void () -> {
+    random.seed(2);
+    float first = random.float();
+    bool moved = false;
+    for (int i = 0; i < 2000; i++) {
+        float f = random.float();
+        test.expectBool(f >= 0.0 && f < 1.0, true);
+        if (f != first) {
+            moved = true;
+        }
+    }
+    test.expectBool(moved, true);
+});
+
+test.start("random: shuffle is a permutation, at every width", void () -> {
+    random.seed(5);
+    int[] ints = [];
+    for (int i = 0; i < 20; i++) {
+        array.push(ints, i);
+    }
+    int[] before = array.copy(ints);
+    random.shuffle(ints);
+    test.expectInt(ints.length, 20);
+    bool moved = false;
+    forEach(ints, v, i) {
+        if (v != before[i]) {
+            moved = true;
+        }
+    }
+    test.expectBool(moved, true);
+    array.sort(ints);
+    forEach(ints, v2, i2) {
+        test.expectInt(v2, i2);
+    }
+
+    // A byte[] has one byte per element, so the swap must move one byte.
+    byte[] bytes = [];
+    for (int b = 0; b < 50; b++) {
+        array.push(bytes, (b * 5) as byte);
+    }
+    random.shuffle(bytes);
+    array.sort(bytes);
+    forEach(bytes, bv, bi) {
+        test.expectInt(bv, bi * 5);
+    }
+
+    String[] words = ["one", "two", "three", "four"];
+    random.shuffle(words);
+    array.sort(words);
+    test.expectString(string.join(words, ","), "four,one,three,two");
+
+    int[] none = [];
+    random.shuffle(none);
+    test.expectInt(none.length, 0);
+});
+
+test.start("random: pick answers an element", void () -> {
+    random.seed(9);
+    int[] one = [42];
+    test.expectInt(random.pick(one), 42);
+    int[] three = [1, 2, 3];
+    for (int i = 0; i < 200; i++) {
+        int v = random.pick(three);
+        test.expectBool(v >= 1 && v <= 3, true);
+    }
+    String[] words = ["a", "b"];
+    String w = random.pick(words);
+    test.expectBool(w == "a" || w == "b", true);
+    byte[] bytes = [7, 9];
+    byte p = random.pick(bytes);
+    test.expectBool(p == 7 || p == 9, true);
+});

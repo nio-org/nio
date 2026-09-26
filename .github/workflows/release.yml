@@ -1,0 +1,201 @@
+name: Release
+
+# Builds `nio` on each platform it ships for and publishes the binaries, the
+# checksums and the install scripts as a GitHub release.
+#
+# A pushed tag `vX.Y.Z` builds and publishes; the tag must match
+# src/version.nio. A manual run with a tag publishes that tag again. A manual
+# run without one only builds, to check a release before tagging it.
+#
+# Run from a repository other than nio-org/nio, it needs the secret
+# NIO_RELEASE_TOKEN: a fine-grained token with "Contents: read and write" on
+# nio-org/nio.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and publish, e.g. v0.1.0 (empty: build only)"
+        required: false
+        default: ""
+
+env:
+  # The tag being released, or empty when nothing is published.
+  TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/v') && github.ref_name || '') }}
+  RELEASE_REPO: nio-org/nio
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: macos-14
+            asset: nio-darwin-arm64.tar.gz
+          # The oldest Ubuntu runner, because a binary asks for the glibc it
+          # was linked against or older: this one runs on glibc 2.35 and
+          # newer (Ubuntu 22.04, Debian 12, RHEL 9 and their successors).
+          - os: ubuntu-22.04
+            asset: nio-linux-x86_64.tar.gz
+          - os: windows-latest
+            asset: nio-windows-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Apple's clang otherwise targets the runner's own macOS version, and
+      # the binary then refuses to start on an older one. 11.0 is the first
+      # macOS that runs on Apple Silicon. Other hosts ignore it.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG || github.ref }}
+
+      # Ubuntu 22.04 ships clang 14, which is older than the IR the compiler
+      # writes. The wrapper also selects lld: GNU ld cannot read bitcode, so
+      # without it the release link drops -flto and the compiler is slower.
+      - name: Install LLVM 18 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          wget -qO "$RUNNER_TEMP/llvm.sh" https://apt.llvm.org/llvm.sh
+          sudo bash "$RUNNER_TEMP/llvm.sh" 18
+          mkdir -p "$RUNNER_TEMP/clang"
+          cat > "$RUNNER_TEMP/clang/clang" <<'EOF'
+          #!/bin/sh
+          exec /usr/lib/llvm-18/bin/clang -fuse-ld=lld -Wno-unused-command-line-argument "$@"
+          EOF
+          chmod +x "$RUNNER_TEMP/clang/clang"
+          echo "$RUNNER_TEMP/clang" >> "$GITHUB_PATH"
+
+      - name: clang version
+        run: clang --version
+
+      - name: Build the compiler from bootstrap/nio.ll
+        run: sh bootstrap/build.sh ./nio0
+
+      - name: Build the release compiler with itself
+        run: ./nio0 build --release src/nio.nio -o ./nio
+
+      - name: Check the tag names the compiler's version
+        if: env.TAG != ''
+        run: |
+          reported=$(./nio version | awk '{print $2}')
+          if [ "v$reported" != "$TAG" ]; then
+              echo "tag $TAG, but the compiler reports $reported (src/version.nio)" >&2
+              exit 1
+          fi
+
+      # CI runs the full suite. This checks the binary that ships.
+      - name: Smoke test
+        run: |
+          ./nio version
+          cat > "$RUNNER_TEMP/smoke.nio" <<'EOF'
+          import 'json';
+
+          type Point {
+              int x;
+              int y;
+          }
+
+          Point p = { x: 1, y: 2 };
+          print(json.toText(p));
+          EOF
+          ./nio run "$RUNNER_TEMP/smoke.nio"
+          ./nio build "$RUNNER_TEMP/smoke.nio" -o "$RUNNER_TEMP/smoke"
+          test "$("$RUNNER_TEMP/smoke")" = '{"x":1,"y":2}'
+          ./nio run tests/unit_main.nio
+
+      - name: Show what the binary requires from the host
+        run: |
+          case $RUNNER_OS in
+          macOS) otool -l nio | grep -A4 LC_BUILD_VERSION ;;
+          Linux) objdump -T nio | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1 ;;
+          esac
+
+      # The license asks for LICENSE and NOTICE to travel with the binary.
+      - name: Package
+        run: |
+          mkdir dist
+          case $RUNNER_OS in
+          Windows) 7z a -tzip "dist/${{ matrix.asset }}" nio.exe LICENSE NOTICE > /dev/null ;;
+          *) tar -czf "dist/${{ matrix.asset }}" nio LICENSE NOTICE ;;
+          esac
+          cd dist
+          if command -v sha256sum > /dev/null; then
+              sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+              shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
+          cat "${{ matrix.asset }}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Not a prerelease, even at 0.x: the install scripts download from
+  # /releases/latest/, which skips prereleases.
+  publish:
+    needs: build
+    if: inputs.tag || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums and install scripts
+        run: |
+          cat dist/*.sha256 | sed 's/ \*/  /' > dist/SHA256SUMS
+          rm dist/*.sha256
+          cp tools/install-release.sh dist/install.sh
+          cp tools/install-release.ps1 dist/install.ps1
+          cat dist/SHA256SUMS
+
+      # The tagged CHANGELOG.md entry, without its heading.
+      - name: Release notes
+        run: |
+          version=${TAG#v}
+          git show "$TAG:CHANGELOG.md" | awk -v h="## $version" '
+              $0 == h { on = 1; next }
+              on && /^## / { exit }
+              on { print }
+          ' > "$RUNNER_TEMP/notes.md"
+          if [ ! -s "$RUNNER_TEMP/notes.md" ]; then
+              echo "CHANGELOG.md has no entry headed '## $version'" >&2
+              exit 1
+          fi
+
+      # Publishing a tag again replaces the files and notes of its release.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.repository == 'nio-org/nio' && github.token || secrets.NIO_RELEASE_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+              echo "the secret NIO_RELEASE_TOKEN is not set" >&2
+              exit 1
+          fi
+          if gh release view "$TAG" --repo "$RELEASE_REPO" > /dev/null 2>&1; then
+              gh release upload "$TAG" dist/* --repo "$RELEASE_REPO" --clobber
+              gh release edit "$TAG" --repo "$RELEASE_REPO" --notes-file "$RUNNER_TEMP/notes.md"
+          else
+              gh release create "$TAG" dist/* \
+                  --repo "$RELEASE_REPO" \
+                  --title "Nio ${TAG#v}" \
+                  --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+          echo "https://github.com/$RELEASE_REPO/releases/tag/$TAG"

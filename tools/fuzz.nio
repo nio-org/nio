@@ -1,0 +1,276 @@
+// A fuzzer for the parsers that read data from a peer: the certificate reader
+// of `x509` and the record and handshake readers of `tls`.
+//
+// It looks for a crash, not a wrong result. An out-of-range index is a runtime
+// error (§5.5) that stops the process. In a network parser, that is a denial of
+// service that any peer can cause. Each structured Error is a pass, so the
+// runner checks the exit status and not the output.
+//
+// The mutations know the structure, because random bytes do not get past the
+// first length check. Each seed is a real certificate or a real record.
+//
+// This is not in tests/all.nio. The suite holds fixed regression cases.
+// Run this for minutes or hours:
+//
+//     nio run tools/fuzz.nio 60          # seconds, default 10
+//
+import 'string';
+import 'array';
+import 'crypto';
+import 'fs';
+import 'time';
+import 'process';
+import 'x509';
+import 'tls';
+
+// A xorshift64* generator with a seed from the clock. The program prints the
+// seed, so any run can be repeated.
+type Rand {
+    int state;
+
+    int next() {
+        int x = self.state;
+        x = x ^ ((x << 13) & 9223372036854775807);
+        x = x ^ (x >> 7);
+        x = x ^ ((x << 17) & 9223372036854775807);
+        if (x == 0) { x = 88172645463325252; }
+        self.state = x;
+        if (x < 0) { return 0 - x; }
+        return x;
+    }
+
+    int upto(int n) {
+        if (n <= 0) { return 0; }
+        return self.next() % n;
+    }
+
+    bool chance(int oneIn) {
+        return self.upto(oneIn) == 0;
+    }
+}
+
+// ---- the seed corpus ----
+
+byte[][] loadHexCorpus(String path) {
+    byte[][] out = [];
+    forEach(string.split(string.fromByteArray(fs.readFile(path)), "\n"), line) {
+        if (string.length(line) == 0 || line[0] == 35) {    // '#'
+            continue;
+        }
+        String[] f = string.split(line, " ");
+        if (f.length < 2) { continue; }
+        byte[] d = crypto.hexDecode(f[f.length - 1]) catch [];
+        if (d.length > 0) { array.push(out, d); }
+    }
+    return out;
+}
+
+// ---- mutations ----
+//
+// Each returns a changed document. The parser gets into the structure before
+// it finds the change.
+
+byte[] mutateFlip(Rand r, byte[] d) {
+    byte[] o = array.copy(d);
+    int n = 1 + r.upto(4);
+    int i = 0;
+    while (i < n && o.length > 0) {
+        int at = r.upto(o.length);
+        o[at] = (o[at] ^ (1 << r.upto(8))) as byte;
+        i = i + 1;
+    }
+    return o;
+}
+
+// Changes a byte that is probably a DER length, so the parser reads a field
+// that is not there.
+byte[] mutateLength(Rand r, byte[] d) {
+    byte[] o = array.copy(d);
+    if (o.length < 4) { return o; }
+    int at = r.upto(o.length - 1);
+    int pick = r.upto(6);
+    if (pick == 0) { o[at] = 255; }
+    else if (pick == 1) { o[at] = 128; }    // indefinite, which DER forbids
+    else if (pick == 2) { o[at] = 127; }
+    else if (pick == 3) { o[at] = 0; }
+    else if (pick == 4) { o[at] = 130; }    // two-byte long form
+    else { o[at] = (o[at] + 1) as byte; }
+    return o;
+}
+
+byte[] mutateTruncate(Rand r, byte[] d) {
+    if (d.length < 2) { return d; }
+    // Prefers long prefixes. A document cut near its end gets the parser deep
+    // into the structure before the data stops.
+    int keep = d.length - 1 - r.upto(d.length / 4 + 1);
+    if (keep < 1) { keep = 1; }
+    return array.slice(d, 0, keep);
+}
+
+byte[] mutateGrow(Rand r, byte[] d) {
+    byte[] o = array.copy(d);
+    int n = 1 + r.upto(64);
+    int i = 0;
+    while (i < n) {
+        array.push(o, r.upto(256) as byte);
+        i = i + 1;
+    }
+    return o;
+}
+
+// Copies a run of one document into another, so the parser reads a field of
+// one structure as a field of another.
+byte[] mutateSplice(Rand r, byte[] a, byte[] b) {
+    if (a.length < 4 || b.length < 4) { return a; }
+    int at = r.upto(a.length - 1);
+    int from = r.upto(b.length - 1);
+    int len = 1 + r.upto(b.length - from);
+    byte[] o = array.slice(a, 0, at);
+    forEach(array.slice(b, from, from + len), x) { array.push(o, x); }
+    forEach(array.slice(a, at, a.length), x) { array.push(o, x); }
+    return o;
+}
+
+// Wraps the document in nested SEQUENCE headers. With these, a peer can try to
+// make a recursive-descent parser exhaust the stack.
+byte[] mutateNest(Rand r, byte[] d) {
+    byte[] o = array.copy(d);
+    int depth = 1 + r.upto(40);
+    int i = 0;
+    while (i < depth && o.length < 60000) {
+        byte[] wrapped = [48, 132];    // SEQUENCE, 4-byte long form
+        array.push(wrapped, ((o.length >> 24) & 255) as byte);
+        array.push(wrapped, ((o.length >> 16) & 255) as byte);
+        array.push(wrapped, ((o.length >> 8) & 255) as byte);
+        array.push(wrapped, (o.length & 255) as byte);
+        forEach(o, x) { array.push(wrapped, x); }
+        o = wrapped;
+        i = i + 1;
+    }
+    return o;
+}
+
+byte[] mutate(Rand r, byte[][] corpus, byte[] d) {
+    int pick = r.upto(7);
+    if (pick == 0) { return mutateFlip(r, d); }
+    if (pick == 1) { return mutateLength(r, d); }
+    if (pick == 2) { return mutateTruncate(r, d); }
+    if (pick == 3) { return mutateGrow(r, d); }
+    if (pick == 4) { return mutateNest(r, d); }
+    if (pick == 5) {
+        return mutateSplice(r, d, corpus[r.upto(corpus.length)]);
+    }
+    // Two mutations at once. Most real defects need a structure that is
+    // correct in one part and wrong in another.
+    return mutate(r, corpus, mutateFlip(r, d));
+}
+
+// ---- the targets ----
+
+// Each target must return or raise. A process that stops is the failure.
+void tryCertificate(byte[] d) {
+    x509.Certificate c = x509.parseCertificate(d) catch e { return; };
+    // Read the fields of a document that parsed. A value that decodes lazily
+    // can fail when its field is read.
+    String s = c.subject + c.issuer + c.serialNumber + c.signatureAlgorithm
+        + c.publicKeyAlgorithm + c.ecCurve;
+    if (string.length(s) < 0) { return; }
+    forEach(c.dnsNames, n) {
+        x509.matchHostname(c, n) catch e { };
+    }
+    x509.matchHostname(c, "example.com") catch e { };
+    c.hasKeyUsage(5);
+    c.isSelfIssued();
+    x509.rsaPublicKey(c) catch e { };
+    x509.ecdsaPublicKey(c) catch e { };
+}
+
+void tryEcdsaSignature(byte[] d) {
+    x509.EcdsaSignature s = x509.parseEcdsaSignature(d) catch e { return; };
+    if (s.r.length + s.s.length < 0) { return; }
+}
+
+void tryPem(byte[] d) {
+    byte[][] ders = x509.parsePem(string.fromByteArray(d)) catch e { return; };
+    forEach(ders, der) { tryCertificate(der); }
+}
+
+void tryHandshake(byte[] d) {
+    // Each target is optional so a failure falls through to the next.
+    tls.ClientHello? ch = tls.parseClientHello(d) catch null;
+    tls.ServerHello? sh = tls.parseServerHello(d) catch null;
+    tls.CertificateVerify? cv = tls.parseCertificateVerify(d) catch null;
+    byte[][]? chain = tls.parseCertificate(d) catch null;
+    tls.RecordHeader? h = tls.parseRecordHeader(d) catch null;
+    if (ch != null) { int n = ch.cipherSuites.length + ch.alpn.length; }
+    if (sh != null) { int n = sh.keyShare.length + sh.sessionId.length; }
+    if (cv != null) { int n = cv.signature.length + cv.algorithm; }
+    if (chain != null) { int n = chain.length; }
+    if (h != null) { int n = h.length + h.contentType; }
+}
+
+void tryChain(byte[][] corpus, Rand r) {
+    // Chain building over mutated certificates. MAX_CHAIN_WORK limits the
+    // search, so a peer cannot make it exponential.
+    byte[][] pool = [];
+    int n = 1 + r.upto(4);
+    int i = 0;
+    while (i < n) {
+        array.push(pool, mutate(r, corpus, corpus[r.upto(corpus.length)]));
+        i = i + 1;
+    }
+    x509.verifyChain(pool, "example.com", [], null) catch e { };
+}
+
+void run() {
+    // getArgs returns the program's own arguments, so the seconds are args[0]
+    // under `nio run` and in a built binary.
+    String[] args = process.getArgs();
+    int seconds = 10;
+    if (args.length > 0) {
+        seconds = string.toInt(args[0]) catch 10;
+    }
+
+    byte[][] certs = loadHexCorpus("tests/golden/x509_fixtures.txt");
+    forEach(loadHexCorpus("tests/golden/x509_ec_fixtures.txt"), d) { array.push(certs, d); }
+    forEach(loadHexCorpus("tests/golden/x509_real_chain.txt"), d) { array.push(certs, d); }
+    forEach(loadHexCorpus("tests/golden/x509_ec_real_chain.txt"), d) { array.push(certs, d); }
+    if (certs.length == 0) {
+        print("no seed corpus found -- run from the repository root");
+        process.exit(1);
+    }
+
+    // Handshake seeds: the messages of RFC 8448, as a real peer sends them.
+    byte[][] messages = loadHexCorpus("tests/golden/rfc8448_records.txt");
+
+    DateTime start = time.now();
+    int seed = time.milliseconds(start - time.date.fromText("2026-01-01T00:00:00Z"));
+    Rand r = { state: seed };
+    print("fuzz: seed " + string.from(seed) + ", " + string.from(seconds) + "s, "
+        + string.from(certs.length) + " certificate seeds, "
+        + string.from(messages.length) + " message seeds");
+
+    int cases = 0;
+    Duration budget = time.duration("1s") * seconds;
+    while (time.now() - start < budget) {
+        int round = 0;
+        // Run a batch between clock reads. A time.now() call per case would
+        // use most of the time.
+        while (round < 200) {
+            byte[] d = mutate(r, certs, certs[r.upto(certs.length)]);
+            tryCertificate(d);
+            tryEcdsaSignature(d);
+            if (r.chance(8)) { tryPem(d); }
+            if (messages.length > 0) {
+                byte[] m = mutate(r, messages, messages[r.upto(messages.length)]);
+                tryHandshake(m);
+            }
+            if (r.chance(20)) { tryChain(certs, r); }
+            cases = cases + 1;
+            round = round + 1;
+        }
+    }
+    print("fuzz: " + string.from(cases) + " cases, no crash");
+}
+
+run();

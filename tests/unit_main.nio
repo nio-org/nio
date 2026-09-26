@@ -1,0 +1,5 @@
+// The fast half on its own: `nio run tests/unit_main.nio`.
+import './unit' as unit;
+import 'test';
+
+test.run();

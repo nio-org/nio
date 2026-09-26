@@ -1,0 +1,114 @@
+// Checks the editor grammar against the language the compiler accepts. A stale
+// grammar breaks nothing, but it colours an older version of the language.
+//
+// This file checks that the checked-in editors/shared/nio.tmLanguage.json
+// mentions every keyword, built-in type, built-in module and reserved name, so
+// a forgotten `nio run tools/grammar.nio` fails here. It needs no subprocess,
+// which keeps it in the fast half of the suite. The generator covers the other
+// half: it refuses to run on a keyword it does not classify.
+//
+// It reads the grammar as text. Every generated name is inside a regex
+// alternation, so the check looks for four spellings. It does not parse the
+// regex.
+import 'test';
+import 'string';
+import 'array';
+import 'map';
+import 'fs';
+import './repo' as repo;
+import '../src/token' as token;
+import '../src/checker' as checker;
+
+String const REGENERATE = "nio run tools/grammar.nio";
+String const grammarPath = "editors/shared/nio.tmLanguage.json";
+
+// The contextual keywords. The lexer emits them as IDENT and the parser
+// matches them by spelling. No table holds them, so the grammar names them
+// literally. This list catches a rename in the parser.
+String[] const contextual = ["async", "override", "sealed", "extends", "union", "noalloc", "extern", "native"];
+
+String readText(String rel) {
+    return string.fromByteArray(fs.readFile(repo.at(rel)));
+}
+
+// Reports whether name appears as an alternative of some regex group in the
+// grammar: `(name)`, `(name|`, `|name|` or `|name)`.
+bool mentioned(String text, String name) {
+    if (string.contains(text, "(" + name + ")")) { return true; }
+    if (string.contains(text, "(" + name + "|")) { return true; }
+    if (string.contains(text, "|" + name + "|")) { return true; }
+    return string.contains(text, "|" + name + ")");
+}
+
+void expectAllMentioned(String text, String[] names, String what) {
+    String[] missing = [];
+    forEach(names, n) {
+        if (!mentioned(text, n)) {
+            array.push(missing, n);
+        }
+    }
+    test.assert(missing.length == 0,
+        what + " missing from " + grammarPath + ": " + string.join(missing, ", ")
+        + " -- run `" + REGENERATE + "`");
+}
+
+test.start("grammar: every keyword is highlighted", void () -> {
+    String text = readText(grammarPath);
+    String[] names = [];
+    forEach(map.keys(token.keywords), k) {
+        array.push(names, k);
+    }
+    expectAllMentioned(text, names, "keyword(s)");
+});
+
+test.start("grammar: every built-in type is highlighted", void () -> {
+    String text = readText(grammarPath);
+    String[] names = [];
+    forEach(map.keys(checker.builtinTypes), t) {
+        array.push(names, t);
+    }
+    expectAllMentioned(text, names, "built-in type(s)");
+});
+
+test.start("grammar: every built-in module is highlighted", void () -> {
+    String text = readText(grammarPath);
+    String[] names = [];
+    forEach(map.keys(checker.builtinModules), m) {
+        array.push(names, m);
+    }
+    forEach(map.keys(checker.builtinNioModules), m) {
+        array.push(names, m);
+    }
+    expectAllMentioned(text, names, "built-in module(s)");
+});
+
+test.start("grammar: every reserved name is highlighted", void () -> {
+    String text = readText(grammarPath);
+    String[] names = [];
+    forEach(map.keys(checker.reserved), r) {
+        array.push(names, r);
+    }
+    expectAllMentioned(text, names, "reserved name(s)");
+});
+
+test.start("grammar: the parser still spells the contextual keywords that way", void () -> {
+    String parser = readText("src/parser.nio");
+    String[] missing = [];
+    forEach(contextual, kw) {
+        if (!string.contains(parser, "\"" + kw + "\"")) {
+            array.push(missing, kw);
+        }
+    }
+    test.assert(missing.length == 0,
+        "src/parser.nio no longer contains the literal(s) " + string.join(missing, ", ")
+        + " that the grammar matches by spelling");
+});
+
+// editors/sync.sh copies shared/ into each editor's tree, because VS Code
+// cannot read a grammar from outside the directory it packages.
+test.start("grammar: each editor's copy matches editors/shared", void () -> {
+    test.expectString(readText("editors/vscode/syntaxes/nio.tmLanguage.json"),
+        readText("editors/shared/nio.tmLanguage.json"));
+    test.expectString(readText("editors/vscode/language-configuration.json"),
+        readText("editors/shared/language-configuration.json"));
+});

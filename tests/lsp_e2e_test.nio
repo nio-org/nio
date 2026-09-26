@@ -1,0 +1,716 @@
+// The language server as a conversation, through the real binary.
+//
+// tests/lsp_test.nio checks the pieces. This checks the protocol, which exists
+// only as an exchange: `nio lsp` runs as a process with a whole session on its
+// standard input, and what comes back is parsed as frames.
+//
+// The session is written in advance because process.child.run gives a child a
+// fixed input and collects its output after it ends (§6.12). This server answers
+// each message before reading the next, so a session written in order comes back
+// in order. It cannot check when a reply arrived.
+//
+// The binary comes from h.compiler(), shared with tests/cli_test.nio so the
+// suite's most expensive step happens once.
+import 'test';
+import 'string';
+import 'array';
+import 'json';
+import 'fs';
+import 'path';
+import './harness' as h;
+import '../src/lsp/uri' as docuri;
+
+String const CRLF = string.fromByteArray([13, 10]);
+
+// ---- writing a session ----
+
+String frame(String body) {
+    return "Content-Length: " + string.from(string.length(body)) + CRLF + CRLF + body;
+}
+
+// Ids 1 and 99 are reserved for the handshake and the shutdown. A case owns the
+// middle of the session.
+String const HELLO =
+    `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}`;
+String const BYE =
+    `{"jsonrpc":"2.0","id":99,"method":"shutdown","params":null}`;
+String const EXIT = `{"jsonrpc":"2.0","method":"exit"}`;
+
+// The text goes through json.toText so a program with quotes and newlines in it
+// survives being quoted.
+String didOpen(String uri, String text) {
+    return `{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":`
+        + json.toText(uri) + `,"languageId":"nio","version":1,"text":` + json.toText(text)
+        + `}}}`;
+}
+
+// Full sync: a change carries the document's whole new text.
+String didChange(String uri, String text) {
+    return `{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":`
+        + json.toText(uri) + `,"version":2},"contentChanges":[{"text":` + json.toText(text)
+        + `}]}}`;
+}
+
+// A quick-fix request over one line of the document.
+String codeAction(String uri, int line) {
+    return `{"jsonrpc":"2.0","id":2,"method":"textDocument/codeAction","params":{"textDocument":{"uri":`
+        + json.toText(uri) + `},"range":{"start":{"line":` + string.from(line)
+        + `,"character":0},"end":{"line":` + string.from(line)
+        + `,"character":0}},"context":{"diagnostics":[]}}}`;
+}
+
+String didClose(String uri) {
+    return `{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":`
+        + json.toText(uri) + `}}}`;
+}
+
+h.Run converse(String[] middle) {
+    String[] parts = [];
+    array.push(parts, frame(HELLO));
+    forEach(middle, m) {
+        array.push(parts, frame(m));
+    }
+    array.push(parts, frame(BYE));
+    array.push(parts, frame(EXIT));
+    return h.runBinaryInput(h.compiler(), ["lsp", "--stdio"], string.join(parts, ""));
+}
+
+// ---- reading a session back ----
+
+// One message the server sent. A case asking whether a key is absent needs the
+// tree; one asking how text was escaped needs the body.
+type Reply {
+    String body;
+    Json tree;
+}
+
+// Splits the server's output into messages. Any framing defect fails here
+// rather than somewhere confusing later.
+Reply[] replies(String out) {
+    Reply[] found = [];
+    int i = 0;
+    int n = string.length(out);
+    while (i < n) {
+        String rest = string.substring(out, i, n);
+        int blank = string.find(rest, CRLF + CRLF);
+        test.assert(blank > 0, "no header terminator in: " + rest);
+        if (blank <= 0) {
+            return found;
+        }
+        String header = string.substring(rest, 0, blank);
+        int colon = string.find(header, ":");
+        test.assert(colon > 0, "not a header: " + header);
+        String len = string.trim(string.substring(header, colon + 1, string.length(header)));
+        int declared = string.toInt(len) catch -1;
+        test.assert(declared >= 0, "not a length: " + len);
+        int start = i + blank + 4;
+        test.assert(start + declared <= n, "a body shorter than its Content-Length");
+        if (start + declared > n) {
+            return found;
+        }
+        String body = string.substring(out, start, start + declared);
+        Json? parsed = json.parse(body) catch null;
+        test.assert(parsed != null, "a body that is not JSON: " + body);
+        if (parsed != null) {
+            Reply r = { body: body, tree: parsed };
+            array.push(found, r);
+        }
+        i = start + declared;
+    }
+    return found;
+}
+
+// The diagnostics of every publishDiagnostics notification for uri, in order,
+// each written as "line:character message".
+String[][] published(Reply[] rs, String uri) {
+    String[][] rounds = [];
+    forEach(rs, r) {
+        String method = json.asText(r.tree["method"]) catch "";
+        if (method != "textDocument/publishDiagnostics") {
+            continue;
+        }
+        String at = json.asText(r.tree["params"]["uri"]) catch "";
+        if (at != uri) {
+            continue;
+        }
+        Json ds = r.tree["params"]["diagnostics"];
+        String[] round = [];
+        for (int i = 0; i < json.length(ds); i++) {
+            Json d = ds[i];
+            Json s = d["range"]["start"];
+            array.push(round, string.from(json.asInt(s["line"]) catch -1) + ":"
+                + string.from(json.asInt(s["character"]) catch -1) + " "
+                + (json.asText(d["message"]) catch ""));
+        }
+        array.push(rounds, round);
+    }
+    return rounds;
+}
+
+// A real path in the suite's own directory: the server resolves imports
+// against it.
+String uriIn(String dir, String name) {
+    return docuri.fromPath(path.join(dir, name));
+}
+
+// ---- the cases ----
+
+test.start("lsp e2e: the handshake and an orderly shutdown", void () -> {
+    h.Run r = converse([]);
+    test.expectInt(r.code, 0);
+    Reply[] rs = replies(r.out);
+    test.expectInt(rs.length, 2);
+
+    // The sync options are written in full, and not as the bare `1` that the
+    // protocol also allows. Clients differ on what the shorthand implies.
+    test.expectInt(json.asInt(rs[0].tree["id"]) catch -1, 1);
+    Json caps = rs[0].tree["result"]["capabilities"];
+    Json sync = caps["textDocumentSync"];
+    test.expectInt(json.asInt(sync["change"]) catch -1, 1);
+    test.assert(json.asBool(sync["openClose"]) catch false, "openClose should be asked for");
+    test.expectString(json.asText(caps["positionEncoding"]) catch "", "utf-16");
+    test.expectString(json.asText(rs[0].tree["result"]["serverInfo"]["name"]) catch "", "nio");
+
+    // shutdown answers null, and only then does exit mean nothing went wrong.
+    test.expectInt(json.asInt(rs[1].tree["id"]) catch -1, 99);
+    test.expectString(rs[1].body, `{"jsonrpc":"2.0","id":99,"result":null}`);
+});
+
+test.start("lsp e2e: exit without shutdown is a failure", void () -> {
+    // Here the status is not zero. An editor that says exit without shutdown
+    // reports that something went wrong.
+    h.Run r = h.runBinaryInput(h.compiler(), ["lsp"],
+        frame(HELLO) + frame(EXIT));
+    test.expectInt(r.code, 1);
+});
+
+test.start("lsp e2e: a closed pipe is not a failure", void () -> {
+    // An editor that is killed never says shutdown, and nothing went wrong.
+    h.Run r = h.runBinaryInput(h.compiler(), ["lsp"], frame(HELLO));
+    test.expectInt(r.code, 0);
+    test.expectInt(replies(r.out).length, 1);
+});
+
+test.start("lsp e2e: opening a broken document reports its errors", void () -> {
+    String dir = h.scratch();
+    String u = uriIn(dir, "main.nio");
+    h.Run r = converse([
+        didOpen(u, `int a = "text";
+String b = 3;
+`),
+    ]);
+    test.expectInt(r.code, 0);
+    String[][] rounds = published(replies(r.out), u);
+    test.expectInt(rounds.length, 1);
+    test.expectInt(rounds[0].length, 2);
+    // The protocol counts lines and characters from 0. A type error is reported
+    // at the value and not at the statement. `"text"` begins at byte 9 of the
+    // first line, so the squiggle starts at character 8.
+    test.expectString(rounds[0][0], `0:8 cannot use String as int in declaration of "a"`);
+    test.expectString(rounds[0][1], `1:11 cannot use int as String in declaration of "b"`);
+});
+
+test.start("lsp e2e: a missing import is offered as a quick fix", void () -> {
+    // The compiler knows the whole edit only for this diagnostic. An editor
+    // applies a code action without asking, so the server offers no guesses.
+    String dir = h.scratch();
+    String u = uriIn(dir, "main.nio");
+    h.Run r = converse([
+        didOpen(u, `int n = path.join("a", "b");
+`),
+        codeAction(u, 0),
+    ]);
+    test.expectInt(r.code, 0);
+    Reply[] rs = replies(r.out);
+    Json? answer = null;
+    forEach(rs, one) {
+        if ((json.asInt(one.tree["id"]) catch -1) == 2) {
+            answer = one.tree["result"];
+        }
+    }
+    test.assert(answer != null, "no answer to the code action request");
+    if (answer == null) {
+        return;
+    }
+    Json actions = answer;
+    test.expectInt(json.length(actions), 1);
+    Json first = actions[0];
+    test.expectString(json.asText(first["title"]) catch "", "add import 'path';");
+    test.expectString(json.asText(first["kind"]) catch "", "quickfix");
+    Json edits = first["edit"]["changes"][u];
+    test.expectInt(json.length(edits), 1);
+    test.expectString(json.asText(edits[0]["newText"]) catch "", "import 'path';\n");
+    // Inserted at the top of a file with no imports, as an empty range.
+    Json at = edits[0]["range"];
+    test.expectInt(json.asInt(at["start"]["line"]) catch -1, 0);
+    test.expectInt(json.asInt(at["start"]["character"]) catch -1, 0);
+    test.expectInt(json.asInt(at["end"]["line"]) catch -1, 0);
+    test.expectInt(json.asInt(at["end"]["character"]) catch -1, 0);
+});
+
+test.start("lsp e2e: a quick fix goes after the imports a file has", void () -> {
+    String dir = h.scratch();
+    String u = uriIn(dir, "main.nio");
+    h.Run r = converse([
+        didOpen(u, `import 'string';
+
+String s = string.trim("  x  ");
+int n = path.join("a", "b");
+`),
+        codeAction(u, 3),
+    ]);
+    Reply[] rs = replies(r.out);
+    Json? answer = null;
+    forEach(rs, one) {
+        if ((json.asInt(one.tree["id"]) catch -1) == 2) {
+            answer = one.tree["result"];
+        }
+    }
+    test.assert(answer != null, "no answer to the code action request");
+    if (answer == null) {
+        return;
+    }
+    Json edits = answer[0]["edit"]["changes"][u];
+    // Line 1 of the file holds the import, so the new one goes on line 2,
+    // which the protocol counts as 1.
+    test.expectInt(json.asInt(edits[0]["range"]["start"]["line"]) catch -1, 1);
+});
+
+test.start("lsp e2e: a diagnostic with no fix is offered none", void () -> {
+    String dir = h.scratch();
+    String u = uriIn(dir, "main.nio");
+    h.Run r = converse([
+        didOpen(u, `int a = "text";
+`),
+        codeAction(u, 0),
+    ]);
+    Reply[] rs = replies(r.out);
+    forEach(rs, one) {
+        if ((json.asInt(one.tree["id"]) catch -1) == 2) {
+            test.expectString(one.body, `{"jsonrpc":"2.0","id":2,"result":[]}`);
+        }
+    }
+});
+
+test.start("lsp e2e: a clean document is told it is clean", void () -> {
+    // Only an empty list erases the last check's squiggles, so a clean document
+    // still gets a notification.
+    String dir = h.scratch();
+    String u = uriIn(dir, "main.nio");
+    h.Run r = converse([didOpen(u, "print(\"hi\");\n")]);
+    String[][] rounds = published(replies(r.out), u);
+    test.expectInt(rounds.length, 1);
+    test.expectInt(rounds[0].length, 0);
+});
+
+test.start("lsp e2e: fixing a document clears its errors", void () -> {
+    String dir = h.scratch();
+    String u = uriIn(dir, "main.nio");
+    h.Run r = converse([
+        didOpen(u, "int a = \"text\";\n"),
+        didChange(u, "int a = 1;\n"),
+    ]);
+    String[][] rounds = published(replies(r.out), u);
+    test.expectInt(rounds.length, 2);
+    test.expectInt(rounds[0].length, 1);
+    test.expectInt(rounds[1].length, 0);
+});
+
+test.start("lsp e2e: a message that must be quoted survives the round trip", void () -> {
+    // Both directions carry text that JSON must escape. The program is built by
+    // concatenation and not as a literal, because a backtick string still
+    // decodes §1.6's escapes.
+    String q = "\"";
+    String bs = string.fromByteArray([92]);
+    String prog = "String s = " + q + "a" + bs + q + "b" + bs + bs + "c" + q + ";\n"
+        + "int n = s;\n";
+    String dir = h.scratch();
+    String u = uriIn(dir, "main.nio");
+    h.Run r = converse([didOpen(u, prog)]);
+
+    // An error about line 2 means the parser got through line 1, which holds
+    // the escapes.
+    Reply[] rs = replies(r.out);
+    String[][] rounds = published(rs, u);
+    test.expectInt(rounds.length, 1);
+    test.expectInt(rounds[0].length, 1);
+    test.expectString(rounds[0][0], `1:8 cannot use String as int in declaration of "n"`);
+
+    // Raw quotes in the message would have ended the JSON string early.
+    forEach(rs, reply) {
+        String method = json.asText(reply.tree["method"]) catch "";
+        if (method == "textDocument/publishDiagnostics") {
+            test.assert(string.contains(reply.body, bs + q + "n" + bs + q),
+                "the message's quotes were not escaped: " + reply.body);
+        }
+    }
+});
+
+test.start("lsp e2e: a diagnostic in an imported module lands on that file", void () -> {
+    // The squiggle belongs in the imported file. The file being edited gets an
+    // empty list and not the error of another file.
+    String dir = h.scratch();
+    h.writeTo(dir, "helper.nio", "export String n = 7;\n");
+    String main = uriIn(dir, "main.nio");
+    String helper = uriIn(dir, "helper.nio");
+    h.Run r = converse([
+        didOpen(main, `import './helper' as hp;
+print(hp.n);
+`),
+    ]);
+    Reply[] rs = replies(r.out);
+    String[][] atMain = published(rs, main);
+    String[][] atHelper = published(rs, helper);
+    test.expectInt(atMain.length, 1);
+    test.expectInt(atMain[0].length, 0);
+    test.expectInt(atHelper.length, 1);
+    test.expectInt(atHelper[0].length, 1);
+    test.expectString(atHelper[0][0], `0:18 cannot use int as String in declaration of "n"`);
+});
+
+test.start("lsp e2e: an unsaved import is read from the editor", void () -> {
+    // The overlay end to end (src/loader.nio's Loader.open). The helper on disk
+    // is correct and the editor's copy is not. The editor must report on the
+    // copy the person is looking at.
+    String dir = h.scratch();
+    h.writeTo(dir, "helper.nio", "export int n = 7;\n");
+    String main = uriIn(dir, "main.nio");
+    String helper = uriIn(dir, "helper.nio");
+    h.Run r = converse([
+        didOpen(main, `import './helper' as hp;
+print(hp.n);
+`),
+        didOpen(helper, "export int n = 7;\n"),
+        didChange(helper, "export String n = 7;\n"),
+    ]);
+    Reply[] rs = replies(r.out);
+    String[][] atHelper = published(rs, helper);
+    // Several rounds reach the helper before the change. The test checks the
+    // last one, after the unsaved edit.
+    test.assert(atHelper.length >= 2, "expected the helper to be reported on");
+    String[] last = atHelper[atHelper.length - 1];
+    test.expectInt(last.length, 1);
+    test.expectString(last[0], `0:18 cannot use int as String in declaration of "n"`);
+
+    // The file on disk is unchanged: the server writes nothing.
+    test.expectString(string.fromByteArray(fs.readFile(path.join(dir, "helper.nio"))),
+        "export int n = 7;\n");
+});
+
+test.start("lsp e2e: an incremental change is refused rather than half-applied", void () -> {
+    // This server asked for whole documents. Taking a change that carries a
+    // `range` would replace the file with a piece of itself.
+    String dir = h.scratch();
+    String u = uriIn(dir, "main.nio");
+    h.Run r = converse([
+        didOpen(u, "print(\"hi\");\n"),
+        `{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":`
+        + json.toText(u) + `,"version":2},"contentChanges":[{"range":{"start":{"line":0,`
+        + `"character":0},"end":{"line":0,"character":5}},"text":"nonsense"}]}}`,
+    ]);
+    test.expectInt(r.code, 0);
+    // One notification, from the open. The change produced none.
+    String[][] rounds = published(replies(r.out), u);
+    test.expectInt(rounds.length, 1);
+    test.expectInt(rounds[0].length, 0);
+    test.assert(string.contains(r.err, "incremental"),
+        "expected the refusal to be logged, got: " + r.err);
+});
+
+test.start("lsp e2e: closing a document withdraws what it reported", void () -> {
+    String dir = h.scratch();
+    String u = uriIn(dir, "main.nio");
+    h.Run r = converse([
+        didOpen(u, "int a = \"text\";\n"),
+        didClose(u),
+    ]);
+    String[][] rounds = published(replies(r.out), u);
+    test.assert(rounds.length >= 2, "expected a clearing notification on close");
+    test.expectInt(rounds[0].length, 1);
+    test.expectInt(rounds[rounds.length - 1].length, 0);
+});
+
+test.start("lsp e2e: a document with no file behind it is left alone", void () -> {
+    // An untitled buffer has no directory to resolve imports against, so there
+    // is nothing to check. It still gets an empty list.
+    h.Run r = converse([didOpen("untitled:Untitled-1", "int a = \"text\";\n")]);
+    test.expectInt(r.code, 0);
+    String[][] rounds = published(replies(r.out), "untitled:Untitled-1");
+    test.expectInt(rounds.length, 1);
+    test.expectInt(rounds[0].length, 0);
+});
+
+test.start("lsp e2e: an unknown request is answered and an unknown notification is not",
+    void () -> {
+        // A client waiting on a reply that never comes waits forever, so an
+        // unimplemented request is refused by name. A notification has no reply to
+        // wait for, and the protocol requires dropping it in silence.
+        h.Run r = converse([
+            `{"jsonrpc":"2.0","id":7,"method":"textDocument/references","params":{}}`,
+            `{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":7}}`,
+            `{"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{"changes":[]}}`,
+        ]);
+        test.expectInt(r.code, 0);
+        Reply[] rs = replies(r.out);
+        // The handshake, the refusal and the shutdown, with nothing for the two
+        // notifications.
+        test.expectInt(rs.length, 3);
+        test.expectInt(json.asInt(rs[1].tree["id"]) catch -1, 7);
+        test.expectInt(json.asInt(rs[1].tree["error"]["code"]) catch 0, -32601);
+        test.assert(string.contains(json.asText(rs[1].tree["error"]["message"]) catch "",
+            "textDocument/references"), "the refusal should name the method");
+    });
+
+test.start("lsp e2e: a request with a string id is answered with that string", void () -> {
+    // JSON-RPC allows a number or a string. A server that assumed numbers would
+    // answer with an id the client cannot match.
+    h.Run r = converse([`{"jsonrpc":"2.0","id":"abc-1","method":"textDocument/references","params":{}}`]);
+    Reply[] rs = replies(r.out);
+    test.expectInt(rs.length, 3);
+    test.expectString(json.asText(rs[1].tree["id"]) catch "", "abc-1");
+});
+
+test.start("lsp e2e: a message that is not JSON is dropped rather than fatal", void () -> {
+    // A malformed message has no id that can be trusted, so JSON-RPC's -32700
+    // has nowhere to go. The conversation must continue.
+    h.Run r = h.runBinaryInput(h.compiler(), ["lsp"],
+        frame(HELLO) + frame("{not json") + frame(BYE) + frame(EXIT));
+    test.expectInt(r.code, 0);
+    Reply[] rs = replies(r.out);
+    test.expectInt(rs.length, 2);
+    test.expectInt(json.asInt(rs[1].tree["id"]) catch -1, 99);
+    test.assert(string.contains(r.err, "not JSON"),
+        "expected the drop to be logged on stderr, got: " + r.err);
+});
+
+test.start("lsp e2e: a header this server does not use is skipped", void () -> {
+    // Content-Type is the only other header the protocol defines. The server
+    // skips it, and field names match without regard to case.
+    String body = HELLO;
+    String odd = "content-length: " + string.from(string.length(body)) + CRLF
+        + "Content-Type: application/vscode-jsonrpc; charset=utf-8" + CRLF + CRLF + body;
+    h.Run r = h.runBinaryInput(h.compiler(), ["lsp"], odd + frame(BYE) + frame(EXIT));
+    test.expectInt(r.code, 0);
+    test.expectInt(replies(r.out).length, 2);
+});
+
+// ---- hover and completion, through the protocol ----
+
+String hoverAt(String uri, int line, int character) {
+    return `{"jsonrpc":"2.0","id":50,"method":"textDocument/hover","params":{"textDocument":{"uri":`
+        + json.toText(uri) + `},"position":{"line":` + string.from(line)
+        + `,"character":` + string.from(character) + `}}}`;
+}
+
+String defineAt(String uri, int line, int character) {
+    return `{"jsonrpc":"2.0","id":52,"method":"textDocument/definition","params":{"textDocument":{"uri":`
+        + json.toText(uri) + `},"position":{"line":` + string.from(line)
+        + `,"character":` + string.from(character) + `}}}`;
+}
+
+String completeAt(String uri, int line, int character) {
+    return `{"jsonrpc":"2.0","id":51,"method":"textDocument/completion","params":{"textDocument":{"uri":`
+        + json.toText(uri) + `},"position":{"line":` + string.from(line)
+        + `,"character":` + string.from(character) + `}}}`;
+}
+
+Json? reply(Reply[] rs, int id) {
+    Json? found = null;
+    forEach(rs, r) {
+        if ((json.asInt(r.tree["id"]) catch -1) == id) {
+            found = r.tree;
+        }
+    }
+    return found;
+}
+
+String const SAMPLE = `import 'string';
+
+type Car {
+    String make;
+    int speed;
+}
+
+int total = 0;
+Car c = { make: "toyota", speed: 90 };
+`;
+
+test.start("lsp e2e: the handshake says what this server can answer", void () -> {
+    h.Run r = converse([]);
+    Reply[] rs = replies(r.out);
+    Json caps = rs[0].tree["result"]["capabilities"];
+    test.assert(json.asBool(caps["hoverProvider"]) catch false, "hover should be offered");
+    test.assert(json.asBool(caps["definitionProvider"]) catch false,
+        "go-to-definition should be offered");
+    // A dot opens a completion list with nothing typed. Every other list is
+    // opened by a name, which the client asks about on its own.
+    Json triggers = caps["completionProvider"]["triggerCharacters"];
+    test.expectInt(json.length(triggers), 1);
+    test.expectString(json.asText(triggers[0]) catch "", ".");
+});
+
+test.start("lsp e2e: hover says what a thing is", void () -> {
+    String dir = h.scratch();
+    String u = uriIn(dir, "main.nio");
+    // Line 8 (0-based 7) is `int total = 0;`, and character 4 is inside `total`.
+    h.Run r = converse([didOpen(u, SAMPLE), hoverAt(u, 7, 4)]);
+    test.expectInt(r.code, 0);
+    Json? got = reply(replies(r.out), 50);
+    test.assert(got != null, "no hover reply");
+    if (got == null) {
+        return;
+    }
+    String value = json.asText(got["result"]["contents"]["value"]) catch "";
+    test.assert(string.contains(value, "int total"),
+        "expected the declared type, got: " + value);
+    // A Nio fence makes an editor colour the hover with the file's grammar.
+    test.assert(string.contains(value, "nio"), "the body should be a Nio code fence");
+    test.expectString(json.asText(got["result"]["contents"]["kind"]) catch "", "markdown");
+});
+
+test.start("lsp e2e: hovering nothing answers null", void () -> {
+    String dir = h.scratch();
+    String u = uriIn(dir, "main.nio");
+    // Character 10 is the `=`. A reply is still owed, or the client waits
+    // forever.
+    h.Run r = converse([didOpen(u, SAMPLE), hoverAt(u, 7, 10)]);
+    Json? got = reply(replies(r.out), 50);
+    test.assert(got != null, "no reply to a hover that found nothing");
+    if (got != null) {
+        test.assert(json.getType(got["result"]) == json.Type.NULL,
+            "expected a null result, got: " + json.toText(got["result"]));
+    }
+});
+
+test.start("lsp e2e: completion answers a module's functions", void () -> {
+    String dir = h.scratch();
+    String u = uriIn(dir, "main.nio");
+    // Completion is always asked in a document that does not parse. The answer
+    // comes from the last tree that did.
+    String typing = SAMPLE + "print(string.";
+    h.Run r = converse([
+        didOpen(u, SAMPLE),
+        didChange(u, typing),
+        completeAt(u, 9, 13),
+    ]);
+    test.expectInt(r.code, 0);
+    Json? got = reply(replies(r.out), 51);
+    test.assert(got != null, "no completion reply");
+    if (got == null) {
+        return;
+    }
+    Json items = got["result"]["items"];
+    test.assert(json.length(items) > 10,
+        "expected string's functions, got " + string.from(json.length(items)));
+    bool sawLength = false;
+    for (int i = 0; i < json.length(items); i++) {
+        if ((json.asText(items[i]["label"]) catch "") == "length") {
+            sawLength = true;
+            // The parameter has a name. A types.FuncType holds only types, so
+            // the name comes from src/builtins.nio's builtinParamNames.
+            test.expectString(json.asText(items[i]["detail"]) catch "", "int length(String s)");
+        }
+    }
+    test.assert(sawLength, "string.length should be offered");
+});
+
+test.start("lsp e2e: completion answers a record's fields", void () -> {
+    String dir = h.scratch();
+    String u = uriIn(dir, "main.nio");
+    String typing = SAMPLE + "print(c.";
+    h.Run r = converse([didOpen(u, SAMPLE), didChange(u, typing), completeAt(u, 9, 8)]);
+    Json? got = reply(replies(r.out), 51);
+    test.assert(got != null, "no completion reply");
+    if (got == null) {
+        return;
+    }
+    Json items = got["result"]["items"];
+    test.expectInt(json.length(items), 2);
+    test.expectString(json.asText(items[0]["label"]) catch "", "make");
+    test.expectString(json.asText(items[1]["label"]) catch "", "speed");
+});
+
+test.start("lsp e2e: a document with nothing to say answers an empty list", void () -> {
+    // The answer is not null. A client given null can fall back to guessing
+    // words from the buffer.
+    h.Run r = converse([completeAt("untitled:Untitled-1", 0, 0)]);
+    Json? got = reply(replies(r.out), 51);
+    test.assert(got != null, "no completion reply");
+    if (got != null) {
+        test.expectInt(json.length(got["result"]["items"]), 0);
+    }
+});
+
+test.start("lsp e2e: a jump answers where a name was declared", void () -> {
+    String dir = h.scratch();
+    String u = uriIn(dir, "main.nio");
+    // Line 8 character 0 is the `Car` of `Car c = { ... };`, declared on line 2.
+    h.Run r = converse([didOpen(u, SAMPLE), defineAt(u, 8, 0)]);
+    test.expectInt(r.code, 0);
+    Json? got = reply(replies(r.out), 52);
+    test.assert(got != null, "no definition reply");
+    if (got == null) {
+        return;
+    }
+    test.expectString(json.asText(got["result"]["uri"]) catch "", u);
+    test.expectInt(json.asInt(got["result"]["range"]["start"]["line"]) catch -1, 2);
+    // The range covers the name alone, which is what an editor highlights on
+    // arrival. `Car` begins at character 5 of `type Car {`.
+    test.expectInt(json.asInt(got["result"]["range"]["start"]["character"]) catch -1, 5);
+    test.expectInt(json.asInt(got["result"]["range"]["end"]["character"]) catch -1, 8);
+});
+
+test.start("lsp e2e: a jump into an imported file names that file", void () -> {
+    // The answer names a different URI from the one asked about, and the client
+    // must recognize it.
+    String dir = h.scratch();
+    String helper = path.join(dir, "helper.nio");
+    fs.writeFile(helper, string.toByteArray(`export int limit = 10;
+`)) catch e { };
+    String u = uriIn(dir, "main.nio");
+    String main = `import './helper' as hp;
+
+int n = hp.limit;
+`;
+    h.Run r = converse([didOpen(u, main), defineAt(u, 2, 11)]);
+    test.expectInt(r.code, 0);
+    Json? got = reply(replies(r.out), 52);
+    test.assert(got != null, "no definition reply");
+    if (got != null) {
+        test.expectString(json.asText(got["result"]["uri"]) catch "",
+            docuri.fromPath(helper));
+        test.expectInt(json.asInt(got["result"]["range"]["start"]["line"]) catch -1, 0);
+    }
+});
+
+test.start("lsp e2e: a jump from nothing answers null", void () -> {
+    String dir = h.scratch();
+    String u = uriIn(dir, "main.nio");
+    // The `=` again: a reply is owed even where there is nowhere to go.
+    h.Run r = converse([didOpen(u, SAMPLE), defineAt(u, 7, 10)]);
+    Json? got = reply(replies(r.out), 52);
+    test.assert(got != null, "no reply to a jump that found nothing");
+    if (got != null) {
+        test.assert(json.getType(got["result"]) == json.Type.NULL,
+            "expected a null result, got: " + json.toText(got["result"]));
+    }
+});
+
+test.start("lsp e2e: hover carries the prose above a declaration", void () -> {
+    String dir = h.scratch();
+    String u = uriIn(dir, "main.nio");
+    String doc = `// How many cars there are.
+int total = 0;
+`;
+    h.Run r = converse([didOpen(u, doc), hoverAt(u, 1, 4)]);
+    test.expectInt(r.code, 0);
+    Json? got = reply(replies(r.out), 50);
+    test.assert(got != null, "no hover reply");
+    if (got != null) {
+        String value = json.asText(got["result"]["contents"]["value"]) catch "";
+        test.assert(string.contains(value, "int total"),
+            "expected the declared type, got: " + value);
+        test.assert(string.contains(value, "How many cars there are."),
+            "expected the doc comment, got: " + value);
+    }
+});

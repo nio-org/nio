@@ -1,0 +1,18 @@
+// 100,000,000 iterations of a nested loop, from bddicken/languages. Measures
+// integer loop and modulo throughput; the array stops constant folding.
+int u = 10;
+int r = 5000;
+int[10000] a;
+int i = 0;
+
+while (i < 10000) {
+    int j = 0;
+    while (j < 10000) {
+        a[i] = a[i] + j % u;
+        j = j + 1;
+    }
+    a[i] = a[i] + r;
+    i = i + 1;
+}
+
+print(a[r]);

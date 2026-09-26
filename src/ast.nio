@@ -1,0 +1,1342 @@
+// The abstract syntax tree that the parser produces.
+//
+// Statement, Expression and TypeNode are sealed, so a new node type is a
+// compile error at each exhaustive type switch below. TypeNode carries no id,
+// because a type annotation is never a key in a side table.
+import 'token';
+import 'lib/quote';
+import 'string';
+import 'array';
+
+// Every declaration carries a `nameTok` beside its `String name`. `tok` gives
+// the start of the statement, and `nameTok` gives the position of the name.
+//
+// Every statement, expression, parameter and switch clause carries an id: a
+// number, unique across the compilation, that side tables key on, because a map
+// key must be a scalar (§6.7). Anything that builds a node must stamp one. Ids
+// start at 1, so 0 marks a node that nothing stamped. The counter crosses
+// modules, so the copies cloneMethod makes get identities of their own.
+int nodeIDs = 0;
+
+export int newID() {
+    nodeIDs++;
+    return nodeIDs;
+}
+
+// unionMark separates a union's name from a tag in the names the parser
+// generates: `union Text { String, byte[] Bytes }` becomes a sealed `Text`
+// that `Text$String` and `Text$Bytes` extend. Each holds its value in a field
+// named unionPayload. §1.3 keeps `$` out of every identifier, so a program can
+// name neither one. parser.nio writes the names, checker.nio reads them back,
+// and types.typeString writes them as `Union.Tag`.
+export String const unionMark = "$";
+export String const unionPayload = "$v";
+
+// templateAlias is the module alias an interpolated string's `${}` calls
+// `from` through: `\`n = ${n}\`` becomes `"n = " + $str.from(n)`. The checker
+// binds it to the built-in string module in every file, so a template needs
+// no import, and the mark keeps any program from naming or shadowing it.
+export String const templateAlias = "$str";
+
+export String unionArmName(String base, String tag) {
+    return base + unionMark + tag;
+}
+
+// ---- The three hierarchies ----
+
+export sealed type Statement {
+    int id;
+    token.Token tok;
+}
+
+export sealed type Expression {
+    int id;
+    token.Token tok;
+}
+
+// A written type annotation, such as int, Car, int[] or String?.
+export sealed type TypeNode {
+    token.Token tok;
+}
+
+export type Program {
+    ImportStatement[] imports;
+    Statement[] statements;
+    // Every comment in the file, in source order. A compile reads none of
+    // them; an editor shows them for a declaration.
+    token.Comment[] comments;
+    // How many `(` the file wrapped an expression in, by node id. A grouping
+    // paren has no effect on the compile, so the parser returns the inner
+    // expression and records the count here. The formatter writes the parens
+    // back from it, so it keeps the grouping of the file.
+    Map<int, int> parens;
+    // The root node of each interpolated string (§1.6), by id: the
+    // concatenation the parser desugared it into, or the single `$str.from`
+    // call when the string is only one `${}`. The formatter writes the
+    // template back from it. A compile does not read it.
+    Map<int, bool> templates;
+}
+
+export String programString(Program p) {
+    String[] parts = [];
+    forEach(p.imports, imp) {
+        array.push(parts, stmtString(imp));
+    }
+    forEach(p.statements, s) {
+        array.push(parts, stmtString(s));
+    }
+    return string.join(parts, "\n");
+}
+
+// ---- Type annotations ----
+
+// A plain type name such as int or Car, or one qualified by a module alias.
+export type NamedType extends TypeNode {
+    String module;    // import alias for a qualified name; "" if there is none
+    String name;
+    // The tag in `Union.Tag`, and "" for every other type. It is a third
+    // segment and not part of name: `alias.Union.Tag` names all three.
+    String member;
+}
+
+// T[], which grows, or T[N], which has a fixed size. size is null for T[].
+export type ArrayTypeNode extends TypeNode {
+    TypeNode elem;
+    IntLiteral? size;
+}
+
+export type OptionalTypeNode extends TypeNode {
+    TypeNode inner;
+}
+
+// A function type, such as `Function(int, string)<bool>`. return is null when
+// the program writes `<void>`. A `!` after the return type sets fallible
+// (§2.9). variadic marks a `...` on the last parameter type, which stays the
+// element type as it does in a declaration.
+export type FuncTypeNode extends TypeNode {
+    TypeNode[] params;
+    TypeNode? return;
+    bool fallible;
+    bool variadic;
+}
+
+// A future type, such as `Future<int>`. elem is null for `Future<void>`, and
+// `Future<int!>` sets fallible.
+export type FutureTypeNode extends TypeNode {
+    TypeNode? elem;
+    bool fallible;
+}
+
+// A map type, such as `Map<String, int>`. Neither parameter can be void.
+export type MapTypeNode extends TypeNode {
+    TypeNode key;
+    TypeNode value;
+}
+
+// A record type written in place as the type of a field, as in
+// `{ int amount; string? piece }[]? repairs`.
+export type RecordTypeNode extends TypeNode {
+    FieldDef[] fields;
+}
+
+export String typeNodeString(TypeNode t) {
+    switch (t) {
+        case NamedType n:
+            String tail = n.name;
+            if (n.member != "") {
+                tail = tail + "." + n.member;
+            }
+            if (n.module != "") {
+                return n.module + "." + tail;
+            }
+            return tail;
+        case ArrayTypeNode a:
+            IntLiteral? size = a.size;
+            if (size != null) {
+                return typeNodeString(a.elem) + "[" + string.from(size.value) + "]";
+            }
+            return typeNodeString(a.elem) + "[]";
+        case OptionalTypeNode o:
+            return typeNodeString(o.inner) + "?";
+        case FuncTypeNode f:
+            String[] params = [];
+            forEach(f.params, p, i) {
+                if (f.variadic && i == f.params.length - 1) {
+                    array.push(params, "..." + typeNodeString(p));
+                    continue;
+                }
+                array.push(params, typeNodeString(p));
+            }
+            String ret = "void";
+            TypeNode? rt = f.return;
+            if (rt != null) {
+                ret = typeNodeString(rt);
+            }
+            if (f.fallible) {
+                ret = ret + "!";
+            }
+            return "Function(" + string.join(params, ", ") + ")<" + ret + ">";
+        case FutureTypeNode fu:
+            String elem = "void";
+            TypeNode? et = fu.elem;
+            if (et != null) {
+                elem = typeNodeString(et);
+            }
+            if (fu.fallible) {
+                elem = elem + "!";
+            }
+            return "Future<" + elem + ">";
+        case MapTypeNode m:
+            return "Map<" + typeNodeString(m.key) + ", " + typeNodeString(m.value) + ">";
+        case RecordTypeNode r:
+            String[] fields = [];
+            forEach(r.fields, f2) {
+                array.push(fields, fieldDefString(f2));
+            }
+            return "{ " + string.join(fields, " ") + " }";
+    }
+}
+
+// ---- Statements ----
+
+// `import 'path' as alias;` at the top of a file.
+export type ImportStatement extends Statement {
+    String path;
+    String alias;    // a written alias, or one derived from the base of the path
+    token.Token pathTok;
+    // The line of aliasTok is 0 when the alias comes from the path, because
+    // the file holds no token for that name.
+    token.Token aliasTok;
+}
+
+// `native source 'path';` or `native flags os '-l...';` (§5.8). kind is
+// "source" or "flags". For flags, os is "darwin", "linux" or "windows", and ""
+// when they apply everywhere. A source has no os, because the file selects per
+// platform with the preprocessor.
+export type NativeStatement extends Statement {
+    String kind;
+    String os;
+    String value;
+    token.Token valueTok;
+}
+
+// `export alias;`, `export alias show A, B;` or `export alias hide A, B;`
+// (§5.4): this module republishes an imported module's surface as part of its
+// own. mode is "all", "show" or "hide"; names is read for the last two.
+//
+// It publishes names and brings none into scope, so a file that also uses the
+// module imports it in the ordinary way. The alias comes from an import, so a
+// re-export adds no dependency and can form no cycle.
+export type ReExportStatement extends Statement {
+    String alias;
+    token.Token aliasTok;
+    String mode;
+    String[] names;
+    token.Token[] nameToks;
+}
+
+// `int x = 5;`, `int x;`, or `int const x = 5;`.
+export type VarDeclStatement extends Statement {
+    TypeNode type;
+    String name;
+    token.Token nameTok;
+    Expression? value;    // null if the declaration omits it
+    bool exported;
+    bool const;
+}
+
+// One field in a type declaration. rename holds the `target:key` text of a
+// `'json:other_name'` annotation, unchanged, and "" when the field has none.
+// The checker splits and validates it.
+export type FieldDef {
+    String name;
+    token.Token nameTok;
+    TypeNode type;
+    String rename;
+    token.Token renameTok;
+}
+
+export String fieldDefString(FieldDef f) {
+    if (f.rename != "") {
+        return typeNodeString(f.type) + " " + f.name + " '" + f.rename + "';";
+    }
+    return typeNodeString(f.type) + " " + f.name + ";";
+}
+
+// `type Car { string make; ... }`. extends is null without an `extends Base`
+// clause. inherited holds copies of the base type's methods, which the checker
+// makes and re-checks with `self` typed as this record; the parser never fills
+// it, and stmtString does not write it.
+//
+// sealed holds the `sealed` modifier (§2.4): only the declaring module can
+// extend the type. The extenders are then assignable to it, and the checker
+// can test a switch over it for full coverage.
+export type TypeDeclStatement extends Statement {
+    String name;
+    token.Token nameTok;
+    NamedType? extends;
+    FieldDef[] fields;
+    FunctionDeclStatement[] methods;
+    FunctionDeclStatement[] inherited;
+    bool exported;
+    bool sealed;
+
+    // The inherited methods first, in the order of the base, then the ones
+    // written in this body. Every pass over a type's methods walks this list.
+    FunctionDeclStatement[] allMethods() {
+        if (self.inherited.length == 0) {
+            return self.methods;
+        }
+        FunctionDeclStatement[] out = [];
+        forEach(self.inherited, m) {
+            array.push(out, m);
+        }
+        forEach(self.methods, m) {
+            array.push(out, m);
+        }
+        return out;
+    }
+}
+
+export type EnumMemberDef {
+    token.Token tok;    // the member's name
+    String name;
+    int value;
+}
+
+// `enum HttpResponses { OK: 200, NOT_FOUND: 404 }`.
+export type EnumDeclStatement extends Statement {
+    String name;
+    token.Token nameTok;
+    EnumMemberDef[] members;
+    bool exported;
+}
+
+// One function parameter. variadic marks the `...String logs` form, which only
+// the last parameter can use: type stays the element type as written, and the
+// body sees an array of that type.
+export type Param {
+    int id;
+    token.Token tok;    // the type, where a parameter begins
+    TypeNode type;
+    String name;
+    token.Token nameTok;
+    bool variadic;
+}
+
+export String paramString(Param p) {
+    if (p.variadic) {
+        return "..." + typeNodeString(p.type) + " " + p.name;
+    }
+    return typeNodeString(p.type) + " " + p.name;
+}
+
+// Where an inherited method body comes from (§2.4). A copied body resolves its
+// free names in the module that wrote it, wherever the compiler emits the copy,
+// and the tokens of the body point into that declaration.
+export type Origin {
+    String type;    // the name of the base type, qualified if it is imported
+    String qual;    // the symbol prefix of that module ("" for the entry file)
+}
+
+// `int name(int a) { ... }`. returnType is null for a function that returns
+// nothing. async marks `int async name(...)`. A call to it returns a Future of
+// the declared type and does not run the body immediately.
+//
+// recv is the receiver of a method declared in a type body (§2.4): a generated
+// parameter named `self`, typed with the enclosing record, and null on a plain
+// function. from is set on each copy an extending type inherits, and names the
+// source of the body.
+export type FunctionDeclStatement extends Statement {
+    String name;
+    token.Token nameTok;
+    Param[] params;
+    TypeNode? returnType;
+    BlockStatement body;
+    bool exported;
+    bool async;
+    Param? recv;
+    bool override;
+    // The §2.12 contract: the body allocates nothing, so a call to it cannot
+    // start a collection.
+    bool noalloc;
+    // `extern int name(int a);` (§5.8): no body, and the name is the C symbol
+    // the program links against. body holds a generated empty block that
+    // nothing reads.
+    bool extern;
+    Origin? from;
+}
+
+// The target is an identifier, an index expression or a member expression.
+export type AssignStatement extends Statement {
+    Expression target;
+    Expression value;
+}
+
+export type ReturnStatement extends Statement {
+    Expression? value;    // null for a bare return
+}
+
+export type IfStatement extends Statement {
+    Expression cond;
+    BlockStatement then;
+    BlockStatement? else;    // null if absent; an else-if holds an IfStatement
+}
+
+// SwitchCase is one clause of a switch (§4.9). values holds every label the
+// clause answers to, because the parser has already folded the stacked form
+// into it: `case 1: case 2: body` arrives here as one clause with two values.
+// default marks the clause that runs when no label matched, and a clause can
+// have both.
+//
+// typeName and bind hold the `case IntLit n:` form, a clause that matches the
+// type of the subject and not its value. Only a sealed subject (§2.4) can have
+// such a clause. The two forms do not mix in one switch, so a clause with a
+// typeName has no values. The binding is required, which keeps `case Foo:`
+// unambiguously a value label.
+export type SwitchCase {
+    int id;
+    token.Token tok;    // the 'case' or 'default' that opens the clause or its stack
+    Expression[] values;
+    bool default;
+    BlockStatement body;
+    NamedType? typeName;
+    String bind;
+    token.Token bindTok;    // where the binding's name was written
+}
+
+// SwitchStatement is `switch (subject) { case v: ... default: ... }`. The
+// clauses are in source order, and a default clause is last.
+//
+// exhaustive marks a type switch that covers every type which extends its
+// sealed subject (§4.9). The checker sets it, and the parser never does. Such a
+// switch counts as terminating without a default clause, because the set of
+// types is closed and one clause always runs.
+export type SwitchStatement extends Statement {
+    Expression subject;
+    SwitchCase[] cases;
+    bool exhaustive;
+
+    // isTypeSwitch tells whether this switch matches the type of the subject
+    // and not its value (§4.9). The two label forms do not mix, so one clause
+    // with a type label decides this for the whole statement.
+    bool isTypeSwitch() {
+        return array.some(self.cases, bool (SwitchCase cl) -> cl.typeName != null);
+    }
+
+    bool hasDefault() {
+        return array.some(self.cases, bool (SwitchCase cl) -> cl.default);
+    }
+}
+
+// WhileStatement is `while (cond) { ... }`. tail runs at the end of each
+// iteration, before the next test of the condition, and `continue` jumps to
+// it, as to the post clause of a for loop. The parser never fills it. The await
+// normalizer fills it when it rewrites a loop with an await in its condition or
+// post clause, because those statements must run again on every path back to
+// the top.
+export type WhileStatement extends Statement {
+    Expression cond;
+    BlockStatement body;
+    Statement[] tail;
+}
+
+// ForStatement is `for (init; cond; post) { ... }`. init is a variable
+// declaration, an assignment, an increment, a decrement or an expression
+// statement. It is null when the clause is empty. post accepts the same
+// statements, but no declaration.
+export type ForStatement extends Statement {
+    Statement? init;
+    Expression cond;
+    Statement? post;
+    BlockStatement body;
+}
+
+// IncDecStatement is `target++;` or `target--;`. The target obeys the rules of
+// an assignment target, and the program evaluates it once.
+export type IncDecStatement extends Statement {
+    Expression target;
+    String op;    // "++" or "--"
+}
+
+// ForEachStatement is `forEach (array, elem) { ... }` or
+// `forEach (array, elem, index) { ... }`.
+export type ForEachStatement extends Statement {
+    Expression array;
+    token.Token elemTok;
+    String elemName;
+    token.Token indexTok;
+    String indexName;    // "" if the statement omits the index binding
+    BlockStatement body;
+}
+
+export type BreakStatement extends Statement { }
+
+export type ContinueStatement extends Statement { }
+
+// A `{ ... }` block. endLine is the line of the closing brace. With the line
+// of tok, it tells a block written on one line from a block written over
+// several. Only the formatter reads it. It is 0 on a block that the parser did
+// not read from a file.
+export type BlockStatement extends Statement {
+    Statement[] statements;
+    int endLine;
+}
+
+export type ExpressionStatement extends Statement {
+    Expression expression;
+}
+
+export String stmtString(Statement s) {
+    switch (s) {
+        case ImportStatement imp:
+            return "import '" + imp.path + "' as " + imp.alias + ";";
+        case NativeStatement na:
+            if (na.kind == "flags" && na.os != "") {
+                return "native flags " + na.os + " '" + na.value + "';";
+            }
+            return "native " + na.kind + " '" + na.value + "';";
+        case ReExportStatement re:
+            if (re.mode == "all") {
+                return "export " + re.alias + ";";
+            }
+            return "export " + re.alias + " " + re.mode + " "
+                + string.join(re.names, ", ") + ";";
+        case VarDeclStatement v:
+            String out = "";
+            if (v.exported) {
+                out = "export ";
+            }
+            String typ = typeNodeString(v.type);
+            if (v.const) {
+                typ = typ + " const";
+            }
+            Expression? val = v.value;
+            if (val == null) {
+                return out + typ + " " + v.name + ";";
+            }
+            return out + typ + " " + v.name + " = " + exprString(val) + ";";
+        case TypeDeclStatement td:
+            String[] members = [];
+            forEach(td.fields, f) {
+                array.push(members, fieldDefString(f));
+            }
+            forEach(td.methods, m) {
+                array.push(members, stmtString(m));
+            }
+            String prefix = "";
+            if (td.exported) {
+                prefix = "export ";
+            }
+            if (td.sealed) {
+                prefix = prefix + "sealed ";
+            }
+            String ext = "";
+            NamedType? base = td.extends;
+            if (base != null) {
+                ext = " extends " + typeNodeString(base);
+            }
+            return prefix + "type " + td.name + ext + " { " + string.join(members, " ") + " }";
+        case EnumDeclStatement en:
+            String[] ms = [];
+            forEach(en.members, m2) {
+                array.push(ms, m2.name + ": " + string.from(m2.value));
+            }
+            String pre = "";
+            if (en.exported) {
+                pre = "export ";
+            }
+            return pre + "enum " + en.name + " { " + string.join(ms, ", ") + " }";
+        case FunctionDeclStatement fd:
+            String[] ps = [];
+            forEach(fd.params, p) {
+                array.push(ps, paramString(p));
+            }
+            String ret = "void ";
+            TypeNode? rt = fd.returnType;
+            if (rt != null) {
+                ret = typeNodeString(rt) + " ";
+            }
+            String fpre = "";
+            if (fd.exported) {
+                fpre = "export ";
+            }
+            if (fd.override) {
+                ret = ret + "override ";
+            }
+            if (fd.async) {
+                ret = ret + "async ";
+            }
+            if (fd.extern) {
+                return "extern " + ret + fd.name + "(" + string.join(ps, ", ") + ");";
+            }
+            return fpre + ret + fd.name + "(" + string.join(ps, ", ") + ") " + stmtString(fd.body);
+        case AssignStatement a:
+            return exprString(a.target) + " = " + exprString(a.value) + ";";
+        case ReturnStatement r:
+            Expression? rv = r.value;
+            if (rv == null) {
+                return "return;";
+            }
+            return "return " + exprString(rv) + ";";
+        case IfStatement ifs:
+            String iout = "if (" + exprString(ifs.cond) + ") " + stmtString(ifs.then);
+            BlockStatement? els = ifs.else;
+            if (els != null) {
+                iout = iout + " else " + stmtString(els);
+            }
+            return iout;
+        case SwitchStatement sw:
+            String[] parts = [];
+            forEach(sw.cases, cl) {
+                NamedType? tn = cl.typeName;
+                if (tn != null) {
+                    array.push(parts, "case " + typeNodeString(tn) + " " + cl.bind + ":");
+                }
+                forEach(cl.values, v2) {
+                    array.push(parts, "case " + exprString(v2) + ":");
+                }
+                if (cl.default) {
+                    array.push(parts, "default:");
+                }
+                array.push(parts, stmtString(cl.body));
+            }
+            return "switch (" + exprString(sw.subject) + ") { " + string.join(parts, " ") + " }";
+        case WhileStatement w:
+            String wout = "while (" + exprString(w.cond) + ") " + stmtString(w.body);
+            if (w.tail.length > 0) {
+                String[] tparts = [];
+                forEach(w.tail, ts) {
+                    array.push(tparts, stmtString(ts));
+                }
+                wout = wout + " tail { " + string.join(tparts, " ") + " }";
+            }
+            return wout;
+        case ForStatement fo:
+            String finit = "";
+            Statement? init = fo.init;
+            if (init != null) {
+                finit = trimSemi(stmtString(init));
+            }
+            String fpost = "";
+            Statement? post = fo.post;
+            if (post != null) {
+                fpost = trimSemi(stmtString(post));
+            }
+            return "for (" + finit + "; " + exprString(fo.cond) + "; " + fpost + ") " + stmtString(fo.body);
+        case IncDecStatement inc:
+            return exprString(inc.target) + inc.op + ";";
+        case ForEachStatement fe:
+            if (fe.indexName == "") {
+                return "forEach (" + exprString(fe.array) + ", " + fe.elemName + ") " + stmtString(fe.body);
+            }
+            return "forEach (" + exprString(fe.array) + ", " + fe.elemName + ", " + fe.indexName + ") " + stmtString(fe.body);
+        case BreakStatement br:
+            return "break;";
+        case ContinueStatement co:
+            return "continue;";
+        case BlockStatement b:
+            String[] bparts = [];
+            forEach(b.statements, st) {
+                array.push(bparts, stmtString(st));
+            }
+            return "{ " + string.join(bparts, " ") + " }";
+        case ExpressionStatement es:
+            return exprString(es.expression) + ";";
+    }
+}
+
+// Removes the final ";" from the init and post clauses of a for header.
+String trimSemi(String s) {
+    int n = string.length(s);
+    if (n > 0 && string.substring(s, n - 1, n) == ";") {
+        return string.substring(s, 0, n - 1);
+    }
+    return s;
+}
+
+// ---- Expressions ----
+
+export type Identifier extends Expression {
+    String name;
+}
+
+export type IntLiteral extends Expression {
+    int value;
+}
+
+export type FloatLiteral extends Expression {
+    float value;
+}
+
+export type StringLiteral extends Expression {
+    String value;
+}
+
+export type BoolLiteral extends Expression {
+    bool value;
+}
+
+export type NullLiteral extends Expression { }
+
+// endLine is the line of the closing bracket. With the line of tok, it tells
+// a literal written on one line from one written over several lines. Only the
+// formatter reads it.
+export type ArrayLiteral extends Expression {
+    Expression[] elements;
+    int endLine;
+}
+
+export type RecordField {
+    String name;
+    Expression value;
+}
+
+// RecordLiteral is `{ make: "toyota", age: 4 }`.
+export type RecordLiteral extends Expression {
+    RecordField[] fields;
+    int endLine;
+}
+
+// MapEntry is one `key: value` entry in a map literal. The key is always a
+// constant: a string literal, or a number literal that can carry a minus sign.
+export type MapEntry {
+    Expression key;
+    Expression value;
+}
+
+// MapLiteral is `{ "alice": 31, "bob": 27 }`. The first key tells it apart from
+// a record literal, because it is a constant and not a bare identifier. The
+// empty literal `{}` parses as a record literal, and the checker reads it as a
+// map where a map type is expected.
+export type MapLiteral extends Expression {
+    MapEntry[] entries;
+    int endLine;
+}
+
+// FuncLit is a function value, such as `int (int b) -> a + b`. The return type
+// comes first and is necessary. A function that returns nothing writes `void`,
+// and returnType is null there. One of exprBody and blockBody is set, and never
+// both.
+export type FuncLit extends Expression {
+    TypeNode? returnType;
+    Param[] params;
+    Expression? exprBody;
+    BlockStatement? blockBody;
+}
+
+export type AwaitExpr extends Expression {
+    Expression value;
+}
+
+// CatchExpr handles an error raised at any point while the program evaluates
+// value (§2.9). `f() catch "fallback"` gives a replacement value in default,
+// and `f() catch e { ... }` binds the Error to name and runs body. One of
+// default and body is set, and never both.
+export type CatchExpr extends Expression {
+    Expression value;
+    String name;            // block form: the name that the Error binds to
+    token.Token nameTok;    // block form: the position of that name
+    BlockStatement? body;
+    Expression? default;
+}
+
+// PrefixExpression is `-x` or `!x`.
+export type PrefixExpression extends Expression {
+    String operator;
+    Expression right;
+}
+
+export type InfixExpression extends Expression {
+    Expression left;
+    String operator;
+    Expression right;
+}
+
+export type IndexExpression extends Expression {
+    Expression left;
+    Expression index;
+}
+
+// AsExpression is `expr as Type`. The `strict` modifier (§6.3) sets strict: at
+// any depth, the document must carry no key that the target type does not
+// declare. It is a property of the read and not of the type, because a program
+// reads the same type strictly from a file it owns and leniently from an API.
+export type AsExpression extends Expression {
+    Expression value;
+    TypeNode type;
+    bool strict;
+}
+
+export type MemberExpression extends Expression {
+    Expression object;
+    String property;
+    bool optional;    // written '?.', so a null object gives null
+}
+
+export type CallExpression extends Expression {
+    Expression callee;
+    Expression[] args;
+}
+
+export String exprString(Expression e) {
+    switch (e) {
+        case Identifier id:
+            return id.name;
+        case IntLiteral il:
+            return il.tok.literal;
+        case FloatLiteral fl:
+            return fl.tok.literal;
+        case StringLiteral sl:
+            return quote.quote(sl.value);
+        case BoolLiteral bl:
+            return bl.tok.literal;
+        case NullLiteral nl:
+            return "null";
+        case ArrayLiteral al:
+            String[] parts = [];
+            forEach(al.elements, el) {
+                array.push(parts, exprString(el));
+            }
+            return "[" + string.join(parts, ", ") + "]";
+        case RecordLiteral rl:
+            String[] rparts = [];
+            forEach(rl.fields, f) {
+                array.push(rparts, f.name + ": " + exprString(f.value));
+            }
+            return "{ " + string.join(rparts, ", ") + " }";
+        case MapLiteral ml:
+            String[] mparts = [];
+            forEach(ml.entries, en) {
+                array.push(mparts, exprString(en.key) + ": " + exprString(en.value));
+            }
+            return "{ " + string.join(mparts, ", ") + " }";
+        case FuncLit fn:
+            String[] ps = [];
+            forEach(fn.params, p) {
+                array.push(ps, paramString(p));
+            }
+            String ret = "void ";
+            TypeNode? rt = fn.returnType;
+            if (rt != null) {
+                ret = typeNodeString(rt) + " ";
+            }
+            String body = "";
+            Expression? eb = fn.exprBody;
+            BlockStatement? bb = fn.blockBody;
+            if (eb != null) {
+                body = exprString(eb);
+            } else if (bb != null) {
+                body = stmtString(bb);
+            }
+            return ret + "(" + string.join(ps, ", ") + ") -> " + body;
+        case AwaitExpr aw:
+            return "(await " + exprString(aw.value) + ")";
+        case CatchExpr ce:
+            BlockStatement? cb = ce.body;
+            if (cb != null) {
+                return "(" + exprString(ce.value) + " catch " + ce.name + " " + stmtString(cb) + ")";
+            }
+            Expression? cd = ce.default;
+            if (cd != null) {
+                return "(" + exprString(ce.value) + " catch " + exprString(cd) + ")";
+            }
+            return "(" + exprString(ce.value) + " catch )";
+        case PrefixExpression pe:
+            return "(" + pe.operator + exprString(pe.right) + ")";
+        case InfixExpression ie:
+            return "(" + exprString(ie.left) + " " + ie.operator + " " + exprString(ie.right) + ")";
+        case IndexExpression ix:
+            return "(" + exprString(ix.left) + "[" + exprString(ix.index) + "])";
+        case AsExpression ae:
+            return "(" + exprString(ae.value) + " as " + typeNodeString(ae.type) + ")";
+        case MemberExpression me:
+            String op = ".";
+            if (me.optional) {
+                op = "?.";
+            }
+            return "(" + exprString(me.object) + op + me.property + ")";
+        case CallExpression call:
+            String[] cparts = [];
+            forEach(call.args, a) {
+                array.push(cparts, exprString(a));
+            }
+            return exprString(call.callee) + "(" + string.join(cparts, ", ") + ")";
+    }
+}
+
+// ---- catch blocks ----
+
+// catchBlocks returns the handler block of every catch expression in
+// statement s itself. It does not enter nested statements, because the walkers
+// that call it recurse into those on their own.
+//
+// A catch block is a statement list that hangs off an expression, so a walk
+// that follows only statements does not see it. Code that asks whether a
+// statement holds a break, a continue or an assignment to a name must look
+// here too.
+export BlockStatement[] catchBlocks(Statement s) {
+    BlockStatement[] out = [];
+    switch (s) {
+        case VarDeclStatement v:
+            catchBlocksInOpt(v.value, out);
+        case AssignStatement a:
+            catchBlocksIn(a.target, out);
+            catchBlocksIn(a.value, out);
+        case ExpressionStatement es:
+            catchBlocksIn(es.expression, out);
+        case ReturnStatement r:
+            catchBlocksInOpt(r.value, out);
+        case IfStatement ifs:
+            catchBlocksIn(ifs.cond, out);
+        case SwitchStatement sw:
+            // The subject only. A case label is a constant (§4.9), so
+            // nothing in a label can raise.
+            catchBlocksIn(sw.subject, out);
+        case WhileStatement w:
+            catchBlocksIn(w.cond, out);
+        case ForStatement fo:
+            catchBlocksIn(fo.cond, out);
+        case IncDecStatement inc:
+            catchBlocksIn(inc.target, out);
+        case ForEachStatement fe:
+            catchBlocksIn(fe.array, out);
+        default:
+            // A declaration, a break, a continue and a block hold no
+            // expression.
+            return out;
+    }
+    return out;
+}
+
+void catchBlocksInOpt(Expression? e, BlockStatement[] out) {
+    if (e != null) {
+        catchBlocksIn(e, out);
+    }
+}
+
+void catchBlocksIn(Expression e, BlockStatement[] out) {
+    switch (e) {
+        case CatchExpr ce:
+            catchBlocksIn(ce.value, out);
+            catchBlocksInOpt(ce.default, out);
+            BlockStatement? body = ce.body;
+            if (body != null) {
+                array.push(out, body);
+            }
+        case PrefixExpression pe:
+            catchBlocksIn(pe.right, out);
+        case InfixExpression ie:
+            catchBlocksIn(ie.left, out);
+            catchBlocksIn(ie.right, out);
+        case IndexExpression ix:
+            catchBlocksIn(ix.left, out);
+            catchBlocksIn(ix.index, out);
+        case MemberExpression me:
+            catchBlocksIn(me.object, out);
+        case CallExpression call:
+            catchBlocksIn(call.callee, out);
+            forEach(call.args, a) {
+                catchBlocksIn(a, out);
+            }
+        case AwaitExpr aw:
+            catchBlocksIn(aw.value, out);
+        case AsExpression ae:
+            catchBlocksIn(ae.value, out);
+        case ArrayLiteral al:
+            forEach(al.elements, el) {
+                catchBlocksIn(el, out);
+            }
+        case RecordLiteral rl:
+            forEach(rl.fields, f) {
+                catchBlocksIn(f.value, out);
+            }
+        case MapLiteral ml:
+            forEach(ml.entries, en) {
+                catchBlocksIn(en.key, out);
+                catchBlocksIn(en.value, out);
+            }
+        default:
+            // The leaf nodes, and function literals. The body of a function
+            // literal runs at call time, so a control-flow walk must not enter
+            // it.
+            return;
+    }
+}
+
+// ---- cloning ----
+
+// cloneMethod copies a method declaration in full, so the copy shares no node
+// with the original. It serves `extends` (§2.4): an extending type gets the
+// methods of the base as methods of its own, checked and compiled again with
+// `self` typed as the extending record. The nodes cannot be shared, because
+// the checker keys each fact by node identity, and one node cannot hold two
+// answers.
+//
+// owner is the name of the extending type. The receiver of the copy takes this
+// type. from passes unchanged along a chain of extending types, so a copy of
+// a copy still names the file that holds the code.
+export FunctionDeclStatement cloneMethod(FunctionDeclStatement fd, String owner, Origin from) {
+    Origin src = from;
+    Origin? already = fd.from;
+    if (already != null) {
+        src = already;
+    }
+    Origin kept = { type: src.type, qual: src.qual };
+    FunctionDeclStatement out = {
+        id: newID(),
+        tok: fd.tok,
+        name: fd.name,
+        nameTok: fd.nameTok,
+        params: cloneParams(fd.params),
+        returnType: cloneTypeOpt(fd.returnType),
+        body: cloneBlock(fd.body),
+        exported: fd.exported,
+        async: fd.async,
+        recv: null,
+        override: fd.override,
+        noalloc: fd.noalloc,
+        extern: fd.extern,
+        from: kept,
+    };
+    Param? recv = fd.recv;
+    if (recv != null) {
+        token.Token rtok = recv.tok;
+        NamedType ownerType = { tok: rtok, module: "", name: owner, member: "" };
+        Param newRecv = {
+            id: newID(), tok: rtok, type: ownerType, name: recv.name,
+            nameTok: recv.nameTok, variadic: false,
+        };
+        out.recv = newRecv;
+    }
+    return out;
+}
+
+Param[] cloneParams(Param[] ps) {
+    Param[] out = [];
+    forEach(ps, p) {
+        Param np = {
+            id: newID(), tok: p.tok, type: cloneType(p.type), name: p.name,
+            nameTok: p.nameTok, variadic: p.variadic,
+        };
+        array.push(out, np);
+    }
+    return out;
+}
+
+BlockStatement cloneBlock(BlockStatement b) {
+    BlockStatement out = { id: newID(), tok: b.tok, statements: cloneStatements(b.statements), endLine: b.endLine };
+    return out;
+}
+
+BlockStatement? cloneBlockOpt(BlockStatement? b) {
+    if (b == null) {
+        return null;
+    }
+    return cloneBlock(b);
+}
+
+Statement[] cloneStatements(Statement[] ss) {
+    Statement[] out = [];
+    forEach(ss, s) {
+        array.push(out, cloneStatement(s));
+    }
+    return out;
+}
+
+Statement? cloneStatementOpt(Statement? s) {
+    if (s == null) {
+        return null;
+    }
+    return cloneStatement(s);
+}
+
+Statement cloneStatement(Statement s) {
+    switch (s) {
+        case VarDeclStatement v:
+            VarDeclStatement nv = {
+                id: newID(), tok: v.tok, type: cloneType(v.type), name: v.name,
+                nameTok: v.nameTok, value: cloneExprOpt(v.value), exported: v.exported,
+                const: v.const,
+            };
+            return nv;
+        case AssignStatement a:
+            AssignStatement na = { id: newID(), tok: a.tok, target: cloneExpr(a.target), value: cloneExpr(a.value) };
+            return na;
+        case ReturnStatement r:
+            ReturnStatement nr = { id: newID(), tok: r.tok, value: cloneExprOpt(r.value) };
+            return nr;
+        case IfStatement ifs:
+            IfStatement ni = {
+                id: newID(), tok: ifs.tok, cond: cloneExpr(ifs.cond),
+                then: cloneBlock(ifs.then), else: cloneBlockOpt(ifs.else),
+            };
+            return ni;
+        case SwitchStatement sw:
+            SwitchCase[] cases = [];
+            forEach(sw.cases, cl) {
+                // The label and the name it binds are part of the clause.
+                // Without them, `case Circle c:` in an inherited body becomes a
+                // value label over an undefined `c` (§4.9).
+                NamedType? label = null;
+                NamedType? had = cl.typeName;
+                if (had != null) {
+                    NamedType copy = { tok: had.tok, module: had.module, name: had.name, member: had.member };
+                    label = copy;
+                }
+                SwitchCase nc = {
+                    id: newID(), tok: cl.tok, values: cloneExprs(cl.values),
+                    default: cl.default, body: cloneBlock(cl.body),
+                    typeName: label, bind: cl.bind, bindTok: cl.bindTok,
+                };
+                array.push(cases, nc);
+            }
+            SwitchStatement ns = { id: newID(), tok: sw.tok, subject: cloneExpr(sw.subject), cases: cases, exhaustive: false };
+            return ns;
+        case WhileStatement w:
+            WhileStatement nw = {
+                id: newID(), tok: w.tok, cond: cloneExpr(w.cond),
+                body: cloneBlock(w.body), tail: cloneStatements(w.tail),
+            };
+            return nw;
+        case ForStatement fo:
+            ForStatement nf = {
+                id: newID(), tok: fo.tok, init: cloneStatementOpt(fo.init), cond: cloneExpr(fo.cond),
+                post: cloneStatementOpt(fo.post), body: cloneBlock(fo.body),
+            };
+            return nf;
+        case IncDecStatement inc:
+            IncDecStatement nid = { id: newID(), tok: inc.tok, target: cloneExpr(inc.target), op: inc.op };
+            return nid;
+        case ForEachStatement fe:
+            ForEachStatement nfe = {
+                id: newID(), tok: fe.tok, array: cloneExpr(fe.array),
+                elemTok: fe.elemTok, elemName: fe.elemName,
+                indexTok: fe.indexTok, indexName: fe.indexName, body: cloneBlock(fe.body),
+            };
+            return nfe;
+        case BreakStatement br:
+            BreakStatement nb = { id: newID(), tok: br.tok };
+            return nb;
+        case ContinueStatement co:
+            ContinueStatement nco = { id: newID(), tok: co.tok };
+            return nco;
+        case BlockStatement b:
+            return cloneBlock(b);
+        case ExpressionStatement es:
+            ExpressionStatement nes = { id: newID(), tok: es.tok, expression: cloneExpr(es.expression) };
+            return nes;
+        case FunctionDeclStatement fd:
+            // Reachable only if the language permits nested declarations.
+            Origin none = { type: "", qual: "" };
+            return cloneMethod(fd, recvOwner(fd), none);
+        case ImportStatement imp:
+            ImportStatement nim = {
+                id: newID(), tok: imp.tok, path: imp.path, alias: imp.alias,
+                pathTok: imp.pathTok, aliasTok: imp.aliasTok,
+            };
+            return nim;
+        case NativeStatement na:
+            NativeStatement nna = {
+                id: newID(), tok: na.tok, kind: na.kind, os: na.os,
+                value: na.value, valueTok: na.valueTok,
+            };
+            return nna;
+        case ReExportStatement re:
+            // A re-export is top-level, so it never occurs in a method body,
+            // and this function clones only method bodies. The clause keeps
+            // the switch exhaustive, and it copies the lists so that the
+            // clone shares none.
+            String[] names = [];
+            forEach(re.names, n) {
+                array.push(names, n);
+            }
+            token.Token[] nameToks = [];
+            forEach(re.nameToks, t) {
+                array.push(nameToks, t);
+            }
+            ReExportStatement nre = {
+                id: newID(), tok: re.tok, alias: re.alias, aliasTok: re.aliasTok,
+                mode: re.mode, names: names, nameToks: nameToks,
+            };
+            return nre;
+        case TypeDeclStatement td:
+            // A type or enum declaration never occurs in a method body, and
+            // this function clones only method bodies. The clause keeps the
+            // switch exhaustive.
+            TypeDeclStatement ntd = {
+                id: newID(), tok: td.tok, name: td.name, nameTok: td.nameTok, extends: td.extends,
+                fields: td.fields, methods: td.methods, inherited: td.inherited,
+                exported: td.exported, sealed: td.sealed,
+            };
+            return ntd;
+        case EnumDeclStatement en:
+            EnumDeclStatement nen = {
+                id: newID(), tok: en.tok, name: en.name, nameTok: en.nameTok,
+                members: en.members, exported: en.exported,
+            };
+            return nen;
+    }
+}
+
+// recvOwner returns the type name on the receiver of a method.
+String recvOwner(FunctionDeclStatement fd) {
+    Param? recv = fd.recv;
+    if (recv == null) {
+        return "";
+    }
+    NamedType? nt = recv.type as NamedType;
+    if (nt == null) {
+        return "";
+    }
+    return nt.name;
+}
+
+Expression? cloneExprOpt(Expression? e) {
+    if (e == null) {
+        return null;
+    }
+    return cloneExpr(e);
+}
+
+Expression cloneExpr(Expression e) {
+    switch (e) {
+        case Identifier id:
+            Identifier nid = { id: newID(), tok: id.tok, name: id.name };
+            return nid;
+        case IntLiteral il:
+            IntLiteral nil2 = { id: newID(), tok: il.tok, value: il.value };
+            return nil2;
+        case FloatLiteral fl:
+            FloatLiteral nfl = { id: newID(), tok: fl.tok, value: fl.value };
+            return nfl;
+        case StringLiteral sl:
+            StringLiteral nsl = { id: newID(), tok: sl.tok, value: sl.value };
+            return nsl;
+        case BoolLiteral bl:
+            BoolLiteral nbl = { id: newID(), tok: bl.tok, value: bl.value };
+            return nbl;
+        case NullLiteral nl:
+            NullLiteral nnl = { id: newID(), tok: nl.tok };
+            return nnl;
+        case ArrayLiteral al:
+            ArrayLiteral nal = { id: newID(), tok: al.tok, elements: cloneExprs(al.elements), endLine: al.endLine };
+            return nal;
+        case RecordLiteral rl:
+            RecordField[] fields = [];
+            forEach(rl.fields, f) {
+                RecordField nf = { name: f.name, value: cloneExpr(f.value) };
+                array.push(fields, nf);
+            }
+            RecordLiteral nrl = { id: newID(), tok: rl.tok, fields: fields, endLine: rl.endLine };
+            return nrl;
+        case MapLiteral ml:
+            MapEntry[] entries = [];
+            forEach(ml.entries, en) {
+                MapEntry ne = { key: cloneExpr(en.key), value: cloneExpr(en.value) };
+                array.push(entries, ne);
+            }
+            MapLiteral nml = { id: newID(), tok: ml.tok, entries: entries, endLine: ml.endLine };
+            return nml;
+        case FuncLit fn:
+            FuncLit nfn = {
+                id: newID(), tok: fn.tok, returnType: cloneTypeOpt(fn.returnType), params: cloneParams(fn.params),
+                exprBody: cloneExprOpt(fn.exprBody), blockBody: cloneBlockOpt(fn.blockBody),
+            };
+            return nfn;
+        case AwaitExpr aw:
+            AwaitExpr naw = { id: newID(), tok: aw.tok, value: cloneExpr(aw.value) };
+            return naw;
+        case CatchExpr ce:
+            CatchExpr nce = {
+                id: newID(), tok: ce.tok, value: cloneExpr(ce.value), name: ce.name, nameTok: ce.nameTok,
+                body: cloneBlockOpt(ce.body), default: cloneExprOpt(ce.default),
+            };
+            return nce;
+        case PrefixExpression pe:
+            PrefixExpression npe = { id: newID(), tok: pe.tok, operator: pe.operator, right: cloneExpr(pe.right) };
+            return npe;
+        case InfixExpression ie:
+            InfixExpression nie = {
+                id: newID(), tok: ie.tok, left: cloneExpr(ie.left),
+                operator: ie.operator, right: cloneExpr(ie.right),
+            };
+            return nie;
+        case IndexExpression ix:
+            IndexExpression nix = { id: newID(), tok: ix.tok, left: cloneExpr(ix.left), index: cloneExpr(ix.index) };
+            return nix;
+        case AsExpression ae:
+            AsExpression nae = { id: newID(), tok: ae.tok, value: cloneExpr(ae.value), type: cloneType(ae.type), strict: ae.strict };
+            return nae;
+        case MemberExpression me:
+            MemberExpression nme = {
+                id: newID(), tok: me.tok, object: cloneExpr(me.object),
+                property: me.property, optional: me.optional,
+            };
+            return nme;
+        case CallExpression call:
+            CallExpression ncall = { id: newID(), tok: call.tok, callee: cloneExpr(call.callee), args: cloneExprs(call.args) };
+            return ncall;
+    }
+}
+
+Expression[] cloneExprs(Expression[] es) {
+    Expression[] out = [];
+    forEach(es, e) {
+        array.push(out, cloneExpr(e));
+    }
+    return out;
+}
+
+TypeNode? cloneTypeOpt(TypeNode? tn) {
+    if (tn == null) {
+        return null;
+    }
+    return cloneType(tn);
+}
+
+TypeNode cloneType(TypeNode tn) {
+    switch (tn) {
+        case NamedType n:
+            NamedType nn = { tok: n.tok, module: n.module, name: n.name, member: n.member };
+            return nn;
+        case ArrayTypeNode a:
+            ArrayTypeNode na = { tok: a.tok, elem: cloneType(a.elem), size: null };
+            IntLiteral? size = a.size;
+            if (size != null) {
+                IntLiteral nsize = { id: newID(), tok: size.tok, value: size.value };
+                na.size = nsize;
+            }
+            return na;
+        case OptionalTypeNode o:
+            OptionalTypeNode no = { tok: o.tok, inner: cloneType(o.inner) };
+            return no;
+        case FuncTypeNode f:
+            TypeNode[] params = [];
+            forEach(f.params, p) {
+                array.push(params, cloneType(p));
+            }
+            FuncTypeNode nf = {
+                tok: f.tok, params: params, return: cloneTypeOpt(f.return),
+                fallible: f.fallible, variadic: f.variadic,
+            };
+            return nf;
+        case FutureTypeNode fu:
+            FutureTypeNode nfu = { tok: fu.tok, elem: cloneTypeOpt(fu.elem), fallible: fu.fallible };
+            return nfu;
+        case MapTypeNode m:
+            MapTypeNode nm = { tok: m.tok, key: cloneType(m.key), value: cloneType(m.value) };
+            return nm;
+        case RecordTypeNode r:
+            FieldDef[] fields = [];
+            forEach(r.fields, f2) {
+                FieldDef nf2 = {
+                    name: f2.name, nameTok: f2.nameTok, type: cloneType(f2.type),
+                    rename: f2.rename, renameTok: f2.renameTok,
+                };
+                array.push(fields, nf2);
+            }
+            RecordTypeNode nr = { tok: r.tok, fields: fields };
+            return nr;
+    }
+}

@@ -1,0 +1,1355 @@
+// The formatter (§3.2). It has one canonical style and no configuration.
+//
+// It writes the tree back with the tokens of the file. The parser keeps two
+// facts that a printed tree otherwise loses: which expressions the file put in
+// grouping parens, and which of the three delimiters each string used. Thus
+// formatting changes only whitespace. tests/format_test.nio checks this.
+//
+// The file decides where a construct breaks over lines: an element that began
+// a new line begins one here too. The formatter decides the indent, the space
+// around each token, the number of blank lines between two statements, and the
+// position of each comment.
+import 'ast';
+import 'token';
+import 'string';
+import 'array';
+import 'map';
+
+// The number of spaces between a trailing `//` comment and its code, or the
+// longest line of the run of lines that it is aligned with.
+int const GAP = 4;
+
+export String format(ast.Program prog) {
+    Printer p = {
+        out: [], trail: [], piece: [], indent: 0, lineIndent: 0, open: false,
+        cs: prog.comments, ci: 0, parens: prog.parens, srcLine: 0, curLine: 0,
+        templates: prog.templates,
+    };
+    p.program(prog);
+    return p.finish();
+}
+
+String pad(int n) {
+    String s = "";
+    int i = 0;
+    while (i < n) {
+        s = s + " ";
+        i++;
+    }
+    return s;
+}
+
+String indentOf(String line) {
+    int i = 0;
+    int n = string.length(line);
+    while (i < n && string.substring(line, i, i + 1) == " ") {
+        i++;
+    }
+    return string.substring(line, 0, i);
+}
+
+byte[] const HEX = string.toByteArray("0123456789abcdef");
+
+// Writes a string as the file wrote it: the same delimiter, with an escape only
+// for the delimiter, a backslash, a newline, a return, a tab or a NUL. Other
+// bytes are copied, so text outside ASCII does not change.
+String quoted(String v, String delim) {
+    String d = delim;
+    if (d == "") {
+        d = "\"";
+    }
+    byte[] mark = string.toByteArray(d);
+    byte dq = mark[0];
+    byte[] src = string.toByteArray(v);
+    byte[] out = [];
+    forEach(src, b, i) {
+        if (b == 92) {
+            array.push(out, 92);
+            array.push(out, 92);
+        } else if (b == dq) {
+            array.push(out, 92);
+            array.push(out, b);
+        } else if (b == 36 && d == "`" && i + 1 < src.length && src[i + 1] == 123) {
+            // `${` would open a hole (§1.6), so the `$` is escaped.
+            array.push(out, 92);
+            array.push(out, 36);
+        } else if (b == 10 && d != "`") {
+            array.push(out, 92);
+            array.push(out, 110);
+        } else if (b == 10) {
+            // A backtick string carries its newlines (§1.6).
+            array.push(out, b);
+        } else if (b == 13) {
+            array.push(out, 92);
+            array.push(out, 114);
+        } else if (b == 9) {
+            array.push(out, 92);
+            array.push(out, 116);
+        } else if (b == 0) {
+            array.push(out, 92);
+            array.push(out, 48);
+        } else if (b < 32 || b == 127) {
+            // Any other control byte is written as \xNN, so a file never
+            // contains one raw.
+            array.push(out, 92);
+            array.push(out, 120);
+            array.push(out, HEX[b / 16]);
+            array.push(out, HEX[b % 16]);
+        } else {
+            array.push(out, b);
+        }
+    }
+    return d + string.fromByteArray(out) + d;
+}
+
+// The line on which an expression begins. A node's own token is its operator
+// or its keyword, so the leftmost operand gives the line.
+int startLine(ast.Expression e) {
+    switch (e) {
+        case ast.InfixExpression ie:
+            return startLine(ie.left);
+        case ast.IndexExpression ix:
+            return startLine(ix.left);
+        case ast.MemberExpression me:
+            return startLine(me.object);
+        case ast.CallExpression c:
+            return startLine(c.callee);
+        case ast.AsExpression a:
+            return startLine(a.value);
+        case ast.CatchExpr ce:
+            return startLine(ce.value);
+        default:
+            return e.tok.line;
+    }
+}
+
+// The base that a `union` produces (§2.11). The parser makes a sealed type
+// with an empty body whose token is the contextual word `union`, followed by
+// one extender per member. The formatter joins the group back into the
+// declaration of the file, because the generated names contain a `$` that no
+// file can write.
+ast.TypeDeclStatement? unionBase(ast.Statement s) {
+    ast.TypeDeclStatement? td = s as ast.TypeDeclStatement;
+    if (td == null) {
+        return null;
+    }
+    if (!td.sealed || td.tok.literal != "union") {
+        return null;
+    }
+    return td;
+}
+
+ast.TypeDeclStatement? unionArm(ast.Statement s, String base) {
+    ast.TypeDeclStatement? td = s as ast.TypeDeclStatement;
+    if (td == null) {
+        return null;
+    }
+    String want = base + ast.unionMark;
+    if (string.length(td.name) <= string.length(want)) {
+        return null;
+    }
+    if (string.substring(td.name, 0, string.length(want)) != want) {
+        return null;
+    }
+    return td;
+}
+
+// The tag of a union member: the part of the generated name after the mark.
+String armTag(ast.TypeDeclStatement arm, String base) {
+    return string.substring(arm.name, string.length(base) + 1, string.length(arm.name));
+}
+
+type Printer {
+    String[] out;      // finished lines, code only
+    String[] trail;    // the comment each finished line carries, or ""
+    String[] piece;    // the line being built
+    int indent;        // indent level for the next line to open
+    int lineIndent;    // indent level of the line being built
+    bool open;
+    token.Comment[] cs;
+    int ci;    // the next comment that is not yet written
+    Map<int, int> parens;
+    Map<int, bool> templates;
+    int srcLine;    // the greatest source line already written
+    int curLine;    // the greatest source line on the line being built
+
+    // ---- the page ----
+
+    void w(String s) {
+        if (!self.open) {
+            self.open = true;
+            self.piece = [];
+            self.lineIndent = self.indent;
+        }
+        array.push(self.piece, s);
+    }
+
+    // Records that the line being built covers source line n. Break decisions
+    // and trailing comments use it.
+    void mark(int n) {
+        if (n > self.curLine) {
+            self.curLine = n;
+        }
+        if (n > self.srcLine) {
+            self.srcLine = n;
+        }
+    }
+
+    // True when the file put this element on a later line than all that is
+    // written on the line being built.
+    bool broke(int n) {
+        return self.curLine > 0 && n > self.curLine;
+    }
+
+    // Opens a construct whose continuation lines are one level in from the
+    // line where it starts. Returns the indent to restore at its end. It reads
+    // the line, not the indent, so a block inside a broken argument list
+    // aligns with the statement and not with the argument.
+    int push() {
+        int save = self.indent;
+        self.indent = self.here() + 1;
+        return save;
+    }
+
+    // The indent of the line now being written.
+    int here() {
+        if (self.open) {
+            return self.lineIndent;
+        }
+        return self.indent;
+    }
+
+    void nl() {
+        if (!self.open) {
+            return;
+        }
+        array.push(self.out, pad(self.lineIndent * 4) + string.join(self.piece, ""));
+        array.push(self.trail, self.takeTrailing());
+        self.piece = [];
+        self.open = false;
+        self.curLine = 0;
+    }
+
+    // The trailing comment for the code just written, when the file put one on
+    // a line that this line covers.
+    String takeTrailing() {
+        String[] got = [];
+        while (self.ci < self.cs.length) {
+            token.Comment c = self.cs[self.ci];
+            if (c.ownLine || c.line > self.curLine) {
+                break;
+            }
+            array.push(got, string.trim(c.text));
+            if (c.endLine > self.srcLine) {
+                self.srcLine = c.endLine;
+            }
+            self.ci++;
+        }
+        return string.join(got, " ");
+    }
+
+    void blankLine() {
+        if (self.out.length == 0) {
+            return;
+        }
+        if (self.out[self.out.length - 1] == "") {
+            return;
+        }
+        array.push(self.out, "");
+        array.push(self.trail, "");
+    }
+
+    // One blank line where the file has one or more.
+    void gap(int line) {
+        if (self.srcLine > 0 && line - self.srcLine >= 2) {
+            self.blankLine();
+        }
+    }
+
+    // Writes every comment the file put above source line `line`.
+    void flushTo(int line) {
+        while (self.ci < self.cs.length && self.cs[self.ci].line < line) {
+            token.Comment c = self.cs[self.ci];
+            self.ci++;
+            self.gap(c.line);
+            self.writeComment(c);
+            if (c.endLine > self.srcLine) {
+                self.srcLine = c.endLine;
+            }
+        }
+    }
+
+    // True when a comment that is not yet written is above source line `line`.
+    bool commentAbove(int line) {
+        return self.ci < self.cs.length && self.cs[self.ci].line < line;
+    }
+
+    void writeComment(token.Comment c) {
+        forEach(string.split(c.text, "\n"), row, i) {
+            if (i == 0) {
+                self.w(row);
+            } else {
+                self.w(string.trim(row));
+            }
+            self.nl();
+        }
+    }
+
+    // Starts the statement or declaration at source line `line`, with the
+    // comments and the blank line that the file put above it.
+    void lead(int line) {
+        self.flushTo(line);
+        self.gap(line);
+        self.mark(line);
+    }
+
+    // Separates two parts of one construct with a space, or with the line
+    // break of the file. The caller increases the indent around it.
+    void sep(int line) {
+        if (self.broke(line)) {
+            self.nl();
+            self.flushTo(line);
+        } else {
+            self.w(" ");
+        }
+    }
+
+    // The comma between two elements, and the line break that the file put
+    // after it.
+    void comma(int line) {
+        self.w(",");
+        self.sep(line);
+    }
+
+    String finish() {
+        self.nl();
+        while (self.ci < self.cs.length) {
+            token.Comment c = self.cs[self.ci];
+            self.ci++;
+            self.gap(c.line);
+            self.writeComment(c);
+            self.srcLine = c.endLine;
+        }
+        self.nl();
+        self.align();
+        while (self.out.length > 0 && self.out[self.out.length - 1] == "") {
+            array.pop(self.out);
+        }
+        return string.join(self.out, "\n") + "\n";
+    }
+
+    // Aligns the trailing comments of consecutive lines at the same indent,
+    // after the longest of those lines.
+    void align() {
+        int i = 0;
+        while (i < self.out.length) {
+            if (self.trail[i] == "") {
+                i++;
+                continue;
+            }
+            String lead = indentOf(self.out[i]);
+            int j = i;
+            int width = 0;
+            while (j < self.out.length && self.trail[j] != ""
+                && indentOf(self.out[j]) == lead) {
+                if (string.length(self.out[j]) > width) {
+                    width = string.length(self.out[j]);
+                }
+                j++;
+            }
+            int k = i;
+            while (k < j) {
+                self.out[k] = self.out[k]
+                    + pad(width - string.length(self.out[k]) + GAP) + self.trail[k];
+                k++;
+            }
+            i = j;
+        }
+    }
+
+    // ---- declarations ----
+
+    void program(ast.Program prog) {
+        forEach(prog.imports, imp) {
+            self.lead(imp.tok.line);
+            self.stmt(imp);
+            self.nl();
+        }
+        int i = 0;
+        while (i < prog.statements.length) {
+            ast.Statement s = prog.statements[i];
+            ast.TypeDeclStatement? u = unionBase(s);
+            if (u != null) {
+                i = i + self.unionDecl(u, prog.statements, i);
+                continue;
+            }
+            self.lead(s.tok.line);
+            self.stmt(s);
+            self.nl();
+            i++;
+        }
+    }
+
+    // Writes `union Name { T Tag, ... }` back. Returns the number of program
+    // statements that it covers: the base and each arm after it.
+    int unionDecl(ast.TypeDeclStatement base, ast.Statement[] all, int at) {
+        ast.TypeDeclStatement[] arms = [];
+        int i = at + 1;
+        while (i < all.length) {
+            ast.TypeDeclStatement? arm = unionArm(all[i], base.name);
+            if (arm == null) {
+                break;
+            }
+            array.push(arms, arm);
+            i++;
+        }
+        self.lead(base.tok.line);
+        if (base.exported) {
+            self.w("export ");
+        }
+        self.w("union " + base.name + " {");
+        int back1 = self.push();
+        forEach(arms, arm, k) {
+            if (k == 0) {
+                self.sep(arm.tok.line);
+            } else {
+                self.comma(arm.tok.line);
+            }
+            self.mark(arm.tok.line);
+            self.w(ast.typeNodeString(arm.fields[0].type));
+            if (arm.nameTok.line != arm.tok.line || arm.nameTok.col != arm.tok.col) {
+                self.w(" " + armTag(arm, base.name));
+            }
+        }
+        self.indent = back1;
+        self.w(" }");
+        self.nl();
+        return i - at;
+    }
+
+    void typeDecl(ast.TypeDeclStatement td) {
+        if (td.exported) {
+            self.w("export ");
+        }
+        if (td.sealed) {
+            self.w("sealed ");
+        }
+        self.w("type " + td.name);
+        ast.NamedType? base = td.extends;
+        if (base != null) {
+            self.w(" extends " + ast.typeNodeString(base));
+        }
+        if (td.fields.length == 0 && td.methods.length == 0) {
+            self.w(" { }");
+            return;
+        }
+        bool flat = self.bodyOnOneLine(td);
+        self.w(" {");
+        // The tree keeps the fields and the methods of a body in two lists, so
+        // only the line numbers give the source order. To write one list and
+        // then the other would move a field declared below a method, together
+        // with the prose above the field.
+        int body = self.here();
+        int back2 = self.indent;
+        if (!flat) {
+            self.indent = body + 1;
+        }
+        int fi = 0;
+        int mi = 0;
+        while (fi < td.fields.length || mi < td.methods.length) {
+            bool field = mi >= td.methods.length;
+            if (!field && fi < td.fields.length) {
+                field = typeStart(td.fields[fi].type) <= td.methods[mi].tok.line;
+            }
+            if (flat) {
+                self.w(" ");
+            } else {
+                self.nl();
+            }
+            if (field) {
+                if (!flat) {
+                    self.lead(typeStart(td.fields[fi].type));
+                }
+                self.fieldDef(td.fields[fi]);
+                fi++;
+                continue;
+            }
+            if (!flat) {
+                self.lead(td.methods[mi].tok.line);
+            }
+            self.stmt(td.methods[mi]);
+            mi++;
+        }
+        if (flat) {
+            self.w(" }");
+            return;
+        }
+        int last = td.tok.line;
+        forEach(td.fields, f) {
+            if (f.nameTok.line > last) {
+                last = f.nameTok.line;
+            }
+        }
+        forEach(td.methods, m) {
+            if (m.body.endLine > last) {
+                last = m.body.endLine;
+            }
+        }
+        self.nl();
+        self.flushTo(last + 1);
+        self.indent = body;
+        self.mark(last + 1);
+        self.w("}");
+        self.indent = back2;
+    }
+
+    // True when every member of a type body is on the first line of the
+    // declaration.
+    bool bodyOnOneLine(ast.TypeDeclStatement td) {
+        bool flat = array.every(td.fields, bool (ast.FieldDef f) -> f.nameTok.line == td.tok.line)
+            && array.every(td.methods, bool (ast.FunctionDeclStatement m) -> m.tok.line == td.tok.line);
+        return flat;
+    }
+
+    void enumDecl(ast.EnumDeclStatement en) {
+        if (en.exported) {
+            self.w("export ");
+        }
+        self.w("enum " + en.name + " {");
+        int last = en.tok.line;
+        forEach(en.members, m) {
+            if (m.tok.line > last) {
+                last = m.tok.line;
+            }
+        }
+        bool multi = last != en.tok.line;
+        int base = self.here();
+        int back3 = self.push();
+        forEach(en.members, m, i) {
+            if (i == 0) {
+                if (multi) {
+                    self.nl();
+                    self.flushTo(m.tok.line);
+                } else {
+                    self.w(" ");
+                }
+            } else {
+                self.comma(m.tok.line);
+            }
+            self.mark(m.tok.line);
+            self.w(m.name + ": " + string.from(m.value));
+        }
+        self.indent = base;
+        if (multi) {
+            self.nl();
+            self.mark(last + 1);
+            self.w("}");
+        }
+        self.indent = back3;
+        if (!multi) {
+            self.w(" }");
+        }
+    }
+
+    void funcDecl(ast.FunctionDeclStatement fd, int base) {
+        if (fd.exported) {
+            self.w("export ");
+        }
+        if (fd.extern) {
+            self.w("extern ");
+        }
+        ast.TypeNode? rt = fd.returnType;
+        if (rt == null) {
+            self.w("void ");
+        } else {
+            self.w(ast.typeNodeString(rt) + " ");
+        }
+        if (fd.override) {
+            self.w("override ");
+        }
+        if (fd.async) {
+            self.w("async ");
+        }
+        if (fd.noalloc) {
+            self.w("noalloc ");
+        }
+        self.w(fd.name);
+        self.params(fd.params);
+        if (fd.extern) {
+            self.w(";");
+            return;
+        }
+        self.w(" ");
+        self.block(fd.body, base);
+    }
+
+    void params(ast.Param[] ps) {
+        self.w("(");
+        int back4 = self.push();
+        forEach(ps, p, i) {
+            if (i > 0) {
+                self.comma(p.tok.line);
+            }
+            self.mark(p.tok.line);
+            self.w(ast.paramString(p));
+        }
+        self.indent = back4;
+        self.w(")");
+    }
+
+    // ---- type annotations ----
+
+    // ast.typeNodeString writes types. It is the spelling of a type that the
+    // whole compiler uses. The exception is a record type written in place: it
+    // is the only annotation that can have one field per line, so the file
+    // decides its layout.
+    void typeNode(ast.TypeNode t) {
+        ast.RecordTypeNode? rec = t as ast.RecordTypeNode;
+        if (rec != null) {
+            self.recordType(rec);
+            return;
+        }
+        ast.ArrayTypeNode? arr = t as ast.ArrayTypeNode;
+        if (arr != null && holdsRecordType(arr.elem)) {
+            self.typeNode(arr.elem);
+            ast.IntLiteral? size = arr.size;
+            if (size != null) {
+                self.w("[" + size.tok.literal + "]");
+                return;
+            }
+            self.w("[]");
+            return;
+        }
+        ast.OptionalTypeNode? opt = t as ast.OptionalTypeNode;
+        if (opt != null && holdsRecordType(opt.inner)) {
+            self.typeNode(opt.inner);
+            self.w("?");
+            return;
+        }
+        self.mark(t.tok.line);
+        self.w(ast.typeNodeString(t));
+    }
+
+    void recordType(ast.RecordTypeNode rec) {
+        self.mark(rec.tok.line);
+        if (rec.fields.length == 0) {
+            self.w("{ }");
+            return;
+        }
+        bool flat = array.every(rec.fields, bool (ast.FieldDef f) -> f.nameTok.line == rec.tok.line);
+        self.w("{");
+        if (flat) {
+            forEach(rec.fields, f) {
+                self.w(" ");
+                self.fieldDef(f);
+            }
+            self.w(" }");
+            return;
+        }
+        int base = self.here();
+        int back = self.indent;
+        self.indent = base + 1;
+        int last = rec.tok.line;
+        forEach(rec.fields, f) {
+            self.nl();
+            self.lead(typeStart(f.type));
+            self.fieldDef(f);
+            if (f.nameTok.line > last) {
+                last = f.nameTok.line;
+            }
+        }
+        self.nl();
+        self.flushTo(last + 1);
+        self.indent = base;
+        self.mark(last + 1);
+        self.w("}");
+        self.indent = back;
+    }
+
+    void fieldDef(ast.FieldDef f) {
+        self.typeNode(f.type);
+        self.mark(f.nameTok.line);
+        self.w(" " + f.name);
+        if (f.rename != "") {
+            self.w(" " + quoted(f.rename, "'"));
+        }
+        self.w(";");
+    }
+
+    // ---- statements ----
+
+    void stmt(ast.Statement s) {
+        int base = self.here();
+        self.mark(s.tok.line);
+        switch (s) {
+            case ast.ImportStatement imp:
+                self.w("import " + quoted(imp.path, "'"));
+                if (imp.aliasTok.line != 0) {
+                    self.w(" as " + imp.alias);
+                }
+                self.w(";");
+            case ast.ReExportStatement re:
+                self.w("export " + re.alias);
+                if (re.mode != "all") {
+                    self.w(" " + re.mode + " " + string.join(re.names, ", "));
+                }
+                self.w(";");
+            case ast.NativeStatement na:
+                if (na.kind == "flags" && na.os != "") {
+                    self.w("native flags " + na.os + " " + quoted(na.value, "'") + ";");
+                    return;
+                }
+                self.w("native " + na.kind + " " + quoted(na.value, "'") + ";");
+            case ast.VarDeclStatement v:
+                if (v.exported) {
+                    self.w("export ");
+                }
+                self.typeNode(v.type);
+                if (v.const) {
+                    self.w(" const");
+                }
+                self.w(" " + v.name);
+                ast.Expression? val = v.value;
+                if (val != null) {
+                    self.w(" =");
+                    int back5 = self.push();
+                    self.sep(startLine(val));
+                    self.expr(val);
+                    self.indent = back5;
+                }
+                self.w(";");
+            case ast.TypeDeclStatement td:
+                self.typeDecl(td);
+            case ast.EnumDeclStatement en:
+                self.enumDecl(en);
+            case ast.FunctionDeclStatement fd:
+                self.funcDecl(fd, base);
+            case ast.AssignStatement a:
+                self.expr(a.target);
+                self.w(" =");
+                int back6 = self.push();
+                self.sep(startLine(a.value));
+                self.expr(a.value);
+                self.indent = back6;
+                self.w(";");
+            case ast.ReturnStatement r:
+                ast.Expression? rv = r.value;
+                if (rv == null) {
+                    self.w("return;");
+                    return;
+                }
+                self.w("return");
+                int back7 = self.push();
+                self.sep(startLine(rv));
+                self.expr(rv);
+                self.indent = back7;
+                self.w(";");
+            case ast.IfStatement ifs:
+                self.ifStmt(ifs, base);
+            case ast.SwitchStatement sw:
+                self.switchStmt(sw, base);
+            case ast.WhileStatement w:
+                self.w("while (");
+                self.expr(w.cond);
+                self.w(") ");
+                self.block(w.body, base);
+            case ast.ForStatement fo:
+                self.w("for (");
+                ast.Statement? init = fo.init;
+                if (init != null) {
+                    self.clause(init);
+                }
+                self.w("; ");
+                self.expr(fo.cond);
+                self.w("; ");
+                ast.Statement? post = fo.post;
+                if (post != null) {
+                    self.clause(post);
+                }
+                self.w(") ");
+                self.block(fo.body, base);
+            case ast.IncDecStatement inc:
+                self.expr(inc.target);
+                self.w(inc.op + ";");
+            case ast.ForEachStatement fe:
+                self.w("forEach(");
+                self.expr(fe.array);
+                self.w(", " + fe.elemName);
+                if (fe.indexName != "") {
+                    self.w(", " + fe.indexName);
+                }
+                self.w(") ");
+                self.block(fe.body, base);
+            case ast.BreakStatement br:
+                self.w("break;");
+            case ast.ContinueStatement co:
+                self.w("continue;");
+            case ast.BlockStatement b:
+                self.block(b, base);
+            case ast.ExpressionStatement es:
+                self.expr(es.expression);
+                self.w(";");
+        }
+    }
+
+    // An init or post clause of a for header. It has no terminator.
+    void clause(ast.Statement s) {
+        self.mark(s.tok.line);
+        switch (s) {
+            case ast.VarDeclStatement v:
+                self.w(ast.typeNodeString(v.type));
+                if (v.const) {
+                    self.w(" const");
+                }
+                self.w(" " + v.name);
+                ast.Expression? val = v.value;
+                if (val != null) {
+                    self.w(" = ");
+                    self.expr(val);
+                }
+            case ast.AssignStatement a:
+                self.expr(a.target);
+                self.w(" = ");
+                self.expr(a.value);
+            case ast.IncDecStatement inc:
+                self.expr(inc.target);
+                self.w(inc.op);
+            case ast.ExpressionStatement es:
+                self.expr(es.expression);
+            default:
+                self.stmt(s);
+        }
+    }
+
+    void ifStmt(ast.IfStatement ifs, int base) {
+        self.w("if (");
+        self.expr(ifs.cond);
+        self.w(") ");
+        self.block(ifs.then, base);
+        ast.BlockStatement? els = ifs.else;
+        if (els == null) {
+            return;
+        }
+        // A chain that the file wrote over several lines stays on several
+        // lines. The token of the wrapper is on the line of the `else`.
+        if (self.broke(els.tok.line)) {
+            self.nl();
+            self.flushTo(els.tok.line);
+            self.indent = base;
+            self.w("else ");
+        } else {
+            self.w(" else ");
+        }
+        self.mark(els.tok.line);
+        // The parser wraps an `else if` in a block whose token is that `if`.
+        // The formatter removes the block and writes the chain back flat.
+        if (els.tok.type == token.IF && els.statements.length == 1) {
+            ast.IfStatement? chained = els.statements[0] as ast.IfStatement;
+            if (chained != null) {
+                self.ifStmt(chained, base);
+                return;
+            }
+        }
+        self.block(els, base);
+    }
+
+    void switchStmt(ast.SwitchStatement sw, int base) {
+        self.w("switch (");
+        self.expr(sw.subject);
+        self.w(") {");
+        int back8 = self.indent;
+        self.indent = base + 1;
+        int end = sw.tok.line;
+        forEach(sw.cases, cl) {
+            self.nl();
+            self.lead(cl.tok.line);
+            ast.NamedType? tn = cl.typeName;
+            if (tn != null) {
+                self.w("case " + ast.typeNodeString(tn) + " " + cl.bind + ":");
+            }
+            forEach(cl.values, v, i) {
+                if (i > 0) {
+                    self.nl();
+                }
+                self.mark(startLine(v));
+                self.w("case ");
+                self.expr(v);
+                self.w(":");
+            }
+            if (cl.default) {
+                if (cl.values.length > 0) {
+                    self.nl();
+                }
+                self.w("default:");
+            }
+            int back9 = self.indent;
+            self.indent = base + 2;
+            // When the file wrote a clause body on the line of its label, the
+            // body stays there, as does any line that the file did not break.
+            bool beside = cl.body.statements.length > 0
+                && cl.body.statements[0].tok.line == cl.tok.line;
+            forEach(cl.body.statements, s) {
+                if (beside) {
+                    self.w(" ");
+                } else {
+                    self.nl();
+                    self.lead(s.tok.line);
+                }
+                self.stmt(s);
+            }
+            self.indent = back9;
+            if (cl.body.endLine > end) {
+                end = cl.body.endLine;
+            }
+        }
+        self.nl();
+        self.flushTo(end);
+        self.indent = base;
+        self.mark(end);
+        self.w("}");
+        self.indent = back8;
+    }
+
+    // base is the indent of the line where the construct of this block began.
+    // That line can differ from the line of the brace: when a header wraps over
+    // two lines, the body is one level in from the statement, not from the
+    // last line of the header.
+    void block(ast.BlockStatement b, int base) {
+        if (b.statements.length == 0 && !self.commentAbove(b.endLine)) {
+            self.mark(b.endLine);
+            self.w("{ }");
+            return;
+        }
+        if (b.endLine > 0 && b.endLine == b.tok.line) {
+            self.w("{ ");
+            forEach(b.statements, s, i) {
+                if (i > 0) {
+                    self.w(" ");
+                }
+                self.stmt(s);
+            }
+            self.w(" }");
+            return;
+        }
+        self.w("{");
+        int back10 = self.indent;
+        self.indent = base + 1;
+        forEach(b.statements, s) {
+            self.nl();
+            self.lead(s.tok.line);
+            self.stmt(s);
+        }
+        self.nl();
+        self.flushTo(b.endLine);
+        self.indent = base;
+        self.mark(b.endLine);
+        self.w("}");
+        self.indent = back10;
+    }
+
+    // ---- expressions ----
+
+    int parenCount(ast.Expression e) {
+        int? n = self.parens[e.id];
+        if (n == null) {
+            return 0;
+        }
+        return n;
+    }
+
+    void expr(ast.Expression e) {
+        int n = self.parenCount(e);
+        int i = 0;
+        while (i < n) {
+            self.w("(");
+            i++;
+        }
+        self.bare(e);
+        i = 0;
+        while (i < n) {
+            self.w(")");
+            i++;
+        }
+    }
+
+    void bare(ast.Expression e) {
+        if (self.templates[e.id] != null) {
+            self.template(e);
+            return;
+        }
+        switch (e) {
+            case ast.Identifier id:
+                self.mark(id.tok.line);
+                self.w(id.name);
+            case ast.IntLiteral il:
+                self.mark(il.tok.line);
+                self.w(il.tok.literal);
+            case ast.FloatLiteral fl:
+                self.mark(fl.tok.line);
+                self.w(fl.tok.literal);
+            case ast.StringLiteral sl:
+                // A backtick string contains its newlines, so it covers every
+                // line that it spans. If only its first line were marked, the
+                // next argument would look like it had a break before it.
+                String text = quoted(sl.value, sl.tok.quote);
+                self.mark(sl.tok.line + string.split(text, "\n").length - 1);
+                self.w(text);
+            case ast.BoolLiteral bl:
+                self.mark(bl.tok.line);
+                self.w(bl.tok.literal);
+            case ast.NullLiteral nu:
+                self.mark(nu.tok.line);
+                self.w("null");
+            case ast.ArrayLiteral al:
+                self.arrayLit(al);
+            case ast.RecordLiteral rl:
+                self.recordLit(rl);
+            case ast.MapLiteral ml:
+                self.mapLit(ml);
+            case ast.FuncLit fn:
+                self.funcLit(fn);
+            case ast.AwaitExpr aw:
+                self.mark(aw.tok.line);
+                self.w("await ");
+                self.expr(aw.value);
+            case ast.CatchExpr ce:
+                self.catchExpr(ce);
+            case ast.PrefixExpression pe:
+                self.mark(pe.tok.line);
+                self.w(pe.operator);
+                self.expr(pe.right);
+            case ast.InfixExpression ie:
+                self.infix(ie);
+            case ast.IndexExpression ix:
+                self.expr(ix.left);
+                self.w("[");
+                self.expr(ix.index);
+                self.w("]");
+            case ast.AsExpression ae:
+                self.expr(ae.value);
+                self.mark(ae.tok.line);
+                if (ae.strict) {
+                    self.w(" strict");
+                }
+                self.w(" as " + ast.typeNodeString(ae.type));
+            case ast.MemberExpression me:
+                self.expr(me.object);
+                // A chain broken over lines keeps its breaks. The dot starts
+                // each line, as the operators of an infix chain do.
+                if (self.broke(me.tok.line)) {
+                    int backM = self.indent;
+                    self.indent = self.here() + 1;
+                    self.nl();
+                    self.flushTo(me.tok.line);
+                    self.indent = backM;
+                }
+                self.mark(me.tok.line);
+                if (me.optional) {
+                    self.w("?.");
+                } else {
+                    self.w(".");
+                }
+                self.w(me.property);
+            case ast.CallExpression call:
+                self.expr(call.callee);
+                self.args(call.args);
+        }
+    }
+
+    // Collects the left spine of an infix chain, so all operands of `a + b + c`
+    // align at one indent. A parenthesized operand is a unit and stops the
+    // walk.
+    void flatten(ast.InfixExpression ie, ast.Expression[] ops, String[] syms) {
+        ast.InfixExpression? left = ie.left as ast.InfixExpression;
+        if (left != null && self.parenCount(ie.left) == 0 && self.templates[ie.left.id] == null) {
+            self.flatten(left, ops, syms);
+        } else {
+            array.push(ops, ie.left);
+        }
+        array.push(syms, ie.operator);
+        array.push(ops, ie.right);
+    }
+
+    void infix(ast.InfixExpression ie) {
+        ast.Expression[] ops = [];
+        String[] syms = [];
+        self.flatten(ie, ops, syms);
+        // A chain that starts its own line keeps its operators at that indent,
+        // under the operand that they continue. A chain that continues a line
+        // with code on it goes in one level, so a reader cannot mistake a
+        // continuation line for a new statement.
+        bool ownLine = !self.open || self.piece.length == 0;
+        int back11 = self.indent;
+        self.indent = self.here();
+        if (!ownLine) {
+            self.indent = self.indent + 1;
+        }
+        self.expr(ops[0]);
+        forEach(syms, op, i) {
+            ast.Expression right = ops[i + 1];
+            // When the file broke the line before an operator, the operator
+            // starts the next line. The line then shows what it continues.
+            if (self.broke(startLine(right))) {
+                self.nl();
+                self.flushTo(startLine(right));
+                self.w(op + " ");
+            } else {
+                self.w(" " + op + " ");
+            }
+            self.expr(right);
+        }
+        self.indent = back11;
+    }
+
+    void args(ast.Expression[] items) {
+        self.w("(");
+        int back12 = self.push();
+        forEach(items, a, i) {
+            if (i == 0) {
+                if (self.broke(startLine(a))) {
+                    self.nl();
+                    self.flushTo(startLine(a));
+                }
+            } else {
+                self.comma(startLine(a));
+            }
+            self.expr(a);
+        }
+        self.indent = back12;
+        self.w(")");
+    }
+
+    void arrayLit(ast.ArrayLiteral al) {
+        if (al.elements.length == 0) {
+            self.w("[]");
+            return;
+        }
+        int[] lines = [];
+        forEach(al.elements, e) {
+            array.push(lines, startLine(e));
+        }
+        bool multi = al.endLine != al.tok.line;
+        int endLine = al.endLine;
+        self.w("[");
+        int base = self.here();
+        int back13 = self.push();
+        forEach(al.elements, e, i) {
+            if (i == 0) {
+                if (multi) {
+                    self.nl();
+                    self.flushTo(lines[0]);
+                }
+            } else {
+                self.comma(lines[i]);
+            }
+            self.expr(e);
+        }
+        self.indent = base;
+        if (multi) {
+            self.w(",");
+            self.nl();
+            self.mark(endLine);
+            self.w("]");
+        }
+        self.indent = back13;
+        if (!multi) {
+            self.w("]");
+        }
+    }
+
+    void recordLit(ast.RecordLiteral rl) {
+        if (rl.fields.length == 0) {
+            self.w("{}");
+            return;
+        }
+        int[] lines = [];
+        forEach(rl.fields, f) {
+            array.push(lines, startLine(f.value));
+        }
+        bool multi = rl.endLine != rl.tok.line;
+        int endLine = rl.endLine;
+        self.w("{");
+        int base = self.here();
+        int back14 = self.push();
+        forEach(rl.fields, f, i) {
+            if (i == 0) {
+                if (multi) {
+                    self.nl();
+                    self.flushTo(lines[0]);
+                } else {
+                    self.w(" ");
+                }
+            } else {
+                self.comma(lines[i]);
+            }
+            self.mark(lines[i]);
+            self.w(f.name + ": ");
+            self.expr(f.value);
+        }
+        self.indent = base;
+        if (multi) {
+            self.w(",");
+            self.nl();
+            self.mark(endLine);
+            self.w("}");
+        }
+        self.indent = back14;
+        if (!multi) {
+            self.w(" }");
+        }
+    }
+
+    void mapLit(ast.MapLiteral ml) {
+        if (ml.entries.length == 0) {
+            self.w("{}");
+            return;
+        }
+        int[] lines = [];
+        forEach(ml.entries, en) {
+            array.push(lines, startLine(en.key));
+        }
+        bool multi = ml.endLine != ml.tok.line;
+        int endLine = ml.endLine;
+        self.w("{");
+        int base = self.here();
+        int back15 = self.push();
+        forEach(ml.entries, en, i) {
+            if (i == 0) {
+                if (multi) {
+                    self.nl();
+                    self.flushTo(lines[0]);
+                } else {
+                    self.w(" ");
+                }
+            } else {
+                self.comma(lines[i]);
+            }
+            self.expr(en.key);
+            self.w(": ");
+            self.expr(en.value);
+        }
+        self.indent = base;
+        if (multi) {
+            self.w(",");
+            self.nl();
+            self.mark(endLine);
+            self.w("}");
+        }
+        self.indent = back15;
+        if (!multi) {
+            self.w(" }");
+        }
+    }
+
+    void funcLit(ast.FuncLit fn) {
+        int base = self.here();
+        self.mark(fn.tok.line);
+        ast.TypeNode? rt = fn.returnType;
+        if (rt == null) {
+            self.w("void ");
+        } else {
+            self.w(ast.typeNodeString(rt) + " ");
+        }
+        self.params(fn.params);
+        self.w(" -> ");
+        ast.Expression? eb = fn.exprBody;
+        if (eb != null) {
+            self.expr(eb);
+            return;
+        }
+        ast.BlockStatement? bb = fn.blockBody;
+        if (bb != null) {
+            self.block(bb, base);
+        }
+    }
+
+    // Writes an interpolated string back from the concatenation that the
+    // parser made of it (§1.6). Each string literal on the chain is text, and
+    // each `$str.from` call is a `${}` that holds its argument.
+    void template(ast.Expression root) {
+        ast.Expression[] parts = [];
+        templateParts(root, parts);
+        self.w("`");
+        forEach(parts, p) {
+            ast.StringLiteral? sl = p as ast.StringLiteral;
+            if (sl != null) {
+                String text = quoted(sl.value, "`");
+                text = string.substring(text, 1, string.length(text) - 1);
+                self.mark(sl.tok.line + string.split(text, "\n").length - 1);
+                self.w(text);
+                continue;
+            }
+            ast.CallExpression? call = p as ast.CallExpression;
+            if (call != null) {
+                self.w("${");
+                self.expr(call.args[0]);
+                self.w("}");
+            }
+        }
+        self.w("`");
+    }
+
+    void catchExpr(ast.CatchExpr ce) {
+        int base = self.here();
+        self.expr(ce.value);
+        int back = self.indent;
+        self.indent = self.here() + 1;
+        self.sep(ce.tok.line);
+        self.indent = back;
+        self.mark(ce.tok.line);
+        self.w("catch ");
+        ast.BlockStatement? body = ce.body;
+        if (body != null) {
+            self.w(ce.name + " ");
+            self.block(body, base);
+            return;
+        }
+        ast.Expression? d = ce.default;
+        if (d != null) {
+            self.expr(d);
+        }
+    }
+}
+
+// The pieces of a template, in order. The parser builds the chain from left to
+// right, so the left spine holds the whole template and nothing else.
+void templateParts(ast.Expression e, ast.Expression[] out) {
+    ast.InfixExpression? ie = e as ast.InfixExpression;
+    if (ie != null) {
+        templateParts(ie.left, out);
+        array.push(out, ie.right);
+        return;
+    }
+    array.push(out, e);
+}
+
+// The line where a field begins. That is the line of its type, not of its name.
+// A record written in place puts several lines between the two.
+int typeStart(ast.TypeNode t) {
+    switch (t) {
+        case ast.RecordTypeNode r:
+            return r.tok.line;
+        case ast.ArrayTypeNode a:
+            return typeStart(a.elem);
+        case ast.OptionalTypeNode o:
+            return typeStart(o.inner);
+        default:
+            return t.tok.line;
+    }
+}
+
+// True when a type annotation is, or contains, a record written in place. Only
+// those can contain a line break, so only those need the printer and not the
+// spelling.
+bool holdsRecordType(ast.TypeNode t) {
+    switch (t) {
+        case ast.RecordTypeNode r:
+            return true;
+        case ast.ArrayTypeNode a:
+            return holdsRecordType(a.elem);
+        case ast.OptionalTypeNode o:
+            return holdsRecordType(o.inner);
+        default:
+            return false;
+    }
+}

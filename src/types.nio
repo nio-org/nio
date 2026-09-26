@@ -1,0 +1,1143 @@
+// The type system, shared by the checker and the code generator. Type is
+// sealed, so a new extender is a compile error at each exhaustive type switch
+// over it.
+import 'string';
+import 'array';
+
+// Kind lists the built-in scalar types.
+//
+// INT, UINT and FLOAT are types of their own, as wide as the host (§2.1). The
+// signed and unsigned integers are two families that never mix in arithmetic.
+//
+// DATETIME and DURATION are both int64 counts of milliseconds. They differ in
+// what they count from: the Unix epoch, and nothing.
+//
+// REGEXP, SOCKET and LISTENER are opaque. None of them has a printed form,
+// equality or a JSON form. SOCKET and LISTENER are two kinds so that the
+// checker refuses the wrong one.
+export enum Kind {
+    INVALID: 0,
+    INT8: 1,
+    INT16: 2,
+    INT32: 3,
+    INT64: 4,
+    INT: 5,
+    FLOAT32: 6,
+    FLOAT64: 7,
+    FLOAT: 8,
+    STRING: 9,
+    BOOL: 10,
+    DATETIME: 11,
+    DURATION: 12,
+    JSON: 13,
+    REGEXP: 14,
+    VOID: 15,
+    NULL: 16,
+    UINT8: 17,
+    UINT16: 18,
+    UINT32: 19,
+    UINT64: 20,
+    UINT: 21,
+    SOCKET: 22,
+    LISTENER: 23
+}
+
+// The width of `int` and `float`. nio compiles for the host, and the bootstrap
+// assumes a 64-bit host. A test can set this value to compile as a 32-bit host
+// does.
+export int naturalBits = 64;
+
+// Records and enums are nominal: each declaration is a type of its own,
+// whatever its name and shape are. newID gives the number that stands for one.
+int typeIDs = 0;
+
+export int newID() {
+    typeIDs++;
+    return typeIDs;
+}
+
+export sealed type Type { }
+
+// Basic is a built-in scalar type. Use the shared constants below.
+export type Basic extends Type {
+    Kind kind;
+}
+
+// Array is T[] or T[N]. len is the declared size of a fixed-size array and 0
+// for one that grows; the checker rejects `T[0]`. The two forms are different
+// types, and neither is assignable to the other.
+export type Array extends Type {
+    Type elem;
+    int len;
+}
+
+export type Optional extends Type {
+    Type inner;
+}
+
+export type Field {
+    String name;
+    Type type;
+
+    // The key this field takes in JSON, from a `'json:key'` annotation. Empty
+    // means the field uses its own name.
+    String jsonName;
+
+    // Marks the catch-all field of the record (§6.3), written `'json*'`. It
+    // collects every key the record does not declare, and its entries are
+    // written beside the declared fields. A record has at most one such field,
+    // and its type must be Json.
+    bool jsonRest;
+
+    String jsonKey() {
+        if (self.jsonName != "") {
+            return self.jsonName;
+        }
+        return self.name;
+    }
+}
+
+// FieldSlot is what fieldType answers: the type and declaration index of a
+// field that exists.
+export type FieldSlot {
+    Type type;
+    int index;
+}
+
+// Method is one function declared in the body of a record (§2.4). sig excludes
+// the receiver, so it is what a call site checks its arguments against.
+export type Method {
+    String name;
+    FuncType sig;
+}
+
+// Record is a record type that a program declares. Records are nominal: two
+// record types are the same only if they have the same id. qual names the
+// module that declares the record, and it is "" for the entry file.
+//
+// The layout of a record, its type descriptor and its JSON form come from the
+// fields alone, so a method costs a value of the type nothing.
+//
+// base is the record that this one extends (§2.4), and null when the record
+// extends nothing. To extend a type copies its members: fields already holds
+// the fields of the base, at the indices of the base, and methods holds the
+// inherited ones. base by itself grants no assignability; only `sealed` does.
+export type Record extends Type {
+    int id;
+    String name;
+    String qual;
+    // The name that shows the declaring module, when it is not the qual. A
+    // package module shows as its package, and also with its version when the
+    // build holds two bands of that package. A qual comes from a file name,
+    // and the entry of every package is `lib.nio`.
+    String shown;
+    Record? base;
+
+    // Marks a type declared `sealed` (§2.4). Only the declaring module can
+    // extend such a type, so extenders below is the full set. Because the set
+    // is closed, a value of an extending type can go where the base is
+    // expected, and the checker can test a `switch` for full coverage.
+    bool sealed;
+
+    // The extending types, in declaration order. Only a sealed type fills it.
+    // A type that extends a sealed one cannot itself be extended, so the
+    // hierarchy is one level deep. Exhaustiveness is membership of this list.
+    Record[] extenders;
+    Field[] fields;
+    Method[] methods;
+
+    // Tells whether this record extends the sealed type base. This is the only
+    // relation that grants assignability between two records (§2.10).
+    bool extends(Record? base) {
+        if (base == null) {
+            return false;
+        }
+        if (!base.sealed) {
+            return false;
+        }
+        Record? b = self.base;
+        if (b == null) {
+            return false;
+        }
+        return b.id == base.id;
+    }
+
+    FieldSlot? fieldType(String name) {
+        FieldSlot? found = null;
+        forEach(self.fields, f, i) {
+            if (found == null && f.name == name) {
+                found = { type: f.type, index: i };
+            }
+        }
+        return found;
+    }
+
+    FuncType? methodSig(String name) {
+        FuncType? found = null;
+        forEach(self.methods, m) {
+            if (found == null && m.name == name) {
+                found = m.sig;
+            }
+        }
+        return found;
+    }
+
+    String[] methodNames() {
+        String[] names = [];
+        forEach(self.methods, m) {
+            array.push(names, m.name);
+        }
+        return names;
+    }
+
+    // Returns the index of the catch-all field, or -1.
+    int restField() {
+        int found = -1;
+        forEach(self.fields, f, i) {
+            if (found == -1 && f.jsonRest) {
+                found = i;
+            }
+        }
+        return found;
+    }
+}
+
+export type EnumMember {
+    String name;
+    int value;
+}
+
+// Enum is an enum type that a program declares. Its values are the integer
+// constants of its members, held as an int at run time. Enums are nominal, as
+// records are: two enum types are the same only if they have the same id. qual
+// names the module that declares the enum, and it is "" for the entry file.
+export type Enum extends Type {
+    int id;
+    String name;
+    String qual;
+    String shown;    // as Record.shown
+    EnumMember[] members;
+
+    int? memberValue(String name) {
+        int? found = null;
+        forEach(self.members, m) {
+            if (found == null && m.name == name) {
+                found = m.value;
+            }
+        }
+        return found;
+    }
+}
+
+// FuncType is a function type. Function types are structural, so two of them
+// are the same when their parameter types and return types are the same.
+//
+// async marks a declared `async` function. return still holds the declared
+// result type, and a call produces a Future of it. A function value is never
+// async.
+//
+// fallible marks a signature that can fail (§2.9). The checker infers it from
+// the body of a declared function, and the `!` in `Function()<String!>` sets it
+// on a function type. It is part of the identity of the type.
+//
+// variadic marks a signature whose last parameter collects the trailing
+// arguments of a call. That parameter already holds the array type the body
+// binds, so `...String logs` gives a `String[]` parameter. It is part of the
+// identity too: a variadic function is not interchangeable with one that takes
+// an array.
+export type FuncType extends Type {
+    Type[] params;
+    Type return;
+    bool async;
+    bool fallible;
+    bool variadic;
+    // Holds the §2.12 contract. It is not part of type identity: equal and
+    // assignable both ignore it, so a `noalloc` function still assigns to an
+    // ordinary function type. A call through a function value is therefore
+    // never noalloc, which is the safe direction.
+    bool noalloc;
+    // Marks the signature of an `extern` declaration (§5.8): the call compiles
+    // to the bare C symbol. Like noalloc, it is not part of type identity.
+    bool extern;
+}
+
+// FutureType is Future<T>. elem is the result type, and VoidT for a void async
+// function. fallible marks `Future<String!>`, whose await can produce an Error
+// in place of a value.
+export type FutureType extends Type {
+    Type elem;
+    bool fallible;
+}
+
+// MapType is Map<K, V>, walked in insertion order. It is structural, as
+// FutureType is. The checker limits key to the scalars that can be hashed
+// (validMapKey) and keeps value non-optional, because a lookup gives V? and
+// there is no V??.
+export type MapType extends Type {
+    Type key;
+    Type value;
+}
+
+// One shared value for each basic type.
+export Basic const InvalidT = { kind: Kind.INVALID };
+export Basic const Int8T = { kind: Kind.INT8 };
+export Basic const Int16T = { kind: Kind.INT16 };
+export Basic const Int32T = { kind: Kind.INT32 };
+export Basic const Int64T = { kind: Kind.INT64 };
+export Basic const IntT = { kind: Kind.INT };
+export Basic const Uint8T = { kind: Kind.UINT8 };
+export Basic const Uint16T = { kind: Kind.UINT16 };
+export Basic const Uint32T = { kind: Kind.UINT32 };
+export Basic const Uint64T = { kind: Kind.UINT64 };
+export Basic const UintT = { kind: Kind.UINT };
+export Basic const Float32T = { kind: Kind.FLOAT32 };
+export Basic const Float64T = { kind: Kind.FLOAT64 };
+export Basic const FloatT = { kind: Kind.FLOAT };
+export Basic const StringT = { kind: Kind.STRING };
+export Basic const BoolT = { kind: Kind.BOOL };
+export Basic const DateTimeT = { kind: Kind.DATETIME };
+export Basic const DurationT = { kind: Kind.DURATION };
+export Basic const JsonT = { kind: Kind.JSON };
+export Basic const RegExpT = { kind: Kind.REGEXP };
+export Basic const SocketT = { kind: Kind.SOCKET };
+export Basic const ListenerT = { kind: Kind.LISTENER };
+export Basic const VoidT = { kind: Kind.VOID };
+export Basic const NullT = { kind: Kind.NULL };
+
+// ErrorT is the built-in Error record (§2.9). It is an ordinary record, one
+// heap block with two slots, so member access, the collector and JSON need no
+// special case. Records are nominal, so this one module-level value is the
+// identity of the type.
+//
+// `code` is a plain int and not an enum, because one enum cannot serve both the
+// library and user code. A program declares its own enum and passes a member,
+// which rule 5 of §2.10 widens. Zero means "unspecified".
+export Record const ErrorT = {
+    id: newID(),
+    name: "Error",
+    qual: "",
+    shown: "",
+    base: null,
+    sealed: false,
+    extenders: [],
+    fields: [
+        { name: "message", type: StringT, jsonName: "", jsonRest: false },
+        { name: "code", type: IntT, jsonName: "", jsonRest: false },
+    ],
+    methods: [],
+};
+
+// ErrorCodeT is the built-in ErrorCode enum (§2.9): the codes that the standard
+// library puts in the `code` field of an Error. A program names it through a
+// module alias, such as fs.ErrorCode or net.ErrorCode, so that `ErrorCode`
+// stays free for user code. All those names resolve to this one enum, so a
+// NOT_FOUND from fs equals a NOT_FOUND from process.
+//
+// The numbers must agree with the NIO_ERR_* set in build/runtime/runtime.h. An
+// errno that the mapping does not name becomes OTHER.
+export Enum const ErrorCodeT = {
+    id: newID(),
+    name: "ErrorCode",
+    qual: "fs",
+    shown: "",
+    members: [
+        { name: "NONE", value: 0 },
+        { name: "OTHER", value: 1 },
+        { name: "NOT_FOUND", value: 2 },
+        { name: "PERMISSION", value: 3 },
+        { name: "EXISTS", value: 4 },
+        { name: "NOT_DIRECTORY", value: 5 },
+        { name: "IS_DIRECTORY", value: 6 },
+        { name: "NOT_EMPTY", value: 7 },
+        { name: "INVALID", value: 8 },
+        { name: "IO", value: 9 },
+        { name: "NO_SPACE", value: 10 },
+        { name: "TOO_MANY_FILES", value: 11 },
+        { name: "NAME_TOO_LONG", value: 12 },
+        { name: "INTERRUPTED", value: 13 },
+        { name: "END_OF_FILE", value: 14 },
+        { name: "LOOP", value: 15 },
+        { name: "READ_ONLY", value: 16 },
+        { name: "CONNECTION_REFUSED", value: 17 },
+        { name: "CONNECTION_RESET", value: 18 },
+        { name: "CONNECTION_ABORTED", value: 19 },
+        { name: "NOT_CONNECTED", value: 20 },
+        { name: "ALREADY_CONNECTED", value: 21 },
+        { name: "ADDRESS_IN_USE", value: 22 },
+        { name: "ADDRESS_NOT_AVAILABLE", value: 23 },
+        { name: "NETWORK_UNREACHABLE", value: 24 },
+        { name: "HOST_UNREACHABLE", value: 25 },
+        { name: "BROKEN_PIPE", value: 26 },
+        { name: "MESSAGE_TOO_LONG", value: 27 },
+        { name: "TIMED_OUT", value: 28 },
+        { name: "AUTHENTICATION", value: 29 },
+    ],
+};
+
+// JsonTypeT is the built-in json.Type enum (§6.3): the seven shapes that a JSON
+// value can have. The numbers must agree with the JSON_* set in
+// build/runtime/runtime.h.
+//
+// MISSING differs from NULL, because JSON separates an absent key from a key
+// that is present and null. An index on an absent key gives MISSING, which lets
+// a program write `raw["a"]["b"]` with no guard at each step.
+export Enum const JsonTypeT = {
+    id: newID(),
+    name: "Type",
+    qual: "json",
+    shown: "",
+    members: [
+        { name: "MISSING", value: 0 },
+        { name: "NULL", value: 1 },
+        { name: "BOOL", value: 2 },
+        { name: "NUMBER", value: 3 },
+        { name: "STRING", value: 4 },
+        { name: "ARRAY", value: 5 },
+        { name: "OBJECT", value: 6 },
+    ],
+};
+
+// CpuT is the built-in os.Cpu record (§6.9): one entry of os.getCpus(). A
+// program names it through the module alias, so that `Cpu` stays available to
+// user code.
+//
+// Both fields are optional, because not every platform reports both. An Apple
+// Silicon Mac has no sysctl for the clock speed, and an ARM Linux kernel names
+// no processor model.
+export Record const CpuT = {
+    id: newID(),
+    name: "Cpu",
+    qual: "os",
+    shown: "",
+    base: null,
+    sealed: false,
+    extenders: [],
+    fields: [
+        { name: "model", type: newOptional(StringT), jsonName: "", jsonRest: false },
+        { name: "speed", type: newOptional(IntT), jsonName: "", jsonRest: false },
+    ],
+    methods: [],
+};
+
+// StatT is the built-in fs.Stat record (§6.11): what fs.stat() reports about
+// one file or directory. A program names it through the module alias, so that
+// `Stat` stays available to user code.
+//
+// `permissions` is text and not mode bits, because the language has no octal
+// literals (§1.6). A program can print and compare "rw-r--r--".
+export Record const StatT = {
+    id: newID(),
+    name: "Stat",
+    qual: "fs",
+    shown: "",
+    base: null,
+    sealed: false,
+    extenders: [],
+    fields: [
+        { name: "name", type: StringT, jsonName: "", jsonRest: false },
+        { name: "extension", type: StringT, jsonName: "", jsonRest: false },
+        { name: "size", type: IntT, jsonName: "", jsonRest: false },
+        { name: "isDirectory", type: BoolT, jsonName: "", jsonRest: false },
+        { name: "isFile", type: BoolT, jsonName: "", jsonRest: false },
+        { name: "permissions", type: StringT, jsonName: "", jsonRest: false },
+        { name: "modified", type: DateTimeT, jsonName: "", jsonRest: false },
+    ],
+    methods: [],
+};
+
+// DeleteOptionsT is the built-in fs.DeleteOptions record (§6.11): the optional
+// second argument of fs.delete. Its one field is optional, so `{}` and a call
+// with no options mean the same thing.
+export Record const DeleteOptionsT = {
+    id: newID(),
+    name: "DeleteOptions",
+    qual: "fs",
+    shown: "",
+    base: null,
+    sealed: false,
+    extenders: [],
+    fields: [
+        { name: "recursive", type: newOptional(BoolT), jsonName: "", jsonRest: false },
+    ],
+    methods: [],
+};
+
+// ChildRunOptionsT is the built-in process.ChildRunOptions record (§6.12): the
+// optional third argument of process.child.run. The name sits at the module and
+// not at the `child` namespace, because the type grammar permits one dot.
+//
+// Every field is optional, so `{}` and a call with no options mean the same
+// thing, and the child keeps what it would inherit. `inherit` shares the three
+// standard streams of this process with the child, in place of collecting them.
+export Record const ChildRunOptionsT = {
+    id: newID(),
+    name: "ChildRunOptions",
+    qual: "process",
+    shown: "",
+    base: null,
+    sealed: false,
+    extenders: [],
+    fields: [
+        { name: "stdin", type: newOptional(newArray(Uint8T)), jsonName: "", jsonRest: false },
+        { name: "cwd", type: newOptional(StringT), jsonName: "", jsonRest: false },
+        { name: "env", type: newOptional(newMapType(StringT, StringT)), jsonName: "", jsonRest: false },
+        { name: "clearEnv", type: newOptional(BoolT), jsonName: "", jsonRest: false },
+        { name: "inherit", type: newOptional(BoolT), jsonName: "", jsonRest: false },
+    ],
+    methods: [],
+};
+
+// ChildUsageT is the built-in process.ChildUsage record (§6.12): what the
+// operating system charged a child that ran to completion. It is optional on
+// the result, because the wait of the Windows CRT has no equivalent of the
+// POSIX getrusage.
+//
+// The fields that POSIX defines and neither the Linux nor the macOS kernel
+// maintains are left out. A constant zero for those would look the same as a
+// real measurement.
+export Record const ChildUsageT = {
+    id: newID(),
+    name: "ChildUsage",
+    qual: "process",
+    shown: "",
+    base: null,
+    sealed: false,
+    extenders: [],
+    fields: [
+        { name: "peakMemory", type: IntT, jsonName: "", jsonRest: false },
+        { name: "userTime", type: DurationT, jsonName: "", jsonRest: false },
+        { name: "systemTime", type: DurationT, jsonName: "", jsonRest: false },
+        { name: "minorFaults", type: IntT, jsonName: "", jsonRest: false },
+        { name: "majorFaults", type: IntT, jsonName: "", jsonRest: false },
+        { name: "blockReads", type: IntT, jsonName: "", jsonRest: false },
+        { name: "blockWrites", type: IntT, jsonName: "", jsonRest: false },
+        { name: "voluntarySwitches", type: IntT, jsonName: "", jsonRest: false },
+        { name: "involuntarySwitches", type: IntT, jsonName: "", jsonRest: false },
+    ],
+    methods: [],
+};
+
+// ChildRunResultT is the built-in process.ChildRunResult record (§6.12): what
+// process.child.run() reports about a program that ran to completion. The
+// streams are bytes, because a program can write any bytes. A nonzero exit code
+// is a field and not an Error: the program ran, and the meaning of its exit
+// status belongs to the caller. Only a failure to start it raises.
+export Record const ChildRunResultT = {
+    id: newID(),
+    name: "ChildRunResult",
+    qual: "process",
+    shown: "",
+    base: null,
+    sealed: false,
+    extenders: [],
+    fields: [
+        { name: "stdout", type: newArray(Uint8T), jsonName: "", jsonRest: false },
+        { name: "stderr", type: newArray(Uint8T), jsonName: "", jsonRest: false },
+        { name: "code", type: IntT, jsonName: "", jsonRest: false },
+        { name: "usage", type: newOptional(ChildUsageT), jsonName: "", jsonRest: false },
+    ],
+    methods: [],
+};
+
+// NetOptionsT is the built-in net.Options record (§6.15): the last argument
+// that every net function accepts and none requires. It is one record for all
+// of them, because each field is an option on several calls. Each function
+// reads the fields that apply to it and ignores the others.
+//
+// `timeout` is a Duration, so the whole-number literal rule of §2.10 makes
+// `{ timeout: 5000 }` mean five seconds with no conversion.
+export Record const NetOptionsT = {
+    id: newID(),
+    name: "Options",
+    qual: "net",
+    shown: "",
+    base: null,
+    sealed: false,
+    extenders: [],
+    fields: [
+        { name: "timeout", type: newOptional(DurationT), jsonName: "", jsonRest: false },
+        { name: "backlog", type: newOptional(IntT), jsonName: "", jsonRest: false },
+        { name: "noDelay", type: newOptional(BoolT), jsonName: "", jsonRest: false },
+    ],
+    methods: [],
+};
+
+// DatagramT is the built-in net.Datagram record (§6.15): one message from a
+// datagram socket, with the address that sent it. A datagram socket receives
+// from any sender, and a reply needs that address.
+export Record const DatagramT = {
+    id: newID(),
+    name: "Datagram",
+    qual: "net",
+    shown: "",
+    base: null,
+    sealed: false,
+    extenders: [],
+    fields: [
+        { name: "address", type: StringT, jsonName: "", jsonRest: false },
+        { name: "data", type: newArray(Uint8T), jsonName: "", jsonRest: false },
+    ],
+    methods: [],
+};
+
+// The constructors. §2.4 takes the type of a record literal from the context,
+// so a literal that goes into a Type-typed slot needs one of these.
+
+export Array newArray(Type elem) {
+    Array a = { elem: elem, len: 0 };
+    return a;
+}
+
+export Array newFixedArray(Type elem, int len) {
+    Array a = { elem: elem, len: len };
+    return a;
+}
+
+export Optional newOptional(Type inner) {
+    Optional o = { inner: inner };
+    return o;
+}
+
+export MapType newMapType(Type key, Type value) {
+    MapType m = { key: key, value: value };
+    return m;
+}
+
+export FutureType newFutureType(Type elem, bool fallible) {
+    FutureType f = { elem: elem, fallible: fallible };
+    return f;
+}
+
+export FuncType newFuncType(Type[] params, Type ret) {
+    FuncType f = { params: params, return: ret, async: false, fallible: false, variadic: false, noalloc: false, extern: false };
+    return f;
+}
+
+// Writes the type as source text.
+export String typeString(Type t) {
+    switch (t) {
+        case Basic b:
+            return basicString(b);
+        case Array a:
+            if (a.len > 0) {
+                return typeString(a.elem) + "[" + string.from(a.len) + "]";
+            }
+            return typeString(a.elem) + "[]";
+        case Optional o:
+            return typeString(o.inner) + "?";
+        case Record r:
+            // The parser names a generated union member `Union$Tag`, with a
+            // character §1.3 keeps out of every identifier. Show the
+            // `Union.Tag` source form: the generated spelling must not reach a
+            // diagnostic.
+            String written = string.replace(r.name, "$", ".");
+            if (r.shown != "") {
+                return r.shown + "." + written;
+            }
+            if (r.qual != "") {
+                return r.qual + "." + written;
+            }
+            return written;
+        case Enum e:
+            if (e.shown != "") {
+                return e.shown + "." + e.name;
+            }
+            if (e.qual != "") {
+                return e.qual + "." + e.name;
+            }
+            return e.name;
+        case FuncType f:
+            String[] parts = [];
+            forEach(f.params, p, i) {
+                if (f.variadic && i == f.params.length - 1) {
+                    Array? arr = p as Array;
+                    if (arr != null) {
+                        array.push(parts, "..." + typeString(arr.elem));
+                        continue;
+                    }
+                }
+                array.push(parts, typeString(p));
+            }
+            String ret = typeString(f.return);
+            if (f.fallible) {
+                ret = ret + "!";
+            }
+            return "Function(" + string.join(parts, ", ") + ")<" + ret + ">";
+        case FutureType fu:
+            if (fu.fallible) {
+                return "Future<" + typeString(fu.elem) + "!>";
+            }
+            return "Future<" + typeString(fu.elem) + ">";
+        case MapType m:
+            return "Map<" + typeString(m.key) + ", " + typeString(m.value) + ">";
+    }
+}
+
+String basicString(Basic b) {
+    switch (b.kind) {
+        case Kind.INT8:
+            return "int8";
+        case Kind.INT16:
+            return "int16";
+        case Kind.INT32:
+            return "int32";
+        case Kind.INT64:
+            return "int64";
+        case Kind.INT:
+            return "int";
+        case Kind.UINT8:
+            return "uint8";
+        case Kind.UINT16:
+            return "uint16";
+        case Kind.UINT32:
+            return "uint32";
+        case Kind.UINT64:
+            return "uint64";
+        case Kind.UINT:
+            return "uint";
+        case Kind.FLOAT32:
+            return "float32";
+        case Kind.FLOAT64:
+            return "float64";
+        case Kind.FLOAT:
+            return "float";
+        case Kind.STRING:
+            return "String";
+        case Kind.BOOL:
+            return "bool";
+        case Kind.DATETIME:
+            return "DateTime";
+        case Kind.DURATION:
+            return "Duration";
+        case Kind.JSON:
+            return "Json";
+        case Kind.REGEXP:
+            return "RegExp";
+        case Kind.SOCKET:
+            return "Socket";
+        case Kind.LISTENER:
+            return "Listener";
+        case Kind.VOID:
+            return "void";
+        case Kind.NULL:
+            return "null";
+        default:
+            return "invalid";
+    }
+}
+
+export bool isError(Type t) {
+    Record? r = t as Record;
+    if (r == null) {
+        return false;
+    }
+    return r.id == ErrorT.id;
+}
+
+// validMapKey tells whether t can be the key of a map. Floats are excluded,
+// because NaN never equals itself, so a program could store a float key and
+// never find it again. Types compared by reference are excluded too.
+export bool validMapKey(Type t) {
+    Enum? e = t as Enum;
+    if (e != null) {
+        return true;
+    }
+    Basic? b = t as Basic;
+    if (b == null) {
+        return false;
+    }
+    switch (b.kind) {
+        case Kind.INT8:
+        case Kind.INT16:
+        case Kind.INT32:
+        case Kind.INT64:
+        case Kind.INT:
+        case Kind.UINT8:
+        case Kind.UINT16:
+        case Kind.UINT32:
+        case Kind.UINT64:
+        case Kind.UINT:
+        case Kind.STRING:
+        case Kind.BOOL:
+        case Kind.DATETIME:
+        case Kind.DURATION:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// equal tells whether a and b are the same type. Records and enums compare by
+// identity, because each declaration produces one id.
+export bool equal(Type a, Type b) {
+    switch (a) {
+        case Basic ab:
+            Basic? bb = b as Basic;
+            if (bb == null) {
+                return false;
+            }
+            return ab.kind == bb.kind;
+        case Array aa:
+            Array? ba = b as Array;
+            if (ba == null) {
+                return false;
+            }
+            return aa.len == ba.len && equal(aa.elem, ba.elem);
+        case Optional ao:
+            Optional? bo = b as Optional;
+            if (bo == null) {
+                return false;
+            }
+            return equal(ao.inner, bo.inner);
+        case Record ar:
+            Record? br = b as Record;
+            if (br == null) {
+                return false;
+            }
+            return ar.id == br.id;
+        case Enum ae:
+            Enum? be = b as Enum;
+            if (be == null) {
+                return false;
+            }
+            return ae.id == be.id;
+        case FuncType af:
+            FuncType? bf = b as FuncType;
+            if (bf == null) {
+                return false;
+            }
+            if (af.async != bf.async || af.fallible != bf.fallible
+                || af.variadic != bf.variadic
+                || af.params.length != bf.params.length || !equal(af.return, bf.return)) {
+                return false;
+            }
+            bool same = true;
+            forEach(af.params, p, i) {
+                if (!equal(p, bf.params[i])) {
+                    same = false;
+                }
+            }
+            return same;
+        case FutureType au:
+            FutureType? bu = b as FutureType;
+            if (bu == null) {
+                return false;
+            }
+            return au.fallible == bu.fallible && equal(au.elem, bu.elem);
+        case MapType am:
+            MapType? bm = b as MapType;
+            if (bm == null) {
+                return false;
+            }
+            return equal(am.key, bm.key) && equal(am.value, bm.value);
+    }
+}
+
+// assignable tells whether a value of type src can go into a location of type
+// dst. Beyond equality, four rules apply. T and null are assignable to T?. A
+// number assigns to a numeric type that holds every value of its own type,
+// which holds below decides. An enum assigns to a signed integer at least as
+// wide as `int`. A type that extends a sealed type assigns to that type (§2.4).
+export bool assignable(Type dst, Type src) {
+    if (equal(dst, src)) {
+        return true;
+    }
+    // A sealed base accepts the types that extend it. This is safe because a
+    // record carries its own TypeDesc: the collector reads the real type out of
+    // the object, so it traces the extra reference fields of the extending type
+    // even where the slot has the type of the base.
+    Record? base = dst as Record;
+    if (base != null) {
+        Record? ext = src as Record;
+        if (ext != null && ext.extends(base)) {
+            return true;
+        }
+    }
+    Optional? o = dst as Optional;
+    if (o != null) {
+        if (equal(src, NullT)) {
+            return true;
+        }
+        if (assignable(o.inner, src)) {
+            return true;
+        }
+    }
+    Enum? e = src as Enum;
+    if (e != null) {
+        // The members of an enum are signed, so only the signed integers
+        // hold all of them.
+        return isSignedFamily(dst) && bits(dst) >= naturalBits;
+    }
+    return holds(dst, src);
+}
+
+// holds tells whether every value of the numeric type src is also a value of
+// the numeric type dst. It defines numeric assignability, and the arithmetic
+// rules use its order through widenPair.
+//
+// In one family the rule is width. From an unsigned type to a signed one the
+// rule is width with one bit to spare, because a signed type must keep room for
+// the sign, so `uint64` goes to no signed type. A signed value never goes into
+// an unsigned type at any width, because no unsigned type has a -1. Floats and
+// integers do not mix in either direction (§2.1).
+bool holds(Type dst, Type src) {
+    if (isFloatFamily(dst) && isFloatFamily(src)
+        || isSignedFamily(dst) && isSignedFamily(src)
+        || isUnsignedFamily(dst) && isUnsignedFamily(src)) {
+        return bits(dst) >= bits(src);
+    }
+    if (isSignedFamily(dst) && isUnsignedFamily(src)) {
+        return bits(dst) > bits(src);
+    }
+    return false;
+}
+
+// Gives the number of value bits that a numeric type holds, and 0 for every
+// type that is not a number. It orders a family, so that an assignment to a
+// type at least as wide loses nothing.
+export int bits(Type t) {
+    Basic? b = t as Basic;
+    if (b == null) {
+        return 0;
+    }
+    switch (b.kind) {
+        case Kind.INT8:
+        case Kind.UINT8:
+            return 8;
+        case Kind.INT16:
+        case Kind.UINT16:
+            return 16;
+        case Kind.INT32:
+        case Kind.UINT32:
+        case Kind.FLOAT32:
+            return 32;
+        case Kind.INT64:
+        case Kind.UINT64:
+        case Kind.FLOAT64:
+            return 64;
+        case Kind.INT:
+        case Kind.UINT:
+        case Kind.FLOAT:
+            return naturalBits;
+        default:
+            return 0;
+    }
+}
+
+export bool isIntFamily(Type t) {
+    return isSignedFamily(t) || isUnsignedFamily(t);
+}
+
+export bool isSignedFamily(Type t) {
+    Basic? b = t as Basic;
+    if (b == null) {
+        return false;
+    }
+    switch (b.kind) {
+        case Kind.INT8:
+        case Kind.INT16:
+        case Kind.INT32:
+        case Kind.INT64:
+        case Kind.INT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// isUnsignedFamily tells whether t is an unsigned integer type. Every operation
+// that reads an 8-byte unit as a number consults it, because the two integer
+// families share one unit.
+export bool isUnsignedFamily(Type t) {
+    Basic? b = t as Basic;
+    if (b == null) {
+        return false;
+    }
+    switch (b.kind) {
+        case Kind.UINT8:
+        case Kind.UINT16:
+        case Kind.UINT32:
+        case Kind.UINT64:
+        case Kind.UINT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+export bool isFloatFamily(Type t) {
+    Basic? b = t as Basic;
+    if (b == null) {
+        return false;
+    }
+    return b.kind == Kind.FLOAT32 || b.kind == Kind.FLOAT64 || b.kind == Kind.FLOAT;
+}
+
+// natural returns the type that operators produce for the family of t: `int`,
+// `uint` or `float`. It returns null for every other type.
+export Type? natural(Type t) {
+    if (isSignedFamily(t)) {
+        return IntT;
+    }
+    if (isUnsignedFamily(t)) {
+        return UintT;
+    }
+    if (isFloatFamily(t)) {
+        return FloatT;
+    }
+    return null;
+}
+
+// concrete returns the fixed-width type that t is on this host, and t itself
+// for every other type. Code generation and the runtime work with widths and
+// not with the name that the source has.
+export Type concrete(Type t) {
+    Basic? b = t as Basic;
+    if (b == null) {
+        return t;
+    }
+    if (b.kind == Kind.INT) {
+        if (naturalBits == 32) {
+            return Int32T;
+        }
+        return Int64T;
+    }
+    if (b.kind == Kind.UINT) {
+        if (naturalBits == 32) {
+            return Uint32T;
+        }
+        return Uint64T;
+    }
+    if (b.kind == Kind.FLOAT) {
+        if (naturalBits == 32) {
+            return Float32T;
+        }
+        return Float64T;
+    }
+    return t;
+}
+
+// isNarrow tells whether t is a number narrower than the natural type of its
+// family. No operator produces a narrow value: one comes from a literal, from a
+// value of a narrower type, from outside the program, or from the conversion of
+// §3.6.
+export bool isNarrow(Type t) {
+    return natural(t) != null && bits(t) < naturalBits;
+}
+
+// widen returns the type that arithmetic on t alone produces. A narrow type
+// widens to the natural type of its family, and a type at least that wide keeps
+// itself.
+export Type widen(Type t) {
+    Type? nat = natural(t);
+    if (nat == null) {
+        return t;
+    }
+    if (bits(t) < naturalBits) {
+        return nat;
+    }
+    return t;
+}
+
+// widenPair returns the type that arithmetic over a and b produces, and null
+// when the two do not mix. The result is the widened type of whichever operand
+// holds every value of the other. When each one holds the other and the two
+// differ, the result is the natural type: `int` and `int64` give `int`.
+export Type? widenPair(Type a, Type b) {
+    if (natural(a) == null || natural(b) == null) {
+        return null;
+    }
+    if (equal(a, b)) {
+        return widen(a);
+    }
+    bool aHolds = holds(a, b);
+    bool bHolds = holds(b, a);
+    if (aHolds && bHolds) {
+        return natural(a);
+    }
+    if (aHolds) {
+        return widen(a);
+    }
+    if (bHolds) {
+        return widen(b);
+    }
+    return null;
+}
+
+export type IntBounds {
+    int lo;
+    int hi;
+}
+
+// intRange returns the range of values that an integer type can hold. A literal
+// must fit the range to take the type, and a JSON document must respect it. It
+// returns null for the signed 64-bit integers, whose range is that of the
+// literal itself, and for every type that is not an integer.
+//
+// The upper bound of an unsigned type is the widest literal that the parser
+// accepts and not the maximum of the type, because §1.6 gives no way to write a
+// number above the range of an int64 in either family.
+export IntBounds? intRange(Type t) {
+    if (isUnsignedFamily(t)) {
+        int uw = bits(t);
+        if (uw == 8) {
+            IntBounds u8 = { lo: 0, hi: 255 };
+            return u8;
+        }
+        if (uw == 16) {
+            IntBounds u16 = { lo: 0, hi: 65535 };
+            return u16;
+        }
+        if (uw == 32) {
+            IntBounds u32 = { lo: 0, hi: 4294967295 };
+            return u32;
+        }
+        IntBounds u64 = { lo: 0, hi: 9223372036854775807 };
+        return u64;
+    }
+    if (!isSignedFamily(t)) {
+        return null;
+    }
+    int w = bits(t);
+    if (w == 8) {
+        IntBounds b8 = { lo: -128, hi: 127 };
+        return b8;
+    }
+    if (w == 16) {
+        IntBounds b16 = { lo: -32768, hi: 32767 };
+        return b16;
+    }
+    if (w == 32) {
+        IntBounds b32 = { lo: -2147483648, hi: 2147483647 };
+        return b32;
+    }
+    return null;
+}
+
+// isInvalid tells whether t is the invalid type, which marks an error the
+// compiler has already reported.
+export bool isInvalid(Type t) {
+    Basic? b = t as Basic;
+    if (b == null) {
+        return false;
+    }
+    return b.kind == Kind.INVALID;
+}
+
+// isByteArray tells whether t is an array of byte, of either form (§2.2).
+export bool isByteArray(Type t) {
+    Array? a = t as Array;
+    if (a == null) {
+        return false;
+    }
+    return equal(a.elem, Uint8T);
+}
+
+// unwrap returns the inner type of an optional, and t for any other type.
+export Type unwrap(Type t) {
+    Optional? o = t as Optional;
+    if (o != null) {
+        return o.inner;
+    }
+    return t;
+}

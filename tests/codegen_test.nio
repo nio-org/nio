@@ -1,0 +1,637 @@
+// These tests assert on the IR text. Each fragment is a contract with the C
+// runtime.
+import 'test';
+import 'string';
+import 'array';
+import '../src/lexer' as lexer;
+import '../src/parser' as parser;
+import '../src/checker' as checker;
+import '../src/codegen' as codegen;
+import '../src/module' as module;
+import '../src/types' as types;
+import '../src/ast' as ast;
+
+// Generates IR with no target attributes and no coverage. The assertions must
+// not depend on the host.
+String generate(String src) {
+    return generateWith(src, "", false);
+}
+
+String generateWith(String src, String attrs, bool coverage) {
+    parser.Parser p = parser.newParser(lexer.newLexer(src));
+    ast.Program prog = p.parseProgram();
+    if (p.errs.length > 0) {
+        return Error("parse errors: " + string.join(p.errs, "\n"));
+    }
+    checker.CheckResult res = checker.check(prog);
+    if (res.errs.length > 0) {
+        return Error("check errors: " + string.join(res.errs, "\n"));
+    }
+    module.Module m = { prog: prog, info: res.info, qual: "", path: "" };
+    codegen.Options opts = { coverage: coverage, debug: false, release: false, targetAttrs: attrs };
+    return codegen.generate([m], opts);
+}
+
+void wants(String ir, String[] fragments) {
+    forEach(fragments, want) {
+        if (!string.contains(ir, want)) {
+            return Error("IR missing \"" + want + "\"\n---\n" + ir);
+        }
+    }
+}
+
+void absent(String ir, String[] fragments) {
+    forEach(fragments, unwanted) {
+        if (string.contains(ir, unwanted)) {
+            return Error("IR unexpectedly contains \"" + unwanted + "\"\n---\n" + ir);
+        }
+    }
+}
+
+int countOf(String s, String sub) {
+    if (string.length(sub) == 0) {
+        return 0;
+    }
+    int n = 0;
+    int at = 0;
+    while (at <= string.length(s) - string.length(sub)) {
+        int i = string.find(string.substring(s, at, string.length(s)), sub);
+        if (i < 0) {
+            return n;
+        }
+        n++;
+        at = at + i + string.length(sub);
+    }
+    return n;
+}
+
+void expectCount(String ir, String sub, int want) {
+    int got = countOf(ir, sub);
+    if (got != want) {
+        return Error("\"" + sub + "\" occurs " + string.from(got) + " times, want "
+            + string.from(want) + "\n---\n" + ir);
+    }
+}
+
+// Generated functions must carry the same target attributes as the C runtime,
+// or LLVM does not inline runtime helpers into generated code.
+test.start("codegen: target attributes", void () -> {
+    String src = "int f(int n) { return n; }\nprintInline(f(1));\n";
+    String attrs = "\"target-cpu\"=\"apple-m1\" \"target-features\"=\"+neon\"";
+    String ir = generateWith(src, attrs, false);
+    wants(ir, [
+        "define i32 @main(i32 %argc, ptr %argv) #0 {",
+        "define i64 @fn.f(i64 %p0) #0 {",
+        "attributes #0 = { " + attrs + " }",
+    ]);
+    absent(generateWith(src, "", false), ["#0"]);
+});
+
+test.start("codegen: the shape of a generated module", void () -> {
+    String ir = generate(`
+import 'json';
+type Car { String make; int age; String? owner; }
+int sum;
+void add(int e) { sum = sum + e; }
+forEach([1, 2], e) { add(e); }
+Car c = { make: "t", age: 4 }
+printInline(json.toText(c));
+printInline(1.5);
+`);
+    wants(ir, [
+        "define i32 @main(i32 %argc, ptr %argv)",
+        "define void @fn.add(i64 %p0)",
+        "@gv.sum = global i64 0",
+        "@gv.c = global ptr null",
+        "call ptr @rt_json_totext",
+        "call void @rt_print",
+        // The second argument is the element's width (§5.7).
+        "call ptr @rt_arr_new(i64 2, i64 8)",
+        "fe.cond",                     // forEach loop blocks
+        "call i64 @rt_arr_len",        // forEach bound
+        "c\"make\\00\"",               // record field name for the TypeDesc
+        "i64 8, ptr null, i64 3",      // car TypeDesc: kind=record, 3 fields
+        "i64 7, ptr @rt_td_string",    // String? TypeDesc: kind=optional
+        "double 1.5",
+        "br label %start",    // alloca hoisting preamble
+    ]);
+    // add is void: the missing-return panic must not appear.
+    absent(ir, ["missing return in function"]);
+});
+
+test.start("codegen: the missing-return guard", void () -> {
+    String ir = generate(`
+int f(int x) {
+    if (x > 0) { return 1; }
+}
+printInline(f(1));
+`);
+    wants(ir, ["missing return in function f", "unreachable"]);
+});
+
+test.start("codegen: string interning", void () -> {
+    String ir = generate("printInline(\"same\");\nprintInline(\"same\");\n");
+    expectCount(ir, "c\"same\"", 1);
+});
+
+test.start("codegen: TypeDesc interning", void () -> {
+    String ir = generate(`
+import 'json';
+printInline(json.toText([1, 2]));
+printInline(json.toText([3]));
+`);
+    expectCount(ir, "{ i64 6, ptr @rt_td_int", 1);
+});
+
+test.start("codegen: short-circuit blocks", void () -> {
+    String ir = generate("bool a = true && false;\nbool b = true || false;\n");
+    wants(ir, ["sc.rhs", "sc.end", "phi i64"]);
+});
+
+test.start("codegen: field-name interning", void () -> {
+    String ir = generate(`
+import 'json';
+type A { int x; }
+type B { int x; }
+A va = { x: 1 }
+B vb = { x: 2 }
+printInline(json.toText(va));
+printInline(json.toText(vb));
+`);
+    expectCount(ir, "c\"x\\00\"", 1);
+});
+
+// Two records with the same shape are distinct types. Each gets its own
+// record TypeDesc.
+test.start("codegen: anonymous record TypeDescs", void () -> {
+    String ir = generate(`
+import 'json';
+type T { { int x; } a; { int x; } b; }
+T v = { a: { x: 1 }, b: { x: 2 } }
+printInline(json.toText(v));
+`);
+    expectCount(ir, "i64 8, ptr null, i64 1", 2);
+});
+
+test.start("codegen: the forEach index binding", void () -> {
+    String ir = generate("int[] a = [1, 2];\nforEach(a, e, i) { a[i] = e + i; }\n");
+    wants(ir, ["fe.cond", "fe.body", "fe.end", "call ptr @rt_arr_slot"]);
+});
+
+// n is narrowed by its initializer; m stays an unknown optional.
+test.start("codegen: optional boxing", void () -> {
+    String ir = generate("int? n = 5;\nint? m;\nprintInline(m == 5);\n");
+    // The box call carries the inner TypeDesc. It sets the cell width (§5.7).
+    wants(ir, ["call ptr @rt_box(i64 5, ptr @", "call i64 @rt_eq"]);
+});
+
+test.start("codegen: a narrowed optional compares inline", void () -> {
+    absent(generate("int? n = 5;\nprintInline(n == 5);\n"), ["call i64 @rt_eq"]);
+});
+
+// A literal divisor cannot be 0 or -1, so no guards are emitted.
+test.start("codegen: a constant divisor needs no guards", void () -> {
+    String ir = generate("int x = 1234;\nprintInline(x / 10);\nprintInline(x % 1000);\n");
+    wants(ir, ["sdiv i64 %t", "srem i64 %t"]);
+    absent(ir, ["division.zero", "modulo.zero", "@rt_div", "@rt_mod"]);
+});
+
+// A non-literal divisor gets inline guards: a panic for zero, and a select
+// that keeps INT64_MIN / -1 defined.
+test.start("codegen: a variable divisor carries guards", void () -> {
+    String ir = generate("int d = 3;\nprintInline(7 / d);\nprintInline(7 % d);\n");
+    wants(ir, [
+        "division.zero", "division.ok", "modulo.zero", "modulo.ok",
+        "c\"division by zero\\00\"", "c\"modulo by zero\\00\"",
+        "icmp eq i64 %t", "select i1 %t", "sdiv i64", "srem i64", "unreachable",
+    ]);
+    absent(ir, ["@rt_div", "@rt_mod"]);
+});
+
+// One rt_print per argument, a space between two, a newline only for print.
+// Every argument is evaluated before anything is written.
+test.start("codegen: print lowering", void () -> {
+    String ir = generate(`
+String s(int n) { return "x"; }
+printInline(s(1), s(2));
+print(3);
+printInline(4);
+`);
+    int at = string.find(ir, "define i32 @main(i32 %argc, ptr %argv)");
+    test.assert(at >= 0, "no main in the IR");
+    String body = string.substring(ir, at, string.length(ir));
+    String[] calls = [];
+    forEach(string.split(body, "\n"), line) {
+        forEach(["@rt_print(", "@rt_print_space(", "@rt_print_newline(", "@fn.s("], fn) {
+            if (string.contains(line, fn)) {
+                array.push(calls, string.substring(fn, 1, string.length(fn) - 1));
+            }
+        }
+    }
+    String[] want = [
+        "fn.s", "fn.s",
+        "rt_print", "rt_print_space", "rt_print",
+        "rt_print", "rt_print_newline",    // print(3)
+        "rt_print",                        // printInline(4): no newline, no separator
+    ];
+    test.expectString(string.join(calls, " "), string.join(want, " "));
+    // The first argument is a string, live while the second is computed.
+    test.assert(string.contains(body, "store ptr %t1, ptr %r0"),
+        "the first print argument is not rooted:\n" + ir);
+});
+
+// A string literal's GC header is one word, and the symbol points past it at
+// the payload. The constant must not be unnamed_addr: a mergeable literal
+// section resolves an interior symbol to the wrong address.
+test.start("codegen: a string literal's GC header", void () -> {
+    String ir = generate("printInline(\"\");\nprintInline(\"ab\");\n");
+    wants(ir, [
+        "@str.0.obj = private constant { i64, i64, [0 x i8] } { i64 2, i64 0,",
+        "@str.0 = private alias i64, getelementptr inbounds ({ i64, i64, [0 x i8] }, ptr @str.0.obj, i32 0, i32 1)",
+        "@str.1.obj = private constant { i64, i64, [2 x i8] } { i64 2, i64 2, [2 x i8] c\"ab\" }",
+    ]);
+    absent(ir, ["unnamed_addr constant { i64, i64"]);
+});
+
+// On a 32-bit host every arithmetic result is cut back to the width of its
+// type. The test collects failures so that it always puts types.naturalBits
+// back: a later test would otherwise see a 32-bit host.
+String const WIDTH_SRC = `
+int a = 2;
+int b = a + a * a;
+float x = 1.5;
+float y = x * x;
+int8 small = 1;
+int c = small + small;
+c++;
+printInline(b);
+printInline(y);
+printInline(-a);
+`;
+
+void noteMissing(String[] out, String host, String ir, String[] fragments) {
+    forEach(fragments, want) {
+        if (!string.contains(ir, want)) {
+            array.push(out, host + ": IR missing \"" + want + "\"");
+        }
+    }
+}
+
+void noteUnwanted(String[] out, String host, String ir, String[] fragments) {
+    forEach(fragments, unwanted) {
+        if (string.contains(ir, unwanted)) {
+            array.push(out, host + ": IR should not contain \"" + unwanted + "\"");
+        }
+    }
+}
+
+test.start("codegen: the host's natural width", void () -> {
+    int saved = types.naturalBits;
+    String[] failures = [];
+
+    types.naturalBits = 32;
+    String ir = generate(WIDTH_SRC);
+    noteMissing(failures, "32-bit host", ir, [
+        "trunc i64 ",    // int arithmetic wraps at 32 bits
+        "sext i32 ",
+        "fptrunc double",    // float arithmetic rounds to binary32
+        "fpext float",
+        ", ptr @rt_td_int32)",    // int prints and serializes as an int32
+        ", ptr @rt_td_float32)",
+    ]);
+
+    // int64 and float64 keep the full width on a 32-bit host.
+    String wide = generate(`
+int64 big = 1;
+int64 sum = big + big * big;
+float64 exact = 0.1;
+float rounded = 0.1;
+printInline(sum);
+printInline(exact);
+`);
+    noteUnwanted(failures, "32-bit host", wide, ["trunc i64"]);
+    noteMissing(failures, "32-bit host", wide, [
+        ", ptr @rt_td_int)",              // int64 still prints as a 64-bit int
+        "double 0.1,",                    // 0.1 as a binary64
+        "double 0.10000000149011612,",    // 0.1 rounded to a binary32
+    ]);
+
+    types.naturalBits = 64;
+    String wide64 = generate(WIDTH_SRC);
+    noteUnwanted(failures, "64-bit host", wide64, [
+        "trunc i64", "sext i32", "fptrunc", "fpext",
+        ", ptr @rt_td_int32)", ", ptr @rt_td_float32)",
+    ]);
+    noteMissing(failures, "64-bit host", wide64, [", ptr @rt_td_int)", ", ptr @rt_td_float)"]);
+
+    types.naturalBits = saved;
+    if (failures.length > 0) {
+        return Error(string.join(failures, "\n"));
+    }
+});
+
+// getCpus takes the os.Cpu[] descriptor. The runtime allocates the array and
+// its records and writes the slots by index, so the fields must stay in
+// declaration order.
+test.start("codegen: os operations", void () -> {
+    String ir = generate(`
+import 'os';
+printInline(os.getPlatform());
+printInline(os.getArch());
+os.Cpu[] cpus = os.getCpus();
+printInline(cpus.length);
+`);
+    wants(ir, [
+        "call ptr @rt_os_platform()",
+        "call ptr @rt_os_arch()",
+        "call ptr @rt_os_get_cpus(ptr @td.",
+        // TD_RECORD (8) with two TD_OPTIONAL (7) fields; the names are the
+        // JSON keys.
+        "{ i64 7, ptr @rt_td_string",
+        "{ i64 7, ptr @rt_td_int",
+        "i64 8, ptr null, i64 2, ptr @td.",
+        "c\"model\\00\"",
+        "c\"speed\\00\"",
+    ]);
+});
+
+// Every fs call but exists takes a trailing error slot: the slot is cleared,
+// the Error is loaded back, and a non-null one branches to a raise block.
+test.start("codegen: fs operations", void () -> {
+    String ir = generate(`
+import 'fs';
+import 'string';
+
+String[] names = fs.readDir("dir") catch [];
+byte[] bytes = fs.readFile("f") catch [];
+fs.writeFile("f", bytes) catch e {}
+fs.createDir("dir") catch e {}
+fs.delete("f") catch e {}
+fs.delete("dir", { recursive: true }) catch e {}
+printInline(fs.exists("f"));
+fs.Stat? s = fs.stat("f") catch e { printInline(names.length, bytes.length); }
+printInline(string.fromByteArray(bytes));
+if (s != null) {
+    printInline(s.name, s.size, s.isDirectory, s.permissions, s.modified);
+}
+`);
+    wants(ir, [
+        "call ptr @rt_fs_read_dir(ptr ",
+        "call ptr @rt_fs_read_file(ptr ",
+        "call void @rt_fs_write_file(ptr ",
+        "call void @rt_fs_create_dir(ptr ",
+        "call void @rt_fs_delete(ptr ",
+        "call i64 @rt_fs_exists(ptr ",
+        "call ptr @rt_fs_stat(ptr ",
+        "call ptr @rt_string_from_byte_array(ptr ",
+        // fs.Stat's descriptor: a record of seven fields.
+        "i64 8, ptr null, i64 7, ptr @td.",
+        "c\"name\\00\"", "c\"extension\\00\"", "c\"size\\00\"", "c\"isDirectory\\00\"",
+        "c\"isFile\\00\"", "c\"permissions\\00\"", "c\"modified\\00\"",
+    ]);
+    // Seven fallible calls give seven cleared slots and seven raise branches.
+    // exists gives neither.
+    expectCount(ir, "fs.raise", 14);
+
+    // A delete without options passes null; both forms are the same call.
+    String[] deletes = [];
+    String[] existsCalls = [];
+    forEach(string.split(ir, "\n"), line) {
+        if (string.contains(line, "call void @rt_fs_delete")) {
+            array.push(deletes, string.trim(line));
+        }
+        if (string.contains(line, "call i64 @rt_fs_exists")) {
+            array.push(existsCalls, string.trim(line));
+        }
+    }
+    test.expectInt(deletes.length, 2);
+    test.assert(string.contains(deletes[0], ", ptr null, ptr "),
+        "a delete without options should pass a null options record, got " + deletes[0]);
+    test.assert(!string.contains(deletes[1], ", ptr null, ptr "),
+        "a delete with options should pass the record, got " + deletes[1]);
+    // exists passes no error slot, so its call has one operand.
+    test.expectInt(existsCalls.length, 1);
+    test.assert(!string.contains(existsCalls[0], ","),
+        "exists should take one argument, got " + existsCalls[0]);
+});
+
+// A map's TypeDesc is TD_MAP (16) with the key and value descriptors in a
+// two-entry side table, and identical map types share one descriptor.
+test.start("codegen: map TypeDescs", void () -> {
+    String ir = generate("Map<String, int> a;\nMap<String, int> b;\nMap<int, String> c;\n");
+    wants(ir, [
+        "{ i64 16, ptr null, i64 2, ptr null, ptr @td.",
+        "[2 x ptr] [ptr @rt_td_string, ptr @rt_td_int]",
+        "[2 x ptr] [ptr @rt_td_int, ptr @rt_td_string]",
+    ]);
+    // One descriptor for the two identical maps, one for the other key order.
+    expectCount(ir, "i64 16, ptr null", 2);
+});
+
+test.start("codegen: map operations", void () -> {
+    String ir = generate(`
+Map<String, int> m;
+Map<String, int> lit = { "a": 1 };
+Map<String, int> empty = {};
+m["k"] = 2;
+printInline(m["k"]);
+printInline(m.length);
+`);
+    wants(ir, [
+        "call ptr @rt_map_new()",
+        "call void @rt_map_set(ptr ",
+        "call ptr @rt_map_get(ptr ",
+        "call i64 @rt_map_len(ptr ",
+    ]);
+    // The declaration, the literal, and the empty literal.
+    expectCount(ir, "call ptr @rt_map_new()", 3);
+    // The literal entry and the indexed write.
+    expectCount(ir, "call void @rt_map_set", 2);
+});
+
+// extends copies methods: each type gets its own symbol and receiver type, so
+// a call never reaches a body compiled for another type.
+test.start("codegen: extends emits a method per type", void () -> {
+    String ir = generate(`
+type Car {
+    String make;
+    int wheels() { return 4; }
+    String label() { return self.make; }
+}
+
+type Truck extends Car {
+    String[] tags;
+    int override wheels() { return 6; }
+}
+
+Truck t = { make: "volvo", tags: [] };
+print(t.wheels(), t.label());
+`);
+    wants(ir, [
+        "define i64 @fn.Car.wheels(",
+        "define ptr @fn.Car.label(",
+        "define i64 @fn.Truck.wheels(",
+        "define ptr @fn.Truck.label(",    // the inherited body, emitted again here
+        "call ptr @fn.Truck.label(",      // and it is the one the call reaches
+    ]);
+    absent(ir, ["call ptr @fn.Car.label("]);
+});
+
+// Slot [0] of every record payload is a pointer to its own TypeDesc
+// (recHeader; runtime.h has the C half). The collector traces a value by its
+// own type and ignores the type of the slot that holds it (§2.4).
+test.start("codegen: a record carries its descriptor", void () -> {
+    String ir = generate("type Point { int x; int y }\nPoint p = { x: 1, y: 2 };\nprint(p.y);\n");
+    // Two fields plus the descriptor slot.
+    wants(ir, ["call ptr @rt_alloc(i64 24)"]);
+    // The only stores of a @td. global are descriptor stamps.
+    int at = string.find(ir, "call ptr @rt_alloc(i64 24)");
+    String after = string.substring(ir, at, string.length(ir));
+    test.assert(string.contains(after, "store ptr @td."),
+        "no descriptor stamp after the allocation:\n" + ir);
+    // Field 0 is at offset 8, field 1 at 16; offset 0 is the descriptor's.
+    wants(ir, ["getelementptr i8, ptr %t1, i64 8", "i64 16"]);
+});
+
+// An async frame's slot [0] is the resume state, so it carries TD_SLOTS (20).
+// Traced as a record, that state would be read as a TypeDesc pointer.
+test.start("codegen: an async frame is not a record", void () -> {
+    String ir = generate(`
+int async work(int n) { return n * 2; }
+Future<int> f = work(3);
+print(await f);
+`);
+    wants(ir, ["%TD { i64 20,"]);
+});
+
+// ---- the fallible calling convention ----
+
+// A fallible function returns {result, error}; an infallible one does not.
+test.start("codegen: the fallible calling convention", void () -> {
+    String ir = generate(`
+String raises(int n) {
+    if (n < 0) { return Error("bad"); }
+    return "ok";
+}
+String clean(int n) { return "ok"; }
+void voidRaiser(int n) {
+    if (n < 0) { return Error("bad"); }
+}
+printInline(raises(1) catch "d");
+printInline(clean(1));
+voidRaiser(1) catch e { printInline(e.message); };
+`);
+    wants(ir, [
+        "define {ptr, ptr} @fn.raises(i64 %p0)",
+        "define ptr @fn.clean(i64 %p0)",
+        "define ptr @fn.voidRaiser(i64 %p0)",
+        // A success returns the value with a null error beside it.
+        "insertvalue {ptr, ptr} zeroinitializer, ptr",
+        // A call splits the pair and branches on the error half.
+        "extractvalue {ptr, ptr}",
+    ]);
+});
+
+// Propagation is a compare and a return. There is no unwinding.
+test.start("codegen: propagation is plain control flow", void () -> {
+    String ir = generate(`
+String raises(int n) {
+    if (n < 0) { return Error("bad"); }
+    return "ok";
+}
+String middle(int n) { return raises(n); }
+printInline(middle(1));
+`);
+    absent(ir, ["landingpad", "invoke "]);
+    wants(ir, [
+        // middle never mentions errors, but propagates one.
+        "define {ptr, ptr} @fn.middle(i64 %p0)",
+        // Nobody catches at the top level, so the error stops the program.
+        "call void @rt_error_abort",
+    ]);
+});
+
+// An Error allocates like any other record. It needs no runtime constructor.
+test.start("codegen: an Error value is a record", void () -> {
+    String ir = generate("String raises() { return Error(\"boom\"); }\nprintInline(raises() catch \"d\");\n");
+    // Two fields plus the descriptor slot.
+    wants(ir, ["call ptr @rt_alloc(i64 24)"]);
+    absent(ir, ["@rt_error_new"]);
+});
+
+// ---- float constants ----
+
+// llFloat's decimal must carry a '.', because LLVM does not lex a float
+// without one, and must read back as the identical binary64. §7 cannot reach a
+// double's bits, so arithmetic builds the corpus.
+test.start("codegen: float constants are bit-exact", void () -> {
+    float[] vals = [
+        0.0, -0.0, 1.0, -1.0, 0.1, -0.1, 0.5, 1.5, 2.0, 3.0,
+        3.141592653589793, 2.718281828459045,
+        9007199254740992.0,                                          // 2^53
+        9007199254740993.0,                                          // the odd integer past it
+        340282346638528859811704183484516925440.0,                   // MaxFloat32
+        0.000000000000000000000000000000000000011754943508222875,    // the smallest normal float32
+    ];
+    // A full-mantissa multiplier walks the exponent range with a fresh
+    // significand at every step.
+    float v = 1.0;
+    for (int i = 0; i < 600; i++) {
+        v = v * 0.31830988618379067;
+        array.push(vals, v);
+        array.push(vals, -v);
+    }
+    v = 1.0;
+    for (int i = 0; i < 600; i++) {
+        v = v * 3.1415926535897931;
+        array.push(vals, v);
+        array.push(vals, -v);
+    }
+    // Whole numbers: llFloat must still emit the '.'.
+    v = 1.0;
+    for (int i = 0; i < 60; i++) {
+        v = v * 2.0 + 1.0;
+        array.push(vals, v);
+    }
+
+    forEach(vals, f) {
+        String s = codegen.llFloat(f);
+        if (!string.contains(s, ".")) {
+            return Error("llFloat(" + string.from(f) + ") = \"" + s
+                + "\", which LLVM will not lex as a float");
+        }
+        float back = string.toFloat(s) catch e {
+            return Error("llFloat(" + string.from(f) + ") = \"" + s + "\", unparsable: "
+                + e.message);
+        };
+        // An exact comparison: shortest-round-trip means every bit comes back.
+        if (back != f) {
+            return Error("llFloat(" + string.from(f) + ") = \"" + s + "\", which is "
+                + string.from(back));
+        }
+    }
+});
+
+// roundFloat32 computes float64(float32(v)) with the 2^52 trick. Rounding to
+// a grid is idempotent: a value already on it must not move.
+test.start("codegen: roundFloat32 lands on the binary32 grid", void () -> {
+    float[] vals = [0.0, 1.0, -1.0, 0.5, 1.5, 0.1, -0.1, 3.141592653589793];
+    float v = 1.0;
+    for (int i = 0; i < 300; i++) {
+        v = v * 0.31830988618379067;
+        array.push(vals, v);
+        array.push(vals, -v);
+    }
+    forEach(vals, f) {
+        float once = codegen.roundFloat32(f);
+        float twice = codegen.roundFloat32(once);
+        if (once != twice) {
+            return Error("roundFloat32 is not idempotent at " + string.from(f) + ": "
+                + string.from(once) + " then " + string.from(twice));
+        }
+    }
+    // Exact binary32 values must not move; 0.1 must land on its binary32.
+    test.expectFloat(codegen.roundFloat32(1.5), 1.5);
+    test.expectFloat(codegen.roundFloat32(0.5), 0.5);
+    test.expectFloat(codegen.roundFloat32(0.1), 0.10000000149011612);
+});

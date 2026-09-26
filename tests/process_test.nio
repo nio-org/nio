@@ -1,0 +1,774 @@
+// The process module, end to end. The child.run cases use POSIX commands,
+// which on Windows come from Git Bash. The compiler build there already needs
+// that shell, because bootstrap/build.sh is a shell script. A case must not
+// assert a result that only one host gives, such as the spelling of a root
+// directory or an environment that holds only the given variables.
+import 'test';
+import 'string';
+import 'array';
+import 'process';
+import './harness' as h;
+import 'time';
+import 'path';
+
+// A variable that this program holds and never passes on. A child that shows
+// it inherited a variable it must not have.
+String const INHERITED = "NIO_TEST_INHERITED";
+
+// Runs src with INHERITED set, and answers what it wrote.
+h.Run withInherited(String src) {
+    Map<String, String> env = {};
+    env[INHERITED] = "yes";
+    return h.runBinaryIn(h.buildSource(src), [], path.getCwd(), env);
+}
+
+// The environment that a child reports can hold more than it was given,
+// because the `env` of Git Bash adds four variables. The option controls the
+// two things asserted here. A variable that a child adds to itself is not one
+// of them.
+void expectOnlyGiven(h.Run r, String given) {
+    h.expectCode(r, 0);
+    if (given != "") {
+        h.expectContains(r.out, given);
+    }
+    if (string.contains(r.out, INHERITED)) {
+        return Error("the child inherited " + INHERITED + ":\n" + r.out);
+    }
+}
+
+test.start("process: process exit code", void () -> {
+    h.Run r = h.runProgram(`
+import 'process';
+print("before");
+process.exit(7);
+print("after");
+`);
+    h.expectCode(r, 7);
+    test.expectString(r.out, "before\n");
+    test.expectString(r.err, "");
+});
+
+test.start("process: process exit skips pending async work", void () -> {
+    h.Run r = h.runProgram(`
+import 'process';
+void async late() { print("late"); }
+late();
+print("main");
+process.exit(0);
+`);
+    h.expectCode(r, 0);
+    test.expectString(r.out, "main\n");
+});
+
+test.start("process: process stdout write is raw", void () -> {
+    h.Run r = h.runProgram(`
+import 'process';
+process.stdout.write("a");
+process.stdout.write("b\\n");
+print("c");
+process.stdout.write("d");
+`);
+    h.expectCode(r, 0);
+    test.expectString(r.out, "ab\nc\nd");
+});
+
+test.start("process: process stderr write", void () -> {
+    h.Run r = h.runProgram(`
+import 'process';
+process.stderr.write("warn: ");
+process.stderr.write("x\\n");
+print("product");
+`);
+    h.expectCode(r, 0);
+    test.expectString(r.out, "product\n");
+    test.expectString(r.err, "warn: x\n");
+});
+
+// These cases check only that flush is callable and changes no output. The
+// purpose of flush needs a live reader at the other end of the pipe, and a
+// batch child runner cannot be one (§6.12).
+test.start("process: stdout and stderr flush", void () -> {
+    h.Run r = h.runProgram(`
+import 'process';
+process.stdout.write("a");
+process.stdout.flush();
+print("b");
+process.stdout.flush();
+process.stderr.write("e");
+process.stderr.flush();
+process.stdout.write("c");
+`);
+    h.expectCode(r, 0);
+    test.expectString(r.out, "ab\nc");
+    test.expectString(r.err, "e");
+});
+
+// A message loop flushes after every reply, even one that wrote no bytes.
+test.start("process: flushing an untouched stream is harmless", void () -> {
+    h.Run r = h.runProgram(`
+import 'process';
+process.stdout.flush();
+process.stderr.flush();
+process.stdout.flush();
+print("done");
+`);
+    h.expectCode(r, 0);
+    test.expectString(r.out, "done\n");
+    test.expectString(r.err, "");
+});
+
+test.start("process: process stdin read", void () -> {
+    h.Run r = h.runProgramInput(`
+import 'process';
+import 'string';
+byte[] all = process.stdin.read() catch [];
+print(all.length);
+print(all[3]);
+process.stdout.write(string.fromByteArray(all));
+`, `hi
+é`);
+    h.expectCode(r, 0);
+    test.expectString(r.out, "5\n195\nhi\né");
+});
+
+// readBytes answers a short count only at the end of the input, and an empty
+// one after it. A zero count is legal and reads nothing (§6.12).
+test.start("process: process stdin readBytes", void () -> {
+    h.Run r = h.runProgramInput(`
+import 'process';
+import 'string';
+print(string.fromByteArray(process.stdin.readBytes(5) catch []));
+print(string.fromByteArray(process.stdin.readBytes(3) catch []));
+print((process.stdin.readBytes(0) catch []).length);
+byte[] rest = process.stdin.readBytes(100) catch [];
+print(rest.length);
+print(string.fromByteArray(rest));
+print((process.stdin.readBytes(4) catch []).length);
+`, "HELLOabcXY");
+    h.expectCode(r, 0);
+    test.expectString(r.out, "HELLO\nabc\n0\n2\nXY\n0\n");
+});
+
+test.start("process: process stdin readBytes rejects a negative count", void () -> {
+    h.expectRuntimeError(`
+import 'process';
+byte[] b = process.stdin.readBytes(-1) catch [];
+print(b.length);
+`, "process.stdin.readBytes: negative count");
+});
+
+test.start("process: process stdin at end of input", void () -> {
+    h.expectOutput(`
+import 'process';
+byte[] all = process.stdin.read() catch [];
+print(all.length);
+String? line = process.stdin.readLine() catch null;
+print(line == null);
+`, [
+        "0", "true",
+    ]);
+});
+
+test.start("process: process in async functions", void () -> {
+    h.Run r = h.runProgramInput(`
+import 'process';
+String async banner(String name) { return name + "!\\n"; }
+void async announce() {
+    process.stdout.write(await banner("go"));
+}
+byte[] async slurp() { return process.stdin.read(); }
+announce();
+byte[] got = await slurp() catch [];
+print(got.length);
+`, "abc");
+    h.expectCode(r, 0);
+    test.expectString(r.out, "3\ngo!\n");
+});
+
+test.start("process: process get args", void () -> {
+    h.Run r = h.runProgramWith(`
+import 'process';
+import 'json';
+String[] args = process.getArgs();
+print(json.toText(args));
+print(args.length);
+`, ["first", "second arg", "--flag=x"], "");
+    h.expectCode(r, 0);
+    test.expectString(r.out, "[\"first\",\"second arg\",\"--flag=x\"]\n3\n");
+});
+
+test.start("process: process get args empty", void () -> {
+    h.expectOutput(`
+import 'process';
+import 'json';
+print(json.toText(process.getArgs()));
+print(process.getArgs().length);
+`, [
+        "[]", "0",
+    ]);
+});
+
+test.start("process: process child run captures output and code", void () -> {
+    h.expectOutput(`
+import 'process';
+import 'string';
+process.ChildRunResult? r = await process.child.run("sh", ["-c", "echo out; echo err >&2; exit 4"]) catch null;
+if (r != null) {
+    print(string.trim(string.fromByteArray(r.stdout)));
+    print(string.trim(string.fromByteArray(r.stderr)));
+    print(r.code);
+}
+`, [
+        "out", "err", "4",
+    ]);
+});
+
+// The kernel sets these numbers, so the case asserts only their shape: present
+// on this platform, and each field in a range that a real measurement can have.
+test.start("process: process child run usage", void () -> {
+    h.expectOutput(`
+import 'process';
+process.ChildRunResult r = await process.child.run("sh", ["-c", "exit 0"]);
+process.ChildUsage? u = r.usage;
+if (u == null) {
+    print("absent");
+} else {
+    print(u.peakMemory > 0);
+    print(u.userTime >= 0 && u.systemTime >= 0);
+    print(u.minorFaults > 0);
+    print(u.majorFaults >= 0);
+    print(u.blockReads >= 0 && u.blockWrites >= 0);
+    print(u.voluntarySwitches >= 0 && u.involuntarySwitches >= 0);
+}
+`, [
+        "true", "true", "true", "true", "true", "true",
+    ]);
+});
+
+test.start("process: process child run empty streams", void () -> {
+    h.expectOutput(`
+import 'process';
+process.ChildRunResult? r = await process.child.run("true", []) catch null;
+if (r != null) {
+    print(r.stdout.length, r.stderr.length, r.code);
+}
+`, [
+        "0 0 0",
+    ]);
+});
+
+test.start("process: process child run child stdin is empty", void () -> {
+    h.Run r = h.runProgramInput(`
+import 'process';
+import 'string';
+process.ChildRunResult? r = await process.child.run("cat", []) catch null;
+if (r != null) {
+    print(r.stdout.length, r.code);
+}
+`, "this input belongs to the parent");
+    h.expectCode(r, 0);
+    test.expectString(r.out, "0 0\n");
+});
+
+test.start("process: process child run feeds stdin", void () -> {
+    h.Run r = h.runProgramInput(`
+import 'process';
+import 'string';
+process.ChildRunResult? r = await process.child.run("cat", [],
+    { stdin: string.toByteArray("fed to the child") }) catch null;
+if (r != null) {
+    print(string.fromByteArray(r.stdout));
+    print(r.code);
+}
+print(string.fromByteArray(process.stdin.read() catch []));
+`, "still the parent's");
+    h.expectCode(r, 0);
+    test.expectString(r.out, "fed to the child\n0\nstill the parent's\n");
+});
+
+test.start("process: process child run stdin round trips bytes", void () -> {
+    h.expectOutput(`
+import 'process';
+import 'json';
+byte[] sent = [104, 0, 200, 105];
+process.ChildRunResult? r = await process.child.run("cat", [], { stdin: sent }) catch null;
+if (r != null) {
+    print(json.toText(r.stdout));
+}
+`, [
+        "[104,0,200,105]",
+    ]);
+});
+
+test.start("process: process child run empty options mean no options", void () -> {
+    h.expectOutput(`
+import 'process';
+process.ChildRunResult? a = await process.child.run("cat", []) catch null;
+process.ChildRunResult? b = await process.child.run("cat", [], {}) catch null;
+process.ChildRunResult? c = await process.child.run("cat", [], { stdin: [] }) catch null;
+if (a != null && b != null && c != null) {
+    print(a.stdout.length, b.stdout.length, c.stdout.length);
+    print(a.code, b.code, c.code);
+}
+`, [
+        "0 0 0", "0 0 0",
+    ]);
+});
+
+test.start("process: process child run working directory", void () -> {
+    // The option sets where the child looks, so the child tells whether a
+    // file in that directory exists. A printed directory would compare two
+    // spellings of one path, and no host keeps them equal.
+    String bin = h.buildSource(`
+import 'fs';
+import 'process';
+print(fs.exists(process.getArgs()[0]));
+`);
+    String one = h.scratch();
+    String two = h.scratch();
+    h.writeTo(one, "one.txt", "");
+    h.writeTo(two, "two.txt", "");
+    h.expectOutputArgs(`
+import 'process';
+import 'string';
+
+String[] argv = process.getArgs();
+
+String said(String name, String? cwd) {
+    process.ChildRunResult? r = null;
+    if (cwd == null) {
+        r = await process.child.run(argv[0], [name]) catch null;
+    } else {
+        r = await process.child.run(argv[0], [name], { cwd: cwd }) catch null;
+    }
+    if (r == null) { return "<failed>"; }
+    return string.trim(string.fromByteArray(r.stdout));
+}
+
+print(said("one.txt", argv[1]), said("two.txt", argv[1]));
+print(said("one.txt", argv[2]), said("two.txt", argv[2]));
+// The option moves the child alone: this program is where it was.
+print(said("one.txt", null), said("two.txt", null));
+`, [bin, one, two], [
+        "true false", "false true", "false false",
+    ]);
+});
+
+test.start("process: process child run missing working directory is catchable", void () -> {
+    h.expectOutput(`
+import 'process';
+await process.child.run("true", [], { cwd: "/definitely/not/a/directory" }) catch e {
+    print(e.message);
+}
+`, [
+        "process.child.run \"true\": cannot enter \"/definitely/not/a/directory\": No such file or directory",
+    ]);
+});
+
+test.start("process: process child run adds to the environment", void () -> {
+    h.expectOutput(`
+import 'process';
+import 'string';
+process.ChildRunResult? r = await process.child.run("sh", ["-c", "echo $NIO_GREETING; test -n \\"$HOME\\" && echo kept"],
+    { env: { "NIO_GREETING": "hello" } }) catch null;
+if (r != null) {
+    print(string.trim(string.fromByteArray(r.stdout)));
+}
+`, [
+        "hello", "kept",
+    ]);
+});
+
+test.start("process: process child run overrides an inherited variable", void () -> {
+    h.expectOutput(`
+import 'process';
+import 'string';
+process.ChildRunResult? r = await process.child.run("sh", ["-c", "echo $HOME; env | grep -c '^HOME='"],
+    { env: { "HOME": "/nowhere" } }) catch null;
+if (r != null) {
+    print(string.trim(string.fromByteArray(r.stdout)));
+}
+`, [
+        "/nowhere", "1",
+    ]);
+});
+
+test.start("process: process child run clear env", void () -> {
+    expectOnlyGiven(withInherited(`
+import 'process';
+import 'string';
+process.ChildRunResult? r = await process.child.run("env", [],
+    { env: { "ONLY": "one" }, clearEnv: true }) catch null;
+if (r != null) {
+    print(string.fromByteArray(r.stdout));
+}
+`), "ONLY=one");
+});
+
+test.start("process: process child run clear env with no map", void () -> {
+    expectOnlyGiven(withInherited(`
+import 'process';
+import 'string';
+process.ChildRunResult? r = await process.child.run("env", [], { clearEnv: true }) catch null;
+if (r != null) {
+    print(string.fromByteArray(r.stdout));
+}
+`), "");
+});
+
+test.start("process: process child run finds the program with its own path", void () -> {
+    // The PATH of the child names nothing, so the child is found only if the
+    // lookup uses the PATH of this program.
+    expectOnlyGiven(withInherited(`
+import 'process';
+import 'string';
+process.ChildRunResult? r = await process.child.run("env", [],
+    { env: { "PATH": "/nonexistent" }, clearEnv: true }) catch null;
+if (r != null) {
+    print(string.fromByteArray(r.stdout));
+}
+`), "PATH=/nonexistent");
+});
+
+test.start("process: process child run rejects bad environment names", void () -> {
+    h.expectOutput(`
+import 'process';
+import 'string';
+await process.child.run("true", [], { env: { "A=B": "x" } }) catch e {
+    print(e.message);
+}
+await process.child.run("true", [], { env: { "A": "x" + string.fromByteArray([0]) + "y" } }) catch e {
+    print(e.message);
+}
+`, [
+        "process.child.run: an environment name cannot contain '='",
+        "process.child.run: an environment name or value cannot contain a NUL byte",
+    ]);
+});
+
+test.start("process: process child run inherits streams", void () -> {
+    h.Run r = h.runProgram(`
+import 'process';
+print("before");
+process.ChildRunResult? r = await process.child.run("sh",
+    ["-c", "echo from the child; echo and its stderr >&2; exit 3"],
+    { inherit: true }) catch null;
+print("after");
+if (r != null) {
+    print(r.stdout.length, r.stderr.length, r.code);
+}
+`);
+    h.expectCode(r, 0);
+    test.expectString(r.out, "before\nfrom the child\nafter\n0 0 3\n");
+    test.expectString(r.err, "and its stderr\n");
+});
+
+test.start("process: process child run inherit gives the child this input", void () -> {
+    h.Run r = h.runProgramInput(`
+import 'process';
+import 'string';
+process.ChildRunResult? r = await process.child.run("cat", [],
+    { stdin: string.toByteArray("ignored"), inherit: true }) catch null;
+if (r != null) {
+    print(r.stdout.length, r.code);
+}
+`, `the parent's own input
+`);
+    h.expectCode(r, 0);
+    test.expectString(r.out, "the parent's own input\n0 0\n");
+});
+
+test.start("process: process child run inherit false captures", void () -> {
+    h.expectOutput(`
+import 'process';
+import 'string';
+bool? unset = null;
+process.ChildRunResult? a = await process.child.run("sh", ["-c", "echo captured"],
+    { inherit: false }) catch null;
+process.ChildRunResult? b = await process.child.run("sh", ["-c", "echo captured"],
+    { inherit: unset }) catch null;
+if (a != null && b != null) {
+    print(string.trim(string.fromByteArray(a.stdout)));
+    print(string.trim(string.fromByteArray(b.stdout)));
+}
+`, [
+        "captured", "captured",
+    ]);
+});
+
+test.start("process: process child run inherit alongside other options", void () -> {
+    // The directory is one that this test made. Each host spells its root
+    // differently.
+    String dir = h.scratch();
+    h.writeTo(dir, "marker.txt", "");
+    h.Run r = h.runProgramArgs(`
+import 'process';
+process.ChildRunResult? r = await process.child.run("sh",
+    ["-c", "ls marker.txt; echo $NIO_GREETING"],
+    { cwd: process.getArgs()[0], env: { "NIO_GREETING": "hello" }, inherit: true }) catch null;
+if (r != null) {
+    print(r.code);
+}
+`, [dir]);
+    h.expectCode(r, 0);
+    test.expectString(r.out, "marker.txt\nhello\n0\n");
+});
+
+test.start("process: process child run inherit failure still catchable", void () -> {
+    h.expectOutput(`
+import 'process';
+await process.child.run("definitely-not-a-real-cmd-xyz", [], { inherit: true }) catch e {
+    print(e.message);
+}
+print("still running");
+`, [
+        "process.child.run \"definitely-not-a-real-cmd-xyz\": No such file or directory",
+        "still running",
+    ]);
+});
+
+test.start("process: process child run inherit concurrently", void () -> {
+    h.Run r = h.runProgram(`
+import 'process';
+import 'string';
+import 'array';
+Future<process.ChildRunResult!>[] running = [];
+array.push(running, process.child.run("sh", ["-c", "echo A"], { inherit: true }));
+array.push(running, process.child.run("sh", ["-c", "sleep 0.2; echo captured"], {}));
+array.push(running, process.child.run("sh", ["-c", "echo B"], { inherit: true }));
+forEach (running, f, i) {
+    process.ChildRunResult? r = await f catch null;
+    if (r != null) {
+        print(string.from(i) + ": " + string.from(r.stdout.length) +
+              " " + string.trim(string.fromByteArray(r.stdout)));
+    }
+}
+`);
+    h.expectCode(r, 0);
+    test.expectString(r.out, "A\nB\n0: 0 \n1: 9 captured\n2: 0 \n");
+});
+
+test.start("process: process child run options survive collection", void () -> {
+    h.StressRun sr = h.runStressed(`
+import 'process';
+import 'string';
+import 'array';
+
+String[] out = [];
+forEach([1, 2, 3, 4, 5], i) {
+    process.ChildRunResult? r = await process.child.run("cat", [],
+        { stdin: string.toByteArray("line " + string.from(i)), cwd: "/" }) catch null;
+    if (r != null) { array.push(out, string.fromByteArray(r.stdout)); }
+}
+forEach(out, line) { print(line); }
+`);
+    test.expectString(sr.stressed.out, "line 1\nline 2\nline 3\nline 4\nline 5\n");
+});
+
+test.start("process: process child run not found is catchable", void () -> {
+    h.expectOutput(`
+import 'process';
+await process.child.run("definitely-not-a-real-cmd-xyz", []) catch e {
+    print(e.message);
+}
+print("still running");
+`, [
+        "process.child.run \"definitely-not-a-real-cmd-xyz\": No such file or directory",
+        "still running",
+    ]);
+});
+
+test.start("process: process child run uncaught stops the program", void () -> {
+    h.expectRuntimeError(`
+import 'process';
+print((await process.child.run("definitely-not-a-real-cmd-xyz", [])).code);
+`, "process.child.run \"definitely-not-a-real-cmd-xyz\"");
+});
+
+test.start("process: process child run rejects NU ls", void () -> {
+    h.expectOutput(`
+import 'process';
+import 'string';
+String tricked = string.fromByteArray([101, 0, 120]);
+await process.child.run(tricked, []) catch e {
+    print(e.message);
+}
+await process.child.run("echo", [tricked]) catch e {
+    print(e.message);
+}
+`, [
+        "process.child.run: a program name cannot contain a NUL byte",
+        "process.child.run: an argument cannot contain a NUL byte",
+    ]);
+});
+
+// The assertion checks an order and no duration. The shorter sleep resumes
+// first, which cannot occur if the two children run one after the other.
+test.start("process: process child run runs children concurrently", void () -> {
+    h.expectOutput(`
+import 'process';
+
+void async job(String name, String secs) {
+    print(name + " starts");
+    await process.child.run("sleep", [secs]) catch e {
+        print(name + " failed");
+        return;
+    };
+    print(name + " done");
+}
+
+job("slow", "0.4");
+job("fast", "0.1");
+`, [
+        "slow starts", "fast starts", "fast done", "slow done",
+    ]);
+});
+
+// §3.5: an await outside an async function drives the scheduler too.
+test.start("process: process child run batch from top level", void () -> {
+    h.expectOutput(`
+import 'process';
+import 'array';
+import 'string';
+
+Future<process.ChildRunResult!>[] running = [];
+forEach(["0.3", "0.2", "0.1"], secs) {
+    array.push(running, process.child.run("sh", ["-c", "sleep " + secs + "; echo " + secs]));
+}
+print("all started");
+forEach(running, f) {
+    process.ChildRunResult? r = await f catch null;
+    if (r != null) {
+        print(string.trim(string.fromByteArray(r.stdout)));
+    }
+}
+`, [
+        "all started", "0.3", "0.2", "0.1",
+    ]);
+});
+
+// The wait for the child stops at the deadline of the timer, so neither
+// delays the other.
+test.start("process: process child run alongside A timer", void () -> {
+    h.expectOutput(`
+import 'process';
+import 'time';
+
+Future<process.ChildRunResult!> child = process.child.run("sleep", ["0.4"]);
+await time.sleep(50);
+print("timer first");
+await child catch e { print("child failed"); };
+print("child collected");
+`, [
+        "timer first", "child collected",
+    ]);
+});
+
+// The drain waits for a dropped child, then reports the error no await took
+// (§2.9, §5.2).
+test.start("process: process child run dropped failure stops the program", void () -> {
+    h.expectRuntimeError(`
+import 'process';
+process.child.run("definitely-not-a-real-cmd-xyz", []);
+print("top-level done");
+`, "process.child.run \"definitely-not-a-real-cmd-xyz\"");
+});
+
+// Lines come back without their terminators. A CRLF stream reads like an LF
+// one, and readLine answers null after the input ends.
+test.start("process: process stdin read line", void () -> {
+    // The input holds one CRLF line ending, made with h.CR.
+    h.Run r = h.runProgramInput(`
+import 'process';
+String? line = process.stdin.readLine() catch null;
+while (line != null) {
+    print("[" + line + "]");
+    line = process.stdin.readLine() catch null;
+}
+String? after = process.stdin.readLine() catch null;
+print(after == null);
+`, "alpha\nbeta" + h.CR + "\n\ngamma");
+    h.expectCode(r, 0);
+    test.expectString(r.out, "[alpha]\n[beta]\n[]\n[gamma]\ntrue\n");
+});
+
+// A child that holds a large array reports far more peakMemory than one that
+// holds nothing.
+test.start("process: child run usage tracks memory", void () -> {
+    String smallBin = h.buildSource("print(1);\n");
+    String bigBin = h.buildSource(`
+import 'array';
+int[] xs = [];
+for (int i = 0; i < 4000000; i++) { array.push(xs, i); }
+print(xs.length);
+`);
+    // 4M int slots are 32 MB of array, so no collector tuning closes the gap.
+    h.expectOutputArgs(`
+import 'process';
+int peak(String bin) {
+    process.ChildRunResult r = await process.child.run(bin, []);
+    process.ChildUsage? u = r.usage;
+    if (u == null) { return 0; }
+    return u.peakMemory;
+}
+String[] argv = process.getArgs();
+int small = peak(argv[0]);
+int big = peak(argv[1]);
+print(small > 0 && big > small * 4);
+`, [smallBin, bigBin], ["true"]);
+});
+
+// The drain waits for a dropped child that is slow. A lower bound on the wall
+// clock shows this from outside, and it cannot give a false failure.
+test.start("process: the drain waits for a dropped child", void () -> {
+    String bin = h.buildSource(`
+import 'process';
+process.child.run("sleep", ["0.4"]);
+print("top-level done");
+`);
+    DateTime start = time.now();
+    h.Run r = h.runBinary(bin, []);
+    Duration elapsed = time.now() - start;
+    h.expectCode(r, 0);
+    test.expectString(r.out, "top-level done\n");
+    // The binary is already built, so this window holds only the run.
+    test.assert(elapsed >= 350,
+        "the program finished in " + string.from(elapsed)
+        + " ms, so the drain did not wait for the child");
+});
+
+test.start("process: child run survives collection", void () -> {
+    h.StressRun r = h.runStressed(`
+import 'process';
+import 'array';
+import 'string';
+
+// Dropped futures: nothing in the program refers to these at all.
+forEach(["a", "b", "c"], tag) {
+    process.child.run("sh", ["-c", "echo " + tag]);
+}
+
+Future<process.ChildRunResult!>[] kept = [];
+forEach(["x", "y", "z"], tag) {
+    array.push(kept, process.child.run("sh", ["-c", "sleep 0.1; echo " + tag]));
+}
+
+// Churn while the children run, so a collection is certain to land inside
+// the window in which the futures are live but unreferenced.
+String junk = "";
+forEach([1, 2, 3, 4, 5, 6, 7, 8], i) {
+    junk = junk + string.from(i) + "--------------------------------";
+}
+print(string.length(junk));
+
+forEach(kept, f) {
+    process.ChildRunResult? r = await f catch null;
+    if (r != null) {
+        print(string.trim(string.fromByteArray(r.stdout)), r.code);
+    }
+}
+`);
+    test.expectString(r.stressed.out, r.plain.out);
+    test.assert(string.contains(r.plain.out, "x 0") && string.contains(r.plain.out, "z 0"),
+        "expected each kept child's output, got \"" + r.plain.out + "\"");
+});

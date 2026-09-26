@@ -1,0 +1,203 @@
+// Native interop (§5.8), end to end: a real C file declared by `native source`,
+// compiled by clang with the program, and called through extern declarations.
+// It covers values in both directions, the GC contract, and the loader's
+// per-host flag filter. tests/ffi_test.nio covers the checker part.
+import 'test';
+import './harness' as h;
+import '../src/loader' as loader;
+
+// One C function for each type that crosses. It includes runtime.h, which each
+// build writes beside the IR. It roots what it holds across an allocation, as
+// every lib/*.c file does.
+String const ADDER_C = `
+#include <stdint.h>
+#include <string.h>
+#include "runtime.h"
+
+int64_t nio_test_add(int64_t a, int64_t b) { return a + b; }
+
+double nio_test_scale(double x, int64_t k) { return x * (double)k; }
+
+int64_t nio_test_both(int64_t yes) { return yes ? 1 : 0; }
+
+int64_t nio_test_sum_bytes(Arr *data) {
+    int64_t total = 0;
+    const uint8_t *b = rt_arr_bytes(data);
+    for (int64_t i = 0; i < data->len; i++) total += b[i];
+    return total;
+}
+
+Str *nio_test_greet(Str *name) {
+    TypeDesc *tds[1] = {&rt_td_string};
+    int64_t slots[1] = {(int64_t)(intptr_t)name};
+    GCFrame f = {rt_gc_top, 1, tds, slots};
+    rt_gc_top = &f;
+    Str *out = rt_str_alloc(7 + name->len);
+    memcpy(out->data, "hello, ", 7);
+    memcpy(out->data + 7, name->data, (size_t)name->len);
+    rt_gc_top = f.prev;
+    return out;
+}
+`;
+
+// The compiler removes a flag for another platform and keeps the flag for the
+// host. The host flag is a real linker input. The others name a library that
+// does not exist, so a successful link is the assertion.
+String flagLines() {
+    String host = loader.hostOS();
+    String out = "";
+    forEach(["windows", "darwin", "linux"], os) {
+        String flag = "-lnot_a_real_library";
+        if (os == host) {
+            flag = "-lm";
+            if (os == "windows") {
+                flag = "-lkernel32";
+            }
+        }
+        out = out + "native flags " + os + " '" + flag + "';\n";
+    }
+    return out;
+}
+
+test.start("ffi: values cross the C boundary both ways", void () -> {
+    h.expectFilesOutput([
+        h.file("adder.c", ADDER_C),
+        h.file("main.nio", `
+import 'string';
+native source './adder.c';
+` + flagLines() + `
+extern int nio_test_add(int a, int b);
+extern float nio_test_scale(float x, int k);
+extern bool nio_test_both(bool yes);
+extern int nio_test_sum_bytes(byte[] data);
+extern String nio_test_greet(String name);
+
+print(nio_test_add(2, 40));
+print(nio_test_scale(1.5, 4));
+print(nio_test_both(true));
+print(nio_test_sum_bytes(string.toByteArray("abc")));
+print(nio_test_greet("nio"));
+`),
+    ], "main.nio", ["42", "6", "true", "294", "hello, nio"]);
+});
+
+test.start("ffi: an extern crosses a module boundary through a wrapper", void () -> {
+    h.expectFilesOutput([
+        h.file("adder.c", ADDER_C),
+        h.file("lib.nio", `
+native source './adder.c';
+extern int nio_test_add(int a, int b);
+export int addTwice(int a, int b) {
+    return nio_test_add(a, b) + nio_test_add(a, b);
+}
+`),
+        h.file("main.nio", `
+import './lib';
+print(lib.addTwice(3, 4));
+`),
+    ], "main.nio", ["14"]);
+});
+
+test.start("ffi: two modules may bind one symbol at one signature", void () -> {
+    // One symbol declared twice appears in the IR once. Two different
+    // signatures for it are a compile error that names the other module, because
+    // clang refuses two conflicting declares of one C function.
+    h.expectFilesOutput([
+        h.file("adder.c", ADDER_C),
+        h.file("lib.nio", `
+native source './adder.c';
+extern int nio_test_add(int a, int b);
+export int viaLib(int a) { return nio_test_add(a, 1); }
+`),
+        h.file("main.nio", `
+import './lib';
+extern int nio_test_add(int a, int b);
+print(nio_test_add(lib.viaLib(1), 40));
+`),
+    ], "main.nio", ["42"]);
+    h.expectFilesError([
+        h.file("adder.c", ADDER_C),
+        h.file("lib.nio", `
+native source './adder.c';
+extern int nio_test_add(int a, int b);
+export int viaLib(int a) { return nio_test_add(a, 1); }
+`),
+        h.file("main.nio", `
+import './lib';
+extern float nio_test_add(float a, float b);
+print(nio_test_add(1.0, 2.0));
+`),
+    ], "main.nio", "declared with a different signature");
+});
+
+test.start("ffi: an extern call suspends and resumes with an async body", void () -> {
+    h.expectFilesOutput([
+        h.file("adder.c", ADDER_C),
+        h.file("main.nio", `
+native source './adder.c';
+extern int nio_test_add(int a, int b);
+int async half(int n) {
+    return nio_test_add(n, 1);
+}
+int async work(int n) {
+    int a = await half(n);
+    return nio_test_add(a, a);
+}
+print(await work(20));
+`),
+    ], "main.nio", ["42"]);
+});
+
+test.start("ffi: a native source that does not exist is a compile error", void () -> {
+    h.expectFilesError([
+        h.file("main.nio", "native source './missing.c';\nprint(1);\n"),
+    ], "main.nio", "not found");
+});
+
+// Two modules may each ship a `util.c`, because the driver writes the sources
+// of each module under its own qual. A build often holds two packages that
+// each wrap a C library.
+test.start("ffi: two modules may each ship a source of the same name", void () -> {
+    h.expectFilesOutput([
+        h.file("a/x.c", "int nio_a_val(void) { return 7; }\n"),
+        h.file("a/mod.nio", `
+native source './x.c';
+extern int nio_a_val();
+export int value() { return nio_a_val(); }
+`),
+        h.file("b/x.c", "int nio_b_val(void) { return 9; }\n"),
+        h.file("b/mod.nio", `
+native source './x.c';
+extern int nio_b_val();
+export int value() { return nio_b_val(); }
+`),
+        h.file("main.nio", `
+import './a/mod' as a;
+import './b/mod' as b;
+print(a.value());
+print(b.value());
+`),
+    ], "main.nio", ["7", "9"]);
+});
+
+test.start("ffi: two native sources may not share a base name", void () -> {
+    h.expectFilesError([
+        h.file("a/x.c", "int unused_a;\n"),
+        h.file("b/x.c", "int unused_b;\n"),
+        h.file("main.nio", `
+native source './a/x.c';
+native source './b/x.c';
+print(1);
+`),
+    ], "main.nio", "share the base name");
+});
+
+test.start("ffi: the IR declares the bare symbol and calls it directly", void () -> {
+    String ir = h.emitIR(`
+extern int nio_ir_probe(int a);
+print(nio_ir_probe(1));
+`);
+    h.expectContains(ir, "declare i64 @nio_ir_probe(i64)");
+    h.expectContains(ir, "call i64 @nio_ir_probe(");
+    h.expectAbsent(ir, "@fn.nio_ir_probe");
+});

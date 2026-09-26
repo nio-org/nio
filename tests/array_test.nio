@@ -1,0 +1,170 @@
+// Eleven functions of §6.5: six that call a function value once per element,
+// and five that move or compare elements without one. Every callback here
+// allocates, so a root that a loop does not keep fails under NIO_GC_STRESS=1.
+import 'test';
+import 'array';
+import 'string';
+
+type Point {
+    int x;
+    int y;
+}
+
+test.start("array: map answers an array of what the function answers", void () -> {
+    int[] nums = [1, 2, 3];
+    int[] doubled = array.map(nums, int (int n) -> n * 2);
+    test.expectString(string.join(array.map(doubled, String (int n) -> string.from(n)), ","), "2,4,6");
+    // A change of element type and of width: ints become strings, bytes become
+    // ints, strings become floats.
+    String[] texts = array.map(nums, String (int n) -> "n" + string.from(n));
+    test.expectString(string.join(texts, " "), "n1 n2 n3");
+    byte[] bytes = [7, 8];
+    int[] widened = array.map(bytes, int (byte b) -> b * 100);
+    test.expectInt(widened[1], 800);
+    float[] halves = array.map(texts, float (String s) -> 0.5);
+    test.expectFloat(halves[2], 0.5);
+    Point[] points = array.map(nums, Point (int n) -> {
+        return { x: n, y: n * n };
+    });
+    test.expectInt(points[2].y, 9);
+    int[] none = [];
+    test.expectInt(array.map(none, int (int n) -> n).length, 0);
+});
+
+test.start("array: filter keeps what the function says", void () -> {
+    int[] nums = [1, 2, 3, 4, 5, 6];
+    int[] evens = array.filter(nums, bool (int n) -> n % 2 == 0);
+    test.expectString(string.join(array.map(evens, String (int n) -> string.from(n)), ","), "2,4,6");
+    String[] words = ["ant", "bee", "cricket", "dog"];
+    String[] longer = array.filter(words, bool (String w) -> string.length(w + "!") > 4);
+    test.expectString(string.join(longer, ","), "cricket");
+    byte[] bytes = [1, 200, 3, 250];
+    byte[] high = array.filter(bytes, bool (byte b) -> b > 100);
+    test.expectInt(high.length, 2);
+    test.expectInt(high[1], 250);
+    test.expectInt(array.filter(nums, bool (int n) -> false).length, 0);
+});
+
+test.start("array: reduce folds from a starting value", void () -> {
+    int[] nums = [1, 2, 3, 4];
+    test.expectInt(array.reduce(nums, 0, int (int acc, int n) -> acc + n), 10);
+    test.expectInt(array.reduce(nums, 1, int (int acc, int n) -> acc * n), 24);
+    // A String accumulator is a heap value that every step replaces.
+    String joined = array.reduce(nums, "", String (String acc, int n) -> acc + string.from(n) + ";");
+    test.expectString(joined, "1;2;3;4;");
+    float mean = array.reduce(nums, 0.0, float (float acc, int n) -> acc + 0.25);
+    test.expectFloat(mean, 1.0);
+    int[] none = [];
+    test.expectInt(array.reduce(none, 7, int (int acc, int n) -> acc + n), 7);
+});
+
+test.start("array: find answers the first match or null", void () -> {
+    int[] nums = [5, 8, 13, 21];
+    int? big = array.find(nums, bool (int n) -> n > 10);
+    test.expectBool(big != null, true);
+    if (big != null) {
+        test.expectInt(big, 13);
+    }
+    int? none = array.find(nums, bool (int n) -> n > 100);
+    test.expectBool(none == null, true);
+    String[] words = ["ant", "bee", "cat"];
+    String? b = array.find(words, bool (String w) -> string.contains(w + "", "e"));
+    test.expectBool(b != null, true);
+    if (b != null) {
+        test.expectString(b, "bee");
+    }
+    byte[] bytes = [1, 2, 3];
+    byte? two = array.find(bytes, bool (byte v) -> v == 2);
+    test.expectBool(two != null, true);
+});
+
+test.start("array: some and every, including the empty array", void () -> {
+    int[] nums = [2, 4, 6];
+    test.expectBool(array.some(nums, bool (int n) -> n == 4), true);
+    test.expectBool(array.some(nums, bool (int n) -> n == 5), false);
+    test.expectBool(array.every(nums, bool (int n) -> n % 2 == 0), true);
+    test.expectBool(array.every(nums, bool (int n) -> n < 6), false);
+    int[] none = [];
+    test.expectBool(array.some(none, bool (int n) -> true), false);
+    test.expectBool(array.every(none, bool (int n) -> false), true);
+    // Both stop at the first element that decides the result.
+    int seen = 0;
+    bool hit = array.some(nums, bool (int n) -> { seen = seen + 1; return n == 2; });
+    test.expectBool(hit, true);
+    test.expectInt(seen, 1);
+});
+
+test.start("array: contains follows ==", void () -> {
+    int[] nums = [1, 2, 3];
+    test.expectBool(array.contains(nums, 2), true);
+    test.expectBool(array.contains(nums, 4), false);
+    String[] words = ["ant", "bee"];
+    test.expectBool(array.contains(words, "b" + "ee"), true);
+    test.expectBool(array.contains(words, "cat"), false);
+    byte[] bytes = [9, 200];
+    test.expectBool(array.contains(bytes, 200), true);
+    int[3] fixed = [4, 5, 6];
+    test.expectBool(array.contains(fixed, 5), true);
+});
+
+test.start("array: reverse works in place at every width", void () -> {
+    int[] nums = [1, 2, 3, 4];
+    array.reverse(nums);
+    test.expectString(string.join(array.map(nums, String (int n) -> string.from(n)), ","), "4,3,2,1");
+    int[] odd = [1, 2, 3];
+    array.reverse(odd);
+    test.expectInt(odd[0], 3);
+    test.expectInt(odd[1], 2);
+    byte[] bytes = [1, 2, 3, 4, 5];
+    array.reverse(bytes);
+    test.expectInt(bytes[0], 5);
+    test.expectInt(bytes[4], 1);
+    String[] words = ["a", "b"];
+    array.reverse(words);
+    test.expectString(words[0], "b");
+    int[] none = [];
+    array.reverse(none);
+    test.expectInt(none.length, 0);
+});
+
+test.start("array: fill sets every element", void () -> {
+    int[3] fixed = [1, 2, 3];
+    array.fill(fixed, 9);
+    test.expectInt(fixed[0] + fixed[1] + fixed[2], 27);
+    String[] words = ["a", "b"];
+    array.fill(words, "z" + "z");
+    test.expectString(string.join(words, ","), "zz,zz");
+    byte[] bytes = [1, 2, 3];
+    array.fill(bytes, 255);
+    test.expectInt(bytes[2], 255);
+});
+
+test.start("array: concat and flatten answer new arrays", void () -> {
+    int[] a = [1, 2];
+    int[] b = [3];
+    int[] ab = array.concat(a, b);
+    test.expectString(string.join(array.map(ab, String (int n) -> string.from(n)), ","), "1,2,3");
+    test.expectInt(a.length, 2);
+    byte[] x = [1];
+    byte[] y = [2, 3];
+    byte[] xy = array.concat(x, y);
+    test.expectInt(xy.length, 3);
+    test.expectInt(xy[2], 3);
+    int[] none = [];
+    test.expectInt(array.concat(none, none).length, 0);
+    String[] s1 = ["a"];
+    String[] s2 = ["b"];
+    test.expectString(string.join(array.concat(s1, s2), ""), "ab");
+
+    int[][] nested = [[1, 2], [], [3, 4, 5]];
+    int[] flat = array.flatten(nested);
+    test.expectString(string.join(array.map(flat, String (int n) -> string.from(n)), ","), "1,2,3,4,5");
+    String[][] wordsIn = [["a", "b"], ["c"]];
+    test.expectString(string.join(array.flatten(wordsIn), ""), "abc");
+    byte[][] bytesIn = [[1], [2, 3]];
+    byte[] flatBytes = array.flatten(bytesIn);
+    test.expectInt(flatBytes.length, 3);
+    test.expectInt(flatBytes[2], 3);
+    int[][] empty = [];
+    test.expectInt(array.flatten(empty).length, 0);
+});

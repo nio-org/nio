@@ -1,0 +1,120 @@
+// An example and smoke test for the `sqlite` library.
+//
+//     nio run libraries/sqlite/example.nio
+//
+// It needs a writable current directory and deletes what it creates. Every
+// line except the summary starts with "ok:". A "FAIL:" line is a library
+// defect.
+import './sqlite';
+import 'json';
+import 'string';
+import 'fs';
+
+String const DB = "sqlite_example.db";
+
+void main() {
+    int fails = 0;
+    Function(bool, String)<void> check = void (bool ok, String what) -> {
+        if (ok) {
+            print("ok: " + what);
+        } else {
+            print("FAIL: " + what);
+            fails = fails + 1;
+        }
+    };
+
+    fs.delete(DB) catch e { };
+
+    sqlite.Db db = sqlite.open(DB) catch e {
+        print("FAIL: open: " + e.message);
+        return;
+    };
+
+    sqlite.exec(db, "CREATE TABLE notes (id INTEGER PRIMARY KEY, title TEXT, n INTEGER, x REAL); CREATE INDEX notes_n ON notes(n);", []) catch e {
+        print("FAIL: schema: " + e.message);
+        return;
+    };
+    check(true, "open + schema (two statements, one exec)");
+
+    // Bind values. Do not splice them into SQL. This title holds an injection.
+    String nasty = "it's 100% _fun_; DROP TABLE notes; -- and a back\\slash";
+    sqlite.exec(db, "INSERT INTO notes (title, n, x) VALUES (?, ?, ?)", [nasty, "9007199254740993", "1.5"]) catch e {
+        print("FAIL: insert: " + e.message);
+        return;
+    };
+    sqlite.exec(db, "INSERT INTO notes (title, n, x) VALUES (?, NULL, NULL)", ["second"]) catch e {
+        print("FAIL: insert 2: " + e.message);
+        return;
+    };
+
+    Json rows = sqlite.query(db, "SELECT title, n, x FROM notes ORDER BY id", []) catch e {
+        print("FAIL: select: " + e.message);
+        return;
+    };
+    String t0 = json.asText(rows[0]["title"]) catch "?";
+    check(t0 == nasty, "a hostile title round-trips byte for byte");
+    int n0 = json.asInt(rows[0]["n"]) catch 0;
+    check(n0 == 9007199254740993, "an INTEGER above 2^53 stays exact");
+    float x0 = json.asFloat(rows[0]["x"]) catch 0.0;
+    check(x0 == 1.5, "a REAL comes back as the value");
+    check(json.getType(rows[1]["n"]) == json.Type.NULL, "SQL NULL is Json null");
+
+    Json counted = sqlite.query(db, "SELECT COUNT(*) AS c FROM notes WHERE title = ?", [nasty]) catch e {
+        print("FAIL: count: " + e.message);
+        return;
+    };
+    int c = json.asInt(counted[0]["c"]) catch -1;
+    check(c == 1, "binding matches the stored text exactly");
+
+    sqlite.exec(db, "INSERT INTO notes (title) VALUES (?)", []) catch e {
+        check(e.code == sqlite.ErrorCode.MISUSE, "a parameter count mismatch raises MISUSE");
+    };
+    sqlite.exec(db, "INSERT INTO nowhere VALUES (1)", []) catch e {
+        check(e.code == sqlite.ErrorCode.SQL, "a missing table raises SQL");
+    };
+    sqlite.query(db, "SELECT 1; SELECT 2", []) catch e {
+        check(e.code == sqlite.ErrorCode.MISUSE, "query refuses a second statement");
+    };
+
+    sqlite.close(db);
+    sqlite.exec(db, "SELECT 1", []) catch e {
+        check(e.code == sqlite.ErrorCode.MISUSE, "a closed handle raises MISUSE");
+    };
+
+    sqlite.Db again = sqlite.open(DB) catch e {
+        print("FAIL: reopen: " + e.message);
+        return;
+    };
+    Json back = sqlite.query(again, "SELECT title FROM notes ORDER BY id", []) catch e {
+        print("FAIL: reread: " + e.message);
+        return;
+    };
+    String t = json.asText(back[0]["title"]) catch "?";
+    check(t == nasty, "the data survives close and reopen");
+    sqlite.close(again);
+
+    sqlite.Db mem = sqlite.open(":memory:") catch e {
+        print("FAIL: :memory:: " + e.message);
+        return;
+    };
+    sqlite.exec(mem, "CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('x')", []) catch e {
+        print("FAIL: :memory: exec: " + e.message);
+        return;
+    };
+    Json mv = sqlite.query(mem, "SELECT v FROM t", []) catch e {
+        print("FAIL: :memory: query: " + e.message);
+        return;
+    };
+    check((json.asText(mv[0]["v"]) catch "?") == "x", ":memory: works");
+    sqlite.close(mem);
+
+    fs.delete(DB) catch e { };
+
+    if (fails == 0) {
+        print("sqlite example: all ok");
+    } else {
+        print("sqlite example: " + string.from(fails) + " FAILED");
+    }
+}
+
+main();

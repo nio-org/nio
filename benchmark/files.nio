@@ -1,0 +1,53 @@
+// Measures whole-file I/O, regexp matching over the whole text, and string
+// edits: 1,000 rounds of read, find a token, change it, write back.
+import 'array';
+import 'fs';
+import 'path';
+import 'regexp';
+import 'string';
+
+int n = 1000;
+int lines = 400;
+
+// The matching line comes last, so every search scans the whole file.
+String[] parts = [];
+int k = 0;
+while (k < lines) {
+    array.push(parts, "field_" + string.from(k) + " = value_" + string.from(k));
+    k = k + 1;
+}
+array.push(parts, "counter = 0000");
+String doc = string.join(parts, "\n") + "\n";
+
+String dir = fs.createTempDir("nio-bench-files-");
+String file = path.join(dir, "data.txt");
+fs.writeFile(file, string.toByteArray(doc));
+
+// The counter stays four digits, so every round matches at the same offset.
+RegExp re = regexp.create("counter = [0-9]{4}");
+int checksum = 0;
+int i = 0;
+
+while (i < n) {
+    String text = string.fromByteArray(fs.readFile(file));
+    int at = regexp.find(text, re);
+    checksum = checksum + at;
+
+    int v = string.toInt(string.substring(text, at + 10, at + 14)) + 1;
+    String num = string.from(v);
+    while (string.length(num) < 4) {
+        num = "0" + num;
+    }
+    String edited = string.substring(text, 0, at + 10) + num
+        + string.substring(text, at + 14, string.length(text));
+
+    fs.writeFile(file, string.toByteArray(edited));
+    i = i + 1;
+}
+
+String text = string.fromByteArray(fs.readFile(file));
+int at = regexp.find(text, re);
+int counter = string.toInt(string.substring(text, at + 10, at + 14));
+
+fs.delete(dir, { recursive: true });
+print(checksum + counter);

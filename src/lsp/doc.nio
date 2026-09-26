@@ -1,0 +1,141 @@
+// The prose written above a declaration: the comment block that ends on the
+// line directly above it, with no blank line between. A comment that trails
+// code documents nothing, which `ownLine` (token.nio) tells apart.
+import '../token' as token;
+import '../lib/str' as str;
+import 'string';
+import 'array';
+
+// Returns the prose written directly above a line, or "" if there is none.
+export String above(token.Comment[] comments, int line) {
+    String[] block = [];
+    int want = line - 1;
+    while (true) {
+        token.Comment? found = endingOn(comments, want);
+        if (found == null) {
+            break;
+        }
+        token.Comment c = found;
+        array.push(block, strip(c));
+        want = c.line - 1;
+    }
+    if (block.length == 0) {
+        return "";
+    }
+    // The walk collects the block upward, so reverse it into file order.
+    array.reverse(block);
+    return string.join(block, "\n");
+}
+
+// The prose at the top of a file, which documents the module: the comment block
+// that begins on line 1. It answers "" where that block sits directly above the
+// first declaration, because then it documents that declaration instead.
+export String atTop(token.Comment[] comments, int firstDecl) {
+    int end = 0;
+    forEach(comments, c) {
+        if (c.ownLine && c.line == 1) {
+            end = c.endLine;
+        }
+    }
+    if (end == 0) {
+        return "";
+    }
+    // The lexer records one comment per line, so a block is a run of them.
+    bool grew = true;
+    while (grew) {
+        grew = false;
+        forEach(comments, c) {
+            if (c.ownLine && c.line == end + 1) {
+                end = c.endLine;
+                grew = true;
+            }
+        }
+    }
+    if (firstDecl == end + 1) {
+        return "";
+    }
+    return above(comments, end + 1);
+}
+
+// Returns the comment that ends on `line` and has only whitespace before it.
+token.Comment? endingOn(token.Comment[] comments, int line) {
+    token.Comment? found = null;
+    forEach(comments, c) {
+        if (c.ownLine && c.endLine == line) {
+            found = c;
+        }
+    }
+    return found;
+}
+
+// Returns the text of a comment with its markers removed. It changes nothing
+// else, because the remaining text is markdown.
+String strip(token.Comment c) {
+    if (str.hasPrefix(c.text, "//")) {
+        return dropSpace(string.substring(c.text, 2, string.length(c.text)));
+    }
+    String body = c.text;
+    if (str.hasPrefix(body, "/*")) {
+        body = string.substring(body, 2, string.length(body));
+    }
+    if (str.hasSuffix(body, "*/")) {
+        body = string.substring(body, 0, string.length(body) - 2);
+    }
+    String[] lines = string.split(body, "\n");
+    String[] out = [];
+    forEach(lines, l, i) {
+        if (i == 0) {
+            array.push(out, dropSpace(trimRight(l)));
+            continue;
+        }
+        array.push(out, dropSpace(dropStar(trimRight(l))));
+    }
+    return string.join(trimBlank(out), "\n");
+}
+
+// Removes the indentation of a continuation line and the `*` at the left edge
+// of a block comment. A line with no star loses only the indentation.
+String dropStar(String s) {
+    int i = 0;
+    int n = string.length(s);
+    while (i < n && (s[i] == 32 || s[i] == 9)) {
+        i++;
+    }
+    if (i < n && s[i] == 42) {
+        i++;
+    }
+    return string.substring(s, i, n);
+}
+
+String dropSpace(String s) {
+    if (string.length(s) > 0 && s[0] == 32) {
+        return string.substring(s, 1, string.length(s));
+    }
+    return s;
+}
+
+String trimRight(String s) {
+    int n = string.length(s);
+    while (n > 0 && (s[n - 1] == 32 || s[n - 1] == 9 || s[n - 1] == 13)) {
+        n--;
+    }
+    return string.substring(s, 0, n);
+}
+
+// Removes the empty lines at both ends of a block comment. They come from the
+// newline after `/*` and the newline before `*/`.
+String[] trimBlank(String[] lines) {
+    int lo = 0;
+    int hi = lines.length;
+    while (lo < hi && lines[lo] == "") {
+        lo++;
+    }
+    while (hi > lo && lines[hi - 1] == "") {
+        hi--;
+    }
+    String[] out = [];
+    for (int i = lo; i < hi; i++) {
+        array.push(out, lines[i]);
+    }
+    return out;
+}

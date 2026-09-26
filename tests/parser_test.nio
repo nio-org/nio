@@ -1,0 +1,861 @@
+// The parser. A program that parses is checked by rendering the tree back with
+// ast.programString, which makes precedence and statement shape visible. A
+// program that does not parse is checked by a substring of its diagnostic.
+import 'test';
+import 'string';
+import 'array';
+import '../src/parser' as parser;
+import '../src/lexer' as lexer;
+import '../src/ast' as ast;
+import 'map';
+
+// The rendered program, and whatever the parser complained about on the way.
+type Parsed {
+    String text;
+    String[] errs;
+}
+
+Parsed parse(String input) {
+    parser.Parser p = parser.newParser(lexer.newLexer(input));
+    ast.Program prog = p.parseProgram();
+    Parsed out = { text: ast.programString(prog), errs: p.errs };
+    return out;
+}
+
+String parseOK(String input) {
+    Parsed p = parse(input);
+    if (p.errs.length > 0) {
+        return Error("unexpected parse errors for \"" + input + "\":\n"
+            + string.join(p.errs, "\n"));
+    }
+    return p.text;
+}
+
+// A row of either table: the source, and the rendering or diagnostic wanted.
+type Row {
+    String input;
+    String want;
+}
+
+Row row(String input, String want) {
+    Row r = { input: input, want: want };
+    return r;
+}
+
+void renders(Row[] table) {
+    forEach(table, t) {
+        String got = parseOK(t.input);
+        if (got != t.want) {
+            return Error("input \"" + t.input + "\":\n got  \"" + got
+                + "\"\n want \"" + t.want + "\"");
+        }
+    }
+}
+
+void rejects(Row[] table) {
+    forEach(table, t) {
+        Parsed p = parse(t.input);
+        if (p.errs.length == 0) {
+            return Error("input \"" + t.input + "\": expected a parse error, got none");
+        }
+        bool found = false;
+        forEach(p.errs, e) {
+            if (string.contains(e, t.want)) {
+                found = true;
+            }
+        }
+        if (!found) {
+            return Error("input \"" + t.input + "\": no error containing \"" + t.want
+                + "\" in:\n" + string.join(p.errs, "\n"));
+        }
+    }
+}
+
+test.start("parser: statements", void () -> {
+    renders([
+        row("int x = 5;", "int x = 5;"),
+        row("int const x = 5;", "int const x = 5;"),
+        row("String const s = \"ciao\";", "String const s = \"ciao\";"),
+        row("int[] const a = [1, 2];", "int[] const a = [1, 2];"),
+        row("car? const c = null;", "car? const c = null;"),
+        row("export int const x = 1;", "export int const x = 1;"),
+        row("DateTime d;", "DateTime d;"),
+        row("String? s;", "String? s;"),
+        row("int?[] xs;", "int?[] xs;"),
+        row("int[] a = [2, 5, 4];", "int[] a = [2, 5, 4];"),
+        row("int[5] a = [1, 2, 3, 4, 5];", "int[5] a = [1, 2, 3, 4, 5];"),
+        row("int[2][] m;", "int[2][] m;"),
+        row("String[3]? s;", "String[3]? s;"),
+        row("int[5] f(int[5] a) { return a; }", "int[5] f(int[5] a) { return a; }"),
+        row("type t { int[4] xs; }", "type t { int[4] xs; }"),
+        row("enum HttpResponses { OK: 200, NOT_FOUND: 404 }",
+            "enum HttpResponses { OK: 200, NOT_FOUND: 404 }"),
+        row("enum E { A: 1, B: 2, }", "enum E { A: 1, B: 2 }"),
+        row("enum E { LOW: -5 }", "enum E { LOW: -5 }"),
+        row("export enum E { A: 1 }", "export enum E { A: 1 }"),
+        row("E x = E.OK;", "E x = (E.OK);"),
+        row("m.E x = m.E.OK;", "m.E x = ((m.E).OK);"),
+        row("float f = 1.5;", "float f = 1.5;"),
+        row("String s = \"hi\";", "String s = \"hi\";"),
+        row("bool b = true;", "bool b = true;"),
+        row("String? s = null;", "String? s = null;"),
+        row("x = x + 1;", "x = (x + 1);"),
+        row("a[0] = 5;", "(a[0]) = 5;"),
+        row("c.owner = \"bob\";", "(c.owner) = \"bob\";"),
+        row("foo();", "foo();"),
+        row("return;", "return;"),
+        row("return x + 1;", "return (x + 1);"),
+        row("while (i < 10) { i = i + 1; }", "while ((i < 10)) { i = (i + 1); }"),
+        row("while (b) { break; }", "while (b) { break; }"),
+        row("while (b) { continue; }", "while (b) { continue; }"),
+        row("forEach(a, e) { if (e) { continue; } break; }",
+            "forEach (a, e) { if (e) { continue; } break; }"),
+        row("switch (x) { case 1: print(1); }", "switch (x) { case 1: { print(1); } }"),
+        row("switch (x) { case 1: print(1); default: print(0); }",
+            "switch (x) { case 1: { print(1); } default: { print(0); } }"),
+        // Stacked empty clauses fold into the clause they share.
+        row("switch (x) { case 1: case 2: print(1); default: print(0); }",
+            "switch (x) { case 1: case 2: { print(1); } default: { print(0); } }"),
+        row("switch (x) { case 1: default: print(0); }",
+            "switch (x) { case 1: default: { print(0); } }"),
+        row("switch (s) { case \"a\": break; case -1.5: continue; }",
+            "switch (s) { case \"a\": { break; } case (-1.5): { continue; } }"),
+        row("switch (x) {}", "switch (x) {  }"),
+        row("i++;", "i++;"),
+        row("a[0]--;", "(a[0])--;"),
+        row("c.age++;", "(c.age)++;"),
+        row("for (int i = 0; i < 10; i++) { printInline(i); }",
+            "for (int i = 0; (i < 10); i++) { printInline(i); }"),
+        row("for (i = 0; i < 10; i = i + 1) {}", "for (i = 0; (i < 10); i = (i + 1)) {  }"),
+        row("for (; i < 10;) {}", "for (; (i < 10); ) {  }"),
+        row("for (; i < n; a[0]--) {}", "for (; (i < n); (a[0])--) {  }"),
+        row("forEach(myArray, e) { printInline(e); }",
+            "forEach (myArray, e) { printInline(e); }"),
+        row("forEach(myArray, e, i) { printInline(i); }",
+            "forEach (myArray, e, i) { printInline(i); }"),
+        row("forEach(f(x), e) {}", "forEach (f(x), e) {  }"),
+        row("type car { String make; int age; String? owner; }",
+            "type car { String make; int age; String? owner; }"),
+        row("type carWeight { int empty; int? full }",
+            "type carWeight { int empty; int? full; }"),
+        row("type car { { int amount; String? piece }[]? repairs; }",
+            "type car { { int amount; String? piece; }[]? repairs; }"),
+        row("type a { { { int d } c; } b; }", "type a { { { int d; } c; } b; }"),
+        row("type e { int power 'json:engine_power'; }",
+            "type e { int power 'json:engine_power'; }"),
+        row("type e { { int n 'json:num' }[] xs; float f }",
+            "type e { { int n 'json:num'; }[] xs; float f; }"),
+        row("type line { int from; int from2 'json:src'; }",
+            "type line { int from; int from2 'json:src'; }"),
+        row("int f(int a, String b) { return a + 1; }",
+            "int f(int a, String b) { return (a + 1); }"),
+        row("geo.point? f() { return null; }", "geo.point? f() { return null; }"),
+        row("int[] f() { return []; }", "int[] f() { return []; }"),
+        row("void noop() {}", "void noop() {  }"),
+        row("car[] myCars;", "car[] myCars;"),
+        row("if (a < b) { x = 1; } else if (a > c) { x = 2; } else { x = 3; }",
+            "if ((a < b)) { x = 1; } else { if ((a > c)) { x = 2; } else { x = 3; } }"),
+        row("car myCar = { make: \"toyota\", age: 4 }",
+            "car myCar = { make: \"toyota\", age: 4 };"),
+        row("car myCar = { make: \"toyota\", age: 4, };",
+            "car myCar = { make: \"toyota\", age: 4 };"),
+        row("int[] a = [1, 2,];", "int[] a = [1, 2];"),
+        row("int[] e = [];", "int[] e = [];"),
+        row("import 'time';", "import 'time' as time;"),
+        row("import 'lib/helpers' as h;", "import 'lib/helpers' as h;"),
+        row("import 'geo.nio';", "import 'geo.nio' as geo;"),
+        row("export int x = 1;", "export int x = 1;"),
+        row("export int f() { return 1; }", "export int f() { return 1; }"),
+        row("export g.point f() { return g.origin(); }",
+            "export g.point f() { return (g.origin)(); }"),
+        row("export type t { int x; }", "export type t { int x; }"),
+        row("geo.point p;", "geo.point p;"),
+        row("g.point? m = null;", "g.point? m = null;"),
+        row("g.point[] ps = [];", "g.point[] ps = [];"),
+        row("m.x = 5;", "(m.x) = 5;"),
+        row("String s = 'single';", "String s = \"single\";"),
+        row("Function(int)<int> f;", "Function(int)<int> f;"),
+        row("Function()<void> t;", "Function()<void> t;"),
+        row("Function(int, String)<bool>? m = null;",
+            "Function(int, String)<bool>? m = null;"),
+        row("Function(int)<int>[] fs = [];", "Function(int)<int>[] fs = [];"),
+        row("Function(Function(int)<int>)<Function()<void>> h;",
+            "Function(Function(int)<int>)<Function()<void>> h;"),
+        row("export Function(int)<int> t;", "export Function(int)<int> t;"),
+        row("Function(int)<int> f = int (int b) -> a + b;",
+            "Function(int)<int> f = int (int b) -> (a + b);"),
+        row("Function()<void> f = void () -> { printInline(\"hi\"); };",
+            "Function()<void> f = void () -> { printInline(\"hi\"); };"),
+        row("void () -> printInline(\"hi\");", "void () -> printInline(\"hi\");"),
+        row("Function(car)<car> f = car (car c) -> c;",
+            "Function(car)<car> f = car (car c) -> c;"),
+        row("int add(int a, int b) { return a + b; }",
+            "int add(int a, int b) { return (a + b); }"),
+        row("void log(String m) { printInline(m); }",
+            "void log(String m) { printInline(m); }"),
+        row("export void log() { }", "export void log() {  }"),
+        row("Function(int)<int> mk(int a) { return int (int b) -> a + b; }",
+            "Function(int)<int> mk(int a) { return int (int b) -> (a + b); }"),
+        row("int x = f(y);", "int x = f(y);"),
+        row("Car c = json.parse(t) as Car;", "Car c = ((json.parse)(t) as Car);"),
+        row("int n = json.parse(t) as int?;", "int n = ((json.parse)(t) as int?);"),
+        row("x = json.parse(t) as g.Point[];", "x = ((json.parse)(t) as g.Point[]);"),
+        // `as` binds tighter than any operator, looser than a call or index.
+        row("b = a == json.parse(t) as Car;", "b = (a == ((json.parse)(t) as Car));"),
+        row("n = (json.parse(t) as Car).age;", "n = (((json.parse)(t) as Car).age);"),
+        // A keyword is a usable field name.
+        row("type t { String type; int for; }", "type t { String type; int for; }"),
+        row("x = a.type;", "x = (a.type);"),
+        row("x = a?.return;", "x = (a?.return);"),
+        row("a.if = 1;", "(a.if) = 1;"),
+        row("c = { type: 1, else: 2 };", "c = { type: 1, else: 2 };"),
+    ]);
+});
+
+test.start("parser: expression precedence", void () -> {
+    renders([
+        row("2 + 3 * 4;", "(2 + (3 * 4));"),
+        row("(2 + 3) * 4;", "((2 + 3) * 4);"),
+        row("a * b + c;", "((a * b) + c);"),
+        row("-a + b;", "((-a) + b);"),
+        row("!true == false;", "((!true) == false);"),
+        row("a + b < c * d;", "((a + b) < (c * d));"),
+        row("a < b && c > d;", "((a < b) && (c > d));"),
+        row("a || b && c;", "(a || (b && c));"),
+        row("a == b != c;", "((a == b) != c);"),
+        row("a - b - c;", "((a - b) - c);"),
+        row("10 / 2 % 3;", "((10 / 2) % 3);"),
+        row("x <= 1 >= y;", "((x <= 1) >= y);"),
+        row("-1.5;", "(-1.5);"),
+        row("foo.bar(baz)[0].qux;", "(((foo.bar)(baz)[0]).qux);"),
+        row("f(a, b + 1);", "f(a, (b + 1));"),
+        row("a[i + 1];", "(a[(i + 1)]);"),
+        row("x == null;", "(x == null);"),
+        row("-a.b;", "(-(a.b));"),
+        row("a?.b;", "(a?.b);"),
+        row("a?.b?.c;", "((a?.b)?.c);"),
+        row("a?.b.c;", "((a?.b).c);"),
+        row("a?.b[0].c;", "(((a?.b)[0]).c);"),
+        row("a?.b != null;", "((a?.b) != null);"),
+    ]);
+});
+
+test.start("parser: parse errors", void () -> {
+    rejects([
+        row("int x", "expected ';'"),
+        row("int const x;", "const variable 'x' must be initialized"),
+        row("const int x = 1;", "'const' goes after the type"),
+        row("void f(int const a) { }", "function parameters cannot be declared const"),
+        row("int y = (x) -> x;", "function value parameters need a type"),
+        row("int function f() { return 1; }", "the 'function' keyword was removed"),
+        row("function f() { }", "the 'function' keyword was removed"),
+        row("void function f() { }",
+            "the 'function' keyword was removed: write 'void f(...) { ... }'"),
+        row("f() { }", "a function needs a return type: void f(...) { ... }"),
+        row("async f() { }", "a function needs a return type: void async f(...) { ... }"),
+        row("type T { f() { } }", "a method needs a return type: void f(...) { ... }"),
+        row("type T { override f() { } }",
+            "a method needs a return type: void override f(...) { ... }"),
+        row("type T { async f() { } }",
+            "a method needs a return type: void async f(...) { ... }"),
+        row("Function()<void> f = () -> { };", "a function value needs a return type"),
+        row("Function(int) f;", "expected <"),
+        row("Function(int)<> f;", "expected IDENT"),
+        row("void v;", "void is not a type"),
+        row("int x = void;", "void is not a value"),
+        row("int const = 1;", "expected IDENT"),
+        row("5 = 3;", "invalid assignment target"),
+        row("5++;", "invalid ++ target"),
+        row("(a + b)--;", "invalid -- target"),
+        row("int x = y++;", "expected ';'"),
+        row("for (;;) {}", "a for loop needs a condition"),
+        row("for (int i = 0; i < 3; int j = 0) {}",
+            "cannot declare a variable in the post clause"),
+        row("for (int i = 0; i < 3) {}", "expected ;"),
+        row("for i = 0; i < 3; i++ {}", "expected ("),
+        row("int for = 1;", "got FOR"),
+        row("if a { }", "expected ("),
+        row("type car { String; }", "expected a field name"),
+        row("type car { String make int age; }", "expected ';' or '}' after field"),
+        row("type car { make: String; }",
+            "the type goes before the field name: String make;"),
+        row("type car { repairs: { int n }[]; }",
+            "the type goes before the field name: write the type of \"repairs\" before its name"),
+        row("type car { String make 5; }", "expected ';' or '}' after field"),
+        row("int x = ;", "unexpected token"),
+        row("void f(int) { }", "expected IDENT"),
+        row("f(): int { return 1; }", "the return type goes before the name"),
+        row("forEach(a) { }", "expected ,"),
+        row("forEach(a, 1) { }", "expected IDENT"),
+        row("forEach a, e { }", "expected ("),
+        row("forEach(a, e, i, j) { }", "expected )"),
+        row("int forEach = 1;", "got FOREACH"),
+        row("while (b) { break }", "expected ';'"),
+        row("while (b) { continue }", "expected ';'"),
+        row("switch x { case 1: f(); }", "expected ("),
+        row("switch (x) case 1: f();", "expected {"),
+        row("switch (x) { case 1 f(); }", "expected :"),
+        row("switch (x) { default: f(); case 1: g(); }",
+            "the default clause must be the last one in a switch"),
+        row("switch (x) { default: f(); default: g(); }",
+            "a switch has at most one default clause"),
+        row("switch (x) { case 1: f(); case 2: }",
+            "this clause has an empty body and no clause after it to run"),
+        row("int switch = 1;", "got SWITCH"),
+        row("int case = 1;", "got CASE"),
+        row("int default = 1;", "got DEFAULT"),
+        row("int break = 1;", "got BREAK"),
+        row("while (b) { break x; }", "expected ';'"),
+        row("int[] x = { a: int; } ;", "unexpected token"),
+        row("x = }", "unexpected token"),
+        row("while (x { }", "expected )"),
+        row("String s = \"abc",
+            "unterminated string: no closing \" before the end of the file"),
+        row("String s = `abc",
+            "unterminated string: no closing ` before the end of the file"),
+        row("String s = \"abc\nint y = 1;", "a \"...\" string ends at the end of its line"),
+        row("int x = 1;\n/* off the end",
+            "unterminated block comment: this \"/*\" has no closing \"*/\""),
+        row("int x = 99999999999999999999;", "invalid integer literal"),
+        // The lexer names a prefix with no digit after it, so the parser does
+        // not report the `x`.
+        row("int x = 0x8000000000000000;", "invalid integer literal"),
+        row("int x = 0xFFFFFFFFFFFFFFFF;", "invalid integer literal"),
+        row("int x = 0x;", "hexadecimal literal with no digits"),
+        row("int x = 0xG;", "hexadecimal literal with no digits"),
+        row("int x = 0X;", "hexadecimal literal with no digits"),
+        row("enum E { A: 0x8000000000000000 }", "invalid integer literal"),
+        row("int[0x] a;", "hexadecimal literal with no digits"),
+        row("}", "unexpected token"),
+        row("x", "expected ';'"),
+        row("x = -;", "unexpected token"),
+        row("void f() { int x = ; int y = 2; }", "unexpected token"),
+        row("int x = 1; import 'time';", "imports must appear at the top of the file"),
+        row("import time;", "expected STRING"),
+        row("import '';", "import path cannot be empty"),
+        row("import 'lib/string-utils';", "cannot derive a module name"),
+        row("import 'time' as;", "expected IDENT"),
+        row("export return;",
+            "export must be followed by a type, enum, function, or variable declaration"),
+        row("enum E { A: 1 B: 2 }", "expected ',' or '}' after enum member"),
+        row("enum E { A }", "expected :"),
+        row("enum E { A: \"x\" }", "enum member \"A\" needs an integer value"),
+        row("enum E { A: 99999999999999999999 }", "invalid integer literal"),
+        row("enum { A: 1 }", "expected IDENT"),
+        row("int enum = 1;", "got ENUM"),
+        row("import 'time'", "expected ';'"),
+    ]);
+});
+
+test.start("parser: async statements", void () -> {
+    renders([
+        row("int async sum(int a) { return a; }", "int async sum(int a) { return a; }"),
+        row("void async log(String m) { printInline(m); }",
+            "void async log(String m) { printInline(m); }"),
+        row("export int async f() { return 1; }", "export int async f() { return 1; }"),
+        row("String? async find() { return null; }",
+            "String? async find() { return null; }"),
+        row("Future<int> f = sum(5);", "Future<int> f = sum(5);"),
+        row("Future<void> t;", "Future<void> t;"),
+        row("Future<int>[] fs = [];", "Future<int>[] fs = [];"),
+        row("Future<int>? m = null;", "Future<int>? m = null;"),
+        row("Future<geo.point> p = geo.locate();", "Future<geo.point> p = (geo.locate)();"),
+        row("type j { Future<int> r; }", "type j { Future<int> r; }"),
+        row("Function(int)<Future<int>> mk;", "Function(int)<Future<int>> mk;"),
+        row("Future<Future<int>> nested;", "Future<Future<int>> nested;"),
+        row("Future<int> take(Future<int> f) { return f; }",
+            "Future<int> take(Future<int> f) { return f; }"),
+        row("int x = await f;", "int x = (await f);"),
+        row("int x = await sum(5) + 1;", "int x = ((await sum(5)) + 1);"),
+        row("await f;", "(await f);"),
+        row("async.run(f, void (int i) -> printInline(i));",
+            "(async.run)(f, void (int i) -> printInline(i));"),
+        row("import 'async';", "import 'async' as async;"),
+    ]);
+});
+
+test.start("parser: async parse errors", void () -> {
+    rejects([
+        row("async int sum(int a) { return a; }", "'async' goes after the return type"),
+        row("Future f;", "expected <"),
+        row("Future<> f;", "expected IDENT"),
+        row("int x = Future;", "Future<...> names a type"),
+        row("int x = await;", "unexpected token"),
+    ]);
+});
+
+test.start("parser: map statements", void () -> {
+    renders([
+        row("Map<String, int> m;", "Map<String, int> m;"),
+        row("Map<String,int> m;", "Map<String, int> m;"),
+        row("Map<int, String> const m = {};", "Map<int, String> const m = {  };"),
+        row("Map<String, int> m = { \"a\": 1, \"b\": 2 };",
+            "Map<String, int> m = { \"a\": 1, \"b\": 2 };"),
+        row("Map<String, int> m = { \"a\": 1, };", "Map<String, int> m = { \"a\": 1 };"),
+        row("Map<int, String> m = { 200: \"ok\", -1: \"minus\" };",
+            "Map<int, String> m = { 200: \"ok\", (-1): \"minus\" };"),
+        row("Map<String, int>? m;", "Map<String, int>? m;"),
+        row("Map<String, int>[] ms;", "Map<String, int>[] ms;"),
+        row("Map<String, Map<String, int>> nested;",
+            "Map<String, Map<String, int>> nested;"),
+        row("Map<String, int[]> m;", "Map<String, int[]> m;"),
+        row("Map<String, geo.point> m;", "Map<String, geo.point> m;"),
+        row("m[\"a\"] = 1;", "(m[\"a\"]) = 1;"),
+        row("printInline(m[\"a\"]);", "printInline((m[\"a\"]));"),
+        row("Map<String, int> f(Map<String, int> m) { return m; }",
+            "Map<String, int> f(Map<String, int> m) { return m; }"),
+        row("type T { Map<String, int> scores; }", "type T { Map<String, int> scores; }"),
+        row("Function(Map<String, int>)<void> f;", "Function(Map<String, int>)<void> f;"),
+        row("Map<String, int> (int x) -> m;", "Map<String, int> (int x) -> m;"),
+        row("Map<String, Car> fleet = { \"g1\": { make: \"toyota\" } };",
+            "Map<String, Car> fleet = { \"g1\": { make: \"toyota\" } };"),
+    ]);
+});
+
+test.start("parser: map parse errors", void () -> {
+    rejects([
+        row("Map m;", "expected <"),
+        row("Map<String> m;", "expected ,"),
+        row("Map<String, void> m;", "void is not a type"),
+        row("printInline(Map);", "Map<...> names a type"),
+        row("Map<String, int> m = { \"a\": 1, b: 2 };", "map literal keys are literals"),
+        row("Map<String, int> m = { \"a\" 1 };", "expected :"),
+    ]);
+});
+
+test.start("parser: variadic parameters", void () -> {
+    renders([
+        row("void log(...String parts) { }", "void log(...String parts) {  }"),
+        row("int sum(int seed, ...int ns) { }", "int sum(int seed, ...int ns) {  }"),
+        row("void log(...String[] rows) { }", "void log(...String[] rows) {  }"),
+        row("Function(...int)<void> f;", "Function(...int)<void> f;"),
+        row("Function(String, ...int)<int> f;", "Function(String, ...int)<int> f;"),
+        row("Function(...int)<void>[] fs;", "Function(...int)<void>[] fs;"),
+        // The '...' must not make the parenthesized list look like an expression.
+        row("Function(...int)<void> f = void (...int ns) -> { };",
+            "Function(...int)<void> f = void (...int ns) -> {  };"),
+        row("Function(...int)<int> f = int (...int ns) -> ns[0];",
+            "Function(...int)<int> f = int (...int ns) -> (ns[0]);"),
+    ]);
+});
+
+test.start("parser: variadic parse errors", void () -> {
+    rejects([
+        row("void log(...String parts, int n) { }",
+            "a variadic parameter must be the last one"),
+        row("Function(...int, String)<void> f;",
+            "a variadic parameter must be the last one"),
+        row("void log(...String parts, int n) { }", "...String parts goes at the end"),
+    ]);
+});
+
+test.start("parser: method declarations", void () -> {
+    renders([
+        row("type T { int n; int get() { return self.n; } }",
+            "type T { int n; int get() { return (self.n); } }"),
+        // A void method opens with `void`, where a field opens with its type.
+        row("type T { int n; void bump() { } }", "type T { int n; void bump() {  } }"),
+        row("type T { int async load() { return 1; } }",
+            "type T { int async load() { return 1; } }"),
+        row("type T { void async run() { } }", "type T { void async run() {  } }"),
+        row("type T { int add(int a, int b) { return a; } }",
+            "type T { int add(int a, int b) { return a; } }"),
+        row("type T { int sum(...int ns) { return 1; } }",
+            "type T { int sum(...int ns) { return 1; } }"),
+        row("type T { int[] rows() { return []; } }",
+            "type T { int[] rows() { return []; } }"),
+        row("type T { Function()<int> f() { return int () -> 1; } }",
+            "type T { Function()<int> f() { return int () -> 1; } }"),
+        // A method body needs no terminator, but one is tolerated.
+        row("type T { int a() { return 1; }; int b; }",
+            "type T { int b; int a() { return 1; } }"),
+        // A function-typed field is still a field: no '(' follows its name.
+        row("type T { Function()<int> f; }", "type T { Function()<int> f; }"),
+        row("export type T { int n; int get() { return self.n; } }",
+            "export type T { int n; int get() { return (self.n); } }"),
+    ]);
+});
+
+test.start("parser: extends declarations", void () -> {
+    renders([
+        row("type B extends A { int n; }", "type B extends A { int n; }"),
+        row("export type B extends A { int n; }", "export type B extends A { int n; }"),
+        row("type B extends m.A { int n; }", "type B extends m.A { int n; }"),
+        row("type B extends A { int override f() { return 1; } }",
+            "type B extends A { int override f() { return 1; } }"),
+        row("type B extends A { void override f() { } }",
+            "type B extends A { void override f() {  } }"),
+        // Both orders of the two modifiers are accepted and print the same.
+        row("type B extends A { int override async f() { return 1; } }",
+            "type B extends A { int override async f() { return 1; } }"),
+        row("type B extends A { int async override f() { return 1; } }",
+            "type B extends A { int override async f() { return 1; } }"),
+        // `extends` and `override` are contextual: both still name things.
+        row("type extends { int extends; }", "type extends { int extends; }"),
+        row("type T { int override; }", "type T { int override; }"),
+        row("type T { void override() { } }", "type T { void override() {  } }"),
+        row("type T { int override(int n) { return n; } }",
+            "type T { int override(int n) { return n; } }"),
+        row("type T { void async() { } }", "type T { void async() {  } }"),
+    ]);
+});
+
+test.start("parser: extern declarations", void () -> {
+    renders([
+        row("extern int add(int a, int b);", "extern int add(int a, int b);"),
+        row("extern void poke();", "extern void poke();"),
+        row("extern String greet(String name);", "extern String greet(String name);"),
+        row("extern float mix(byte[] data, float x);", "extern float mix(byte[] data, float x);"),
+        // `extern` is contextual: it still names things everywhere else.
+        row("int extern = 3;", "int extern = 3;"),
+        row("extern = 5;", "extern = 5;"),
+        row("extern(1);", "extern(1);"),
+        row("extern x = 1;", "extern x = 1;"),
+    ]);
+    rejects([
+        row("extern int f(int a) { return a; }", "an extern function has no body"),
+        row("export extern int f(int a);", "an extern function cannot be exported"),
+    ]);
+});
+
+test.start("parser: native statements", void () -> {
+    renders([
+        row("native source './webview.m';", "native source './webview.m';"),
+        row("native flags '-lm';", "native flags '-lm';"),
+        row("native flags darwin '-framework Cocoa -framework WebKit';",
+            "native flags darwin '-framework Cocoa -framework WebKit';"),
+        // `native` is contextual: it still names things everywhere else.
+        row("int native = 4;", "int native = 4;"),
+        row("native = 2;", "native = 2;"),
+        // Two identifiers with no string after them declare a variable named
+        // `source`, not a native statement. The lookahead must not claim them.
+        row("native source = 1;", "native source = 1;"),
+    ]);
+    rejects([
+        row("native source '';", "native source cannot be empty"),
+        row("export native source './x.c';", "a native declaration cannot be exported"),
+    ]);
+});
+
+test.start("parser: method parse errors", void () -> {
+    rejects([
+        row("type T { { int x; int m() { return 1; } } inner; }",
+            "an inline record type cannot declare methods"),
+        row("type T { int m() }", "expected {"),
+    ]);
+});
+
+test.start("parser: a method named async", void () -> {
+    renders([
+        row("type T { void async() { } }", "type T { void async() {  } }"),
+        row("type T { int async(int a) { return a; } }",
+            "type T { int async(int a) { return a; } }"),
+        row("type T { void async run() { } }", "type T { void async run() {  } }"),
+    ]);
+});
+
+// §Appendix A's own example, start to finish.
+String const SPEC_EXAMPLE = `
+type CarWeight {
+    int empty;
+    int? full
+}
+
+type Car {
+    String make;
+    int age;
+    String? owner;
+    {
+        DateTime date;
+        int amount;
+        String? piece
+    }[]? repairs;
+    CarWeight weight;
+}
+
+int[] myArray = [2,5,4]; //size is optional
+
+int sum;
+
+int sumElements(int a, int b) {
+    return a + b;
+}
+
+forEach(myArray, arrayElement, i) {
+    sum = sumElements(sum, arrayElement);
+}
+
+Car myCar = {
+    make: "toyota",
+    age: 4,
+    weight: { empty: 1200 }
+}
+
+Car[] myCars = [myCar];
+
+String myCarJson = json.toText(myCar);
+`;
+
+test.start("parser: the spec example parses", void () -> {
+    parseOK(SPEC_EXAMPLE);
+});
+
+test.start("parser: recovery finds more than one error", void () -> {
+    Parsed p = parse("int x = ;\nint y = ;\nint z = 1;");
+    test.assert(p.errs.length >= 2,
+        "expected at least 2 errors after recovery, got " + string.from(p.errs.length));
+});
+
+test.start("parser: errors carry positions", void () -> {
+    Parsed p = parse("int x = 1;\nint y = ;");
+    test.assert(p.errs.length > 0, "expected an error");
+    test.assert(string.contains(p.errs[0], "line 2:"),
+        "expected an error on line 2, got: " + p.errs[0]);
+});
+
+// A statement not ending in '}' needs its ';'.
+test.start("parser: a missing semicolon without a brace", void () -> {
+    Parsed p = parse("int x = 1 int y = 2;");
+    test.assert(p.errs.length > 0, "expected an error for a missing semicolon");
+});
+
+// The parser synthesizes the receiver of a method, because only the parser
+// knows which type body the method is in.
+test.start("parser: a method gets a receiver", void () -> {
+    Parsed ignored = parse("");
+    parser.Parser p = parser.newParser(lexer.newLexer(
+        "type Car { int n; int get() { return self.n; } }"));
+    ast.Program prog = p.parseProgram();
+    test.assert(p.errs.length == 0, "unexpected parse errors: " + string.join(p.errs, "\n"));
+    ast.TypeDeclStatement? td = prog.statements[0] as ast.TypeDeclStatement;
+    if (td == null) {
+        return Error("expected a type declaration");
+    }
+    test.expectInt(td.fields.length, 1);
+    test.expectInt(td.methods.length, 1);
+    ast.Param? recv = td.methods[0].recv;
+    if (recv == null) {
+        return Error("the method has no receiver");
+    }
+    test.expectString(recv.name, "self");
+    test.expectString(ast.typeNodeString(recv.type), "Car");
+});
+
+// ast.cloneMethod copies a whole method, for `extends`. It must handle every
+// node the parser can produce, so this clones a body that uses all of them.
+// §3.2 cannot compare records by identity, so the test checks that every id in
+// the clone is new.
+String const CLONE_SRC = `
+type T {
+    int n;
+    String s 'json:the_s';
+
+    Map<String, int> everything(int a, ...String rest) {
+        int x = -a;
+        float f = 1.5;
+        bool b = !true;
+        String? maybe = null;
+        int[] arr = [1, 2];
+        int[3] fixed = [1, 2, 3];
+        Map<String, int> m = { "k": 1 };
+        T rec = { n: 1, s: "x" };
+        Function(int)<int> fn = int (int y) -> y + 1;
+        Function()<void> blocky = void () -> { printInline("hi"); };
+        Future<int> fut = self.load();
+        int got = await fut;
+        int caught = self.risky() catch 0;
+        int handled = self.risky() catch e { return m; };
+        x = arr[0] + rec.n + fn(1) + got + caught + handled;
+        x++;
+        x--;
+        if (x > 0 && x < 10 || b) {
+            x = x * 2 / 2 % 3;
+        } else {
+            x = x - 1;
+        }
+        while (x > 0) {
+            x--;
+            if (x == 3) { continue; }
+            break;
+        }
+        for (int i = 0; i < 2; i++) {
+            x = x + i;
+        }
+        forEach (arr, elem, i) {
+            x = x + elem + i;
+        }
+        printInline(maybe?.length, fixed[0], rest, f);
+        m["k"] = x;
+        return m;
+    }
+
+    int async load() { return self.n; }
+    int risky() { return Error("x"); }
+}
+`;
+
+// collectStmt and collectExpr gather every node id, so two rounds can be
+// compared for overlap.
+void collectExpr(ast.Expression e, Map<int, bool> out) {
+    out[e.id] = true;
+    switch (e) {
+        case ast.ArrayLiteral a:
+            forEach(a.elements, el) { collectExpr(el, out); }
+        case ast.RecordLiteral r:
+            forEach(r.fields, f) { collectExpr(f.value, out); }
+        case ast.MapLiteral m:
+            forEach(m.entries, en) {
+                collectExpr(en.key, out);
+                collectExpr(en.value, out);
+            }
+        case ast.FuncLit fl:
+            forEach(fl.params, p) { out[p.id] = true; }
+            ast.Expression? eb = fl.exprBody;
+            if (eb != null) { collectExpr(eb, out); }
+            ast.BlockStatement? bb = fl.blockBody;
+            if (bb != null) { collectStmt(bb, out); }
+        case ast.AwaitExpr aw:
+            collectExpr(aw.value, out);
+        case ast.CatchExpr cx:
+            collectExpr(cx.value, out);
+            ast.BlockStatement? body = cx.body;
+            if (body != null) { collectStmt(body, out); }
+            ast.Expression? d = cx.default;
+            if (d != null) { collectExpr(d, out); }
+        case ast.PrefixExpression p:
+            collectExpr(p.right, out);
+        case ast.InfixExpression i:
+            collectExpr(i.left, out);
+            collectExpr(i.right, out);
+        case ast.IndexExpression ix:
+            collectExpr(ix.left, out);
+            collectExpr(ix.index, out);
+        case ast.AsExpression ax:
+            collectExpr(ax.value, out);
+        case ast.MemberExpression me:
+            collectExpr(me.object, out);
+        case ast.CallExpression c:
+            collectExpr(c.callee, out);
+            forEach(c.args, a) { collectExpr(a, out); }
+        default:
+            // Every other expression is a leaf. §4.9 has no empty clause,
+            // because a `{ }` body is a record literal.
+            break;
+    }
+}
+
+void collectStmt(ast.Statement s, Map<int, bool> out) {
+    out[s.id] = true;
+    switch (s) {
+        case ast.VarDeclStatement v:
+            ast.Expression? val = v.value;
+            if (val != null) { collectExpr(val, out); }
+        case ast.FunctionDeclStatement fd:
+            forEach(fd.params, p) { out[p.id] = true; }
+            ast.Param? rc = fd.recv;
+            if (rc != null) { out[rc.id] = true; }
+            collectStmt(fd.body, out);
+        case ast.AssignStatement a:
+            collectExpr(a.target, out);
+            collectExpr(a.value, out);
+        case ast.ReturnStatement r:
+            ast.Expression? rv = r.value;
+            if (rv != null) { collectExpr(rv, out); }
+        case ast.IfStatement i:
+            collectExpr(i.cond, out);
+            collectStmt(i.then, out);
+            ast.BlockStatement? els = i.else;
+            if (els != null) { collectStmt(els, out); }
+        case ast.SwitchStatement sw:
+            collectExpr(sw.subject, out);
+            forEach(sw.cases, cl) {
+                out[cl.id] = true;
+                forEach(cl.values, v) { collectExpr(v, out); }
+                collectStmt(cl.body, out);
+            }
+        case ast.WhileStatement w:
+            collectExpr(w.cond, out);
+            collectStmt(w.body, out);
+            forEach(w.tail, t) { collectStmt(t, out); }
+        case ast.ForStatement f:
+            ast.Statement? init = f.init;
+            if (init != null) { collectStmt(init, out); }
+            collectExpr(f.cond, out);
+            ast.Statement? post = f.post;
+            if (post != null) { collectStmt(post, out); }
+            collectStmt(f.body, out);
+        case ast.IncDecStatement idc:
+            collectExpr(idc.target, out);
+        case ast.ForEachStatement fe:
+            collectExpr(fe.array, out);
+            collectStmt(fe.body, out);
+        case ast.BlockStatement b:
+            forEach(b.statements, st) { collectStmt(st, out); }
+        case ast.ExpressionStatement es:
+            collectExpr(es.expression, out);
+        default:
+            // import, enum, break and continue carry no child nodes.
+            break;
+    }
+}
+
+test.start("parser: cloneMethod covers every node", void () -> {
+    parser.Parser p = parser.newParser(lexer.newLexer(CLONE_SRC));
+    ast.Program prog = p.parseProgram();
+    test.assert(p.errs.length == 0, "parse errors:\n" + string.join(p.errs, "\n"));
+    ast.TypeDeclStatement? td = prog.statements[0] as ast.TypeDeclStatement;
+    if (td == null) {
+        return Error("expected a type declaration");
+    }
+    ast.Origin from = { type: "T", qual: "lib" };
+    forEach(td.methods, md) {
+        ast.FunctionDeclStatement clone = ast.cloneMethod(md, "Sub", from);
+        if (ast.stmtString(clone) != ast.stmtString(md)) {
+            return Error("clone of " + md.name + " reads differently:\n"
+                + ast.stmtString(md) + "\n" + ast.stmtString(clone));
+        }
+        // checker.Info is keyed by id, so a shared id would give the clone the
+        // original's types.
+        Map<int, bool> original = {};
+        collectStmt(md, original);
+        Map<int, bool> copied = {};
+        collectStmt(clone, copied);
+        int[] copiedIds = map.keys(copied);
+        test.assert(copiedIds.length == map.keys(original).length,
+            "clone of " + md.name + " has " + string.from(copiedIds.length)
+            + " nodes, the original " + string.from(map.keys(original).length));
+        forEach(copiedIds, id) {
+            if (original[id] != null) {
+                return Error("clone of " + md.name + " shares node id " + string.from(id));
+            }
+        }
+        ast.Param? recv = clone.recv;
+        if (recv == null) {
+            return Error("clone of " + md.name + " lost its receiver");
+        }
+        test.expectString(ast.typeNodeString(recv.type), "Sub");
+        ast.Origin? origin = clone.from;
+        if (origin == null) {
+            return Error("clone of " + md.name + " lost its origin");
+        }
+        test.expectString(origin.type, "T");
+        test.expectString(origin.qual, "lib");
+    }
+});
+
+test.start("parser: an interpolated string is the concatenation it reads as", void () -> {
+    // §1.6: each hole is a call to string.from through the template alias,
+    // so the stages after the parser do not see templates.
+    renders([
+        row("String s = `a ${n} b`;", "String s = ((\"a \" + ($str.from)(n)) + \" b\");"),
+        row("String s = `${n}`;", "String s = ($str.from)(n);"),
+        row("String s = `${a}${b}`;", "String s = (($str.from)(a) + ($str.from)(b));"),
+        row("String s = `${ {x: 1}.x }`;", "String s = ($str.from)(({ x: 1 }.x));"),
+    ]);
+    // One bad hole is one error: the parser skips to the end of the string.
+    rejects([
+        row("String s = `a ${} b`;", "empty ${} in a string"),
+    ]);
+    Parsed p = parse("String s = `a ${} b ${x}`;");
+    test.expectInt(p.errs.length, 1);
+});

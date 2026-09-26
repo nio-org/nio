@@ -1,0 +1,690 @@
+// Source text to a stream of tokens.
+//
+// The lexer walks one-byte Strings, which §6.6 makes equivalent to bytes:
+// positions and lengths count bytes. `ch` holds the current character, and ""
+// marks the end of the input. A NUL byte in the input also reads as "" (see
+// charAt), so an embedded NUL ends the scan.
+import 'token';
+import 'string';
+import 'array';
+
+// Holds the 256 one-byte Strings, built at first use. A substring in charAt,
+// the inner loop of the lexer, allocates one string for each character of each
+// file, and is the largest source of garbage in a compile.
+String[] oneByteStrings = [];
+
+String oneByte(byte b) {
+    if (oneByteStrings.length == 0) {
+        for (int i = 0; i < 256; i++) {
+            array.push(oneByteStrings, string.fromByteArray([i as byte]));
+        }
+    }
+    return oneByteStrings[b];
+}
+
+String const C2 = string.fromByteArray([194]);
+String const C3 = string.fromByteArray([195]);
+
+// What skipWhitespaceAndComments returns: the position and the note for an
+// unterminated block comment. note is "" when the scan can continue.
+type CommentSkip {
+    int line;
+    int col;
+    String note;
+}
+
+// What readString returns: the decoded text, and a note that gives the cause
+// when the literal did not close or held a bad escape. note is "" when it is
+// sound. hole marks a scan that stopped at `${` rather than at the closing
+// delimiter, which only a backtick string can do.
+type Scanned {
+    String text;
+    String note;
+    bool hole;
+}
+
+// What readNumber returns: the digits as written, whether they hold a fraction,
+// and a note for a run of digits that is not a number. Only `0x` with nothing
+// after it gives such a note.
+type Number {
+    String text;
+    bool isFloat;
+    String note;
+}
+
+export type Lexer {
+    String input;
+    // The same text as bytes, so that charAt can index it and take no
+    // substring.
+    byte[] data;
+    int pos;        // index of ch
+    int readPos;    // index of the next character
+    String ch;      // the current character, and "" at the end of the input
+    int line;
+    int col;
+
+    // Every comment scanned so far, in source order. The parser attaches them
+    // to the tree that it builds, and no part of a compile reads them.
+    token.Comment[] comments;
+    // The line of the last token returned. It decides `ownLine`: a comment that
+    // starts after that line has only whitespace before it. It starts at 0, so
+    // a comment on line 1 is on its own line.
+    int lastLine;
+
+    // One entry for each interpolated string whose `${` the scan has entered
+    // and whose `}` it has not reached, innermost last. An entry counts the
+    // `{` opened inside that expression that are still open. A `}` at zero
+    // closes the hole and the string resumes. Any other `}` is a brace. A
+    // string inside the expression that opens its own hole pushes another
+    // entry, so holes can nest.
+    int[] holes;
+
+    void readChar() {
+        if (self.ch == "\n") {
+            self.line++;
+            self.col = 0;
+        }
+        self.ch = charAt(self.data, self.readPos);
+        self.pos = self.readPos;
+        self.readPos++;
+        self.col++;
+    }
+
+    String peekChar() {
+        return charAt(self.data, self.readPos);
+    }
+
+    // peekChar2 looks one character past peekChar. Only `...` needs it,
+    // because it is the only three-character token in the language.
+    String peekChar2() {
+        return charAt(self.data, self.readPos + 1);
+    }
+
+    // nextToken scans the next token and records its line, which tells a comment
+    // on its own line from one that trails code. scanToken has several exits, so
+    // the record happens here and not in it.
+    token.Token nextToken() {
+        token.Token tok = self.scanToken();
+        // Every exit of scanToken leaves the cursor one position past the
+        // token, so the end is read here for all of them at once. A scan that
+        // set its own end says so by leaving a line already filled in.
+        if (tok.endLine == 0) {
+            tok.endLine = self.line;
+            tok.endCol = self.col;
+        }
+        self.lastLine = tok.line;
+        return tok;
+    }
+
+    token.Token scanToken() {
+        CommentSkip sk = self.skipWhitespaceAndComments();
+        if (sk.note != "") {
+            // An unterminated block comment took the rest of the input. The
+            // token sits at its opener, so the error points there, and the
+            // next call reports EOF.
+            // The span is the opener alone. What is unterminated runs to the
+            // end of the file, and underlining the whole file says nothing.
+            token.Token bad = {
+                type: token.ILLEGAL, literal: "/*", line: sk.line, col: sk.col,
+                note: sk.note, quote: "", endLine: sk.line, endCol: sk.col + 2,
+            };
+            return bad;
+        }
+
+        token.Token tok = { type: "", literal: "", line: self.line, col: self.col, note: "", quote: "", endLine: 0, endCol: 0 };
+
+        switch (self.ch) {
+            case "=":
+                if (self.peekChar() == "=") {
+                    self.readChar();
+                    tok.type = token.EQ;
+                    tok.literal = "==";
+                } else {
+                    tok.type = token.ASSIGN;
+                    tok.literal = "=";
+                }
+            case "+":
+                if (self.peekChar() == "+") {
+                    self.readChar();
+                    tok.type = token.INC;
+                    tok.literal = "++";
+                } else {
+                    tok.type = token.PLUS;
+                    tok.literal = "+";
+                }
+            case "-":
+                if (self.peekChar() == "-") {
+                    self.readChar();
+                    tok.type = token.DEC;
+                    tok.literal = "--";
+                } else if (self.peekChar() == ">") {
+                    self.readChar();
+                    tok.type = token.ARROW;
+                    tok.literal = "->";
+                } else {
+                    tok.type = token.MINUS;
+                    tok.literal = "-";
+                }
+            case "*":
+                tok.type = token.ASTERISK;
+                tok.literal = "*";
+            case "/":
+                tok.type = token.SLASH;
+                tok.literal = "/";
+            case "%":
+                tok.type = token.PERCENT;
+                tok.literal = "%";
+            case "!":
+                if (self.peekChar() == "=") {
+                    self.readChar();
+                    tok.type = token.NOTEQ;
+                    tok.literal = "!=";
+                } else {
+                    tok.type = token.BANG;
+                    tok.literal = "!";
+                }
+            case "<":
+                if (self.peekChar() == "=") {
+                    self.readChar();
+                    tok.type = token.LTE;
+                    tok.literal = "<=";
+                } else if (self.peekChar() == "<") {
+                    // The lexer can join this pair, but not `>>`: no type starts
+                    // with `<`, so two adjacent ones are always a shift. The
+                    // parser handles the `>>` that closes
+                    // `Map<String, Future<int>>`.
+                    self.readChar();
+                    tok.type = token.SHL;
+                    tok.literal = "<<";
+                } else {
+                    tok.type = token.LT;
+                    tok.literal = "<";
+                }
+            case ">":
+                if (self.peekChar() == "=") {
+                    self.readChar();
+                    tok.type = token.GTE;
+                    tok.literal = ">=";
+                } else {
+                    tok.type = token.GT;
+                    tok.literal = ">";
+                }
+            case "&":
+                if (self.peekChar() == "&") {
+                    self.readChar();
+                    tok.type = token.AND;
+                    tok.literal = "&&";
+                } else {
+                    tok.type = token.BITAND;
+                    tok.literal = "&";
+                }
+            case "|":
+                if (self.peekChar() == "|") {
+                    self.readChar();
+                    tok.type = token.OR;
+                    tok.literal = "||";
+                } else {
+                    tok.type = token.BITOR;
+                    tok.literal = "|";
+                }
+            case "^":
+                tok.type = token.CARET;
+                tok.literal = "^";
+            case "~":
+                tok.type = token.TILDE;
+                tok.literal = "~";
+            case ",":
+                tok.type = token.COMMA;
+                tok.literal = ",";
+            case ";":
+                tok.type = token.SEMICOLON;
+                tok.literal = ";";
+            case ":":
+                tok.type = token.COLON;
+                tok.literal = ":";
+            case ".":
+                if (self.peekChar() == "." && self.peekChar2() == ".") {
+                    self.readChar();
+                    self.readChar();
+                    tok.type = token.ELLIPSIS;
+                    tok.literal = "...";
+                } else {
+                    tok.type = token.DOT;
+                    tok.literal = ".";
+                }
+            case "?":
+                if (self.peekChar() == ".") {
+                    self.readChar();
+                    tok.type = token.QDOT;
+                    tok.literal = "?.";
+                } else {
+                    tok.type = token.QUESTION;
+                    tok.literal = "?";
+                }
+            case "(":
+                tok.type = token.LPAREN;
+                tok.literal = "(";
+            case ")":
+                tok.type = token.RPAREN;
+                tok.literal = ")";
+            case "{":
+                if (self.holes.length > 0) {
+                    self.holes[self.holes.length - 1]++;
+                }
+                tok.type = token.LBRACE;
+                tok.literal = "{";
+            case "}":
+                if (self.holes.length > 0 && self.holes[self.holes.length - 1] == 0) {
+                    // The `}` that closes a `${`. The string resumes after it,
+                    // and readString skips it as it would an opening delimiter.
+                    Scanned rest = self.readString("`");
+                    tok.quote = "`";
+                    tok.literal = rest.text;
+                    if (rest.note != "") {
+                        array.pop(self.holes);
+                        tok.type = token.ILLEGAL;
+                        tok.note = rest.note;
+                    } else if (rest.hole) {
+                        tok.type = token.TSTR_MID;
+                    } else {
+                        array.pop(self.holes);
+                        tok.type = token.TSTR_END;
+                    }
+                    return tok;
+                }
+                if (self.holes.length > 0) {
+                    self.holes[self.holes.length - 1]--;
+                }
+                tok.type = token.RBRACE;
+                tok.literal = "}";
+            case "[":
+                tok.type = token.LBRACKET;
+                tok.literal = "[";
+            case "]":
+                tok.type = token.RBRACKET;
+                tok.literal = "]";
+            case "\"":
+            case "'":
+            case "`":
+                String delim = self.ch;
+                Scanned s = self.readString(self.ch);
+                if (s.note == "" && s.hole) {
+                    tok.type = token.TSTR_START;
+                    tok.literal = s.text;
+                    tok.quote = delim;
+                    array.push(self.holes, 0);
+                } else if (s.note == "") {
+                    tok.type = token.STRING;
+                    tok.literal = s.text;
+                    tok.quote = delim;
+                } else {
+                    tok.type = token.ILLEGAL;
+                    tok.literal = s.text;
+                    tok.note = s.note;
+                }
+                return tok;
+            case "":
+                tok.type = token.EOF;
+                tok.literal = "";
+                return tok;
+            default:
+                if (isLetter(self.ch)) {
+                    String lit = self.readIdentifier();
+                    tok.type = token.lookupIdent(lit);
+                    tok.literal = lit;
+                    return tok;
+                }
+                if (isDigit(self.ch)) {
+                    Number n = self.readNumber();
+                    if (n.note != "") {
+                        tok.type = token.ILLEGAL;
+                        tok.literal = n.text;
+                        tok.note = n.note;
+                        return tok;
+                    }
+                    if (n.isFloat) {
+                        tok.type = token.FLOAT;
+                    } else {
+                        tok.type = token.INT;
+                    }
+                    tok.literal = n.text;
+                    return tok;
+                }
+                tok.type = token.ILLEGAL;
+                tok.literal = byteString(self.ch);
+        }
+
+        self.readChar();
+        return tok;
+    }
+
+    // Moves past whitespace, `//` line comments and `/* */` block comments.
+    // Block comments do not nest, and the first `*/` closes one.
+    //
+    // The note is not empty when a block comment runs to the end of the input,
+    // and it carries the position of the `/*` that opened it. The lexer then
+    // sits at the end of the input, so the caller must make the token for it.
+    CommentSkip skipWhitespaceAndComments() {
+        while (true) {
+            if (self.ch == " " || self.ch == "\t" || self.ch == "\r" || self.ch == "\n") {
+                self.readChar();
+            } else if (self.ch == "/" && self.peekChar() == "/") {
+                int openLine = self.line;
+                int openCol = self.col;
+                int from = self.pos;
+                while (self.ch != "\n" && self.ch != "") {
+                    self.readChar();
+                }
+                self.record(from, openLine, openCol);
+            } else if (self.ch == "/" && self.peekChar() == "*") {
+                int openLine = self.line;
+                int openCol = self.col;
+                int from = self.pos;
+                self.readChar();
+                self.readChar();
+                while (self.ch != "*" || self.peekChar() != "/") {
+                    if (self.ch == "") {
+                        CommentSkip bad = {
+                            line: openLine, col: openCol,
+                            note: 'unterminated block comment: this "/*" has no closing "*/"',
+                        };
+                        return bad;
+                    }
+                    self.readChar();
+                }
+                self.readChar();
+                self.readChar();
+                self.record(from, openLine, openCol);
+            } else {
+                CommentSkip ok = { line: 0, col: 0, note: "" };
+                return ok;
+            }
+        }
+    }
+
+    // Keeps a comment that the scan has just passed. self.pos is one past the
+    // last character of the comment in both forms.
+    void record(int from, int openLine, int openCol) {
+        token.Comment c = {
+            text: string.substring(self.input, from, self.pos),
+            line: openLine, col: openCol, endLine: self.line,
+            ownLine: openLine > self.lastLine,
+        };
+        array.push(self.comments, c);
+    }
+
+    // readString scans a string that quote delimits, where quote is ", ' or `.
+    // It accepts the escapes \" \' \` \\ \$ \n \r \t \0 and \xNN. The note is
+    // not empty when the string does not close or an escape is malformed, and
+    // it gives the cause. A malformed escape does not end the scan: the string
+    // is read to its close and reported whole, so the parser sees one bad
+    // token and not the tail of the string as code.
+    //
+    // In a backtick string `${` opens a hole (§1.6): the scan stops before the
+    // expression and answers hole, and scanToken resumes it at the `}`.
+    //
+    // Only a backtick string can cover more than one line, and the newlines in
+    // it are part of it. A raw newline ends a " or ' string as unterminated, so
+    // the compiler reports a forgotten closing quote on its own line and does
+    // not take the rest of the file. A CRLF in a backtick string becomes one
+    // newline, so the same source gives the same string for either line ending.
+    Scanned readString(String quote) {
+        String[] out = [];
+        String badEscape = "";
+        self.readChar();
+        while (true) {
+            if (self.ch == quote) {
+                self.readChar();
+                Scanned done = { text: string.join(out, ""), note: badEscape, hole: false };
+                return done;
+            } else if (self.ch == "") {
+                Scanned ranOut = { text: string.join(out, ""), note: unterminated(quote, false), hole: false };
+                return ranOut;
+            } else if (quote == "`" && self.ch == "$" && self.peekChar() == "{") {
+                self.readChar();
+                self.readChar();
+                Scanned hole = { text: string.join(out, ""), note: badEscape, hole: true };
+                return hole;
+            } else if (self.ch == "\n") {
+                if (quote != "`") {
+                    Scanned atBreak = { text: string.join(out, ""), note: unterminated(quote, true), hole: false };
+                    return atBreak;
+                }
+                array.push(out, self.ch);
+                self.readChar();
+            } else if (self.ch == "\r") {
+                if (quote == "`" && self.peekChar() == "\n") {
+                    self.readChar();    // drop the CR; the LF is appended next
+                    continue;
+                }
+                array.push(out, self.ch);
+                self.readChar();
+            } else if (self.ch == "\\") {
+                self.readChar();
+                switch (self.ch) {
+                    case "\"":
+                        array.push(out, "\"");
+                    case "'":
+                        array.push(out, "'");
+                    case "`":
+                        array.push(out, "`");
+                    case "\\":
+                        array.push(out, "\\");
+                    case "$":
+                        array.push(out, "$");
+                    case "n":
+                        array.push(out, "\n");
+                    case "r":
+                        array.push(out, "\r");
+                    case "t":
+                        array.push(out, "\t");
+                    case "0":
+                        array.push(out, "\0");
+                    case "x":
+                        // Two hexadecimal digits, both required: \x41 is A.
+                        // Only a digit is taken, so a short form leaves the
+                        // closing quote where it is.
+                        int hi = hexCharValue(self.peekChar());
+                        int lo = -1;
+                        if (hi >= 0) {
+                            self.readChar();
+                            lo = hexCharValue(self.peekChar());
+                            if (lo >= 0) {
+                                self.readChar();
+                            }
+                        }
+                        if (hi < 0 || lo < 0) {
+                            badEscape = "\\x needs two hexadecimal digits, as in \\x41";
+                        } else {
+                            array.push(out, string.fromByteArray([(hi * 16 + lo) as byte]));
+                        }
+                    case "\n":
+                        // A backslash does not continue a " or ' string onto
+                        // the next line.
+                        if (quote != "`") {
+                            Scanned atEscBreak = { text: string.join(out, ""), note: unterminated(quote, true), hole: false };
+                            return atEscBreak;
+                        }
+                        array.push(out, "\\");
+                        array.push(out, self.ch);
+                    case "":
+                        Scanned atEscEnd = { text: string.join(out, ""), note: unterminated(quote, false), hole: false };
+                        return atEscEnd;
+                    default:
+                        array.push(out, "\\");
+                        array.push(out, self.ch);
+                }
+                self.readChar();
+            } else {
+                array.push(out, self.ch);
+                self.readChar();
+            }
+        }
+    }
+
+    String readIdentifier() {
+        int start = self.pos;
+        while (isLetter(self.ch) || isDigit(self.ch)) {
+            self.readChar();
+        }
+        return string.substring(self.input, start, self.pos);
+    }
+
+    Number readNumber() {
+        int start = self.pos;
+        // A `0x` or `0X` prefix makes the rest hexadecimal (§1.6). Only an
+        // integer takes that form, because there is no hexadecimal float, so
+        // the scan skips the fraction below.
+        if (self.ch == "0" && (self.peekChar() == "x" || self.peekChar() == "X")) {
+            self.readChar();
+            self.readChar();
+            int firstDigit = self.pos;
+            while (isHexDigit(self.ch)) {
+                self.readChar();
+            }
+            String hexText = string.substring(self.input, start, self.pos);
+            if (self.pos == firstDigit) {
+                // The prefix with no digits after it. To name the cause here
+                // stops the parser from reporting the symptom, an `x` where an
+                // operator belongs.
+                Number bare = {
+                    text: hexText, isFloat: false,
+                    note: "hexadecimal literal with no digits: " + hexText
+                        + " needs at least one digit after the prefix (0-9, a-f, A-F)",
+                };
+                return bare;
+            }
+            Number h = { text: hexText, isFloat: false, note: "" };
+            return h;
+        }
+        while (isDigit(self.ch)) {
+            self.readChar();
+        }
+        bool isFloat = false;
+        if (self.ch == "." && isDigit(self.peekChar())) {
+            isFloat = true;
+            self.readChar();
+            while (isDigit(self.ch)) {
+                self.readChar();
+            }
+        }
+        Number n = {
+            text: string.substring(self.input, start, self.pos), isFloat: isFloat,
+            note: "",
+        };
+        return n;
+    }
+}
+
+export Lexer newLexer(String input) {
+    Lexer l = {
+        input: input, data: string.toByteArray(input),
+        pos: 0, readPos: 0, ch: "", line: 1, col: 0, comments: [], lastLine: 0,
+        holes: [],
+    };
+    l.readChar();
+    return l;
+}
+
+// charAt returns the byte at index i as a one-byte String. It returns "" at the
+// end of the input, past the end, and for a NUL byte, so the scan stops at the
+// first NUL.
+String charAt(byte[] data, int i) {
+    if (i >= data.length) {
+        return "";
+    }
+    byte b = data[i];
+    if (b == 0) {
+        return "";
+    }
+    return oneByte(b);
+}
+
+// Builds the diagnostic for a string that ends before its closing quote.
+String unterminated(String quote, bool atNewline) {
+    if (atNewline) {
+        return "unterminated string: a " + quote + "..." + quote + " string ends at the end of "
+            + "its line; write a string that spans lines with backticks";
+    }
+    return "unterminated string: no closing " + quote + " before the end of the file";
+}
+
+// Makes the literal text of an ILLEGAL token from one byte. A byte below 0x80
+// stands for itself. A byte above becomes the two-byte UTF-8 encoding of the
+// code point with that value, so the middle byte of a stray multi-byte
+// character reads as a character and not as a lone byte. The lead byte is C2
+// for 0x80 to 0xBF and C3 for 0xC0 to 0xFF.
+//
+// The parser quotes this text in its "unexpected token" message, so the
+// encoding must not change.
+String byteString(String ch) {
+    byte sb = ch[0];
+    if (sb < 128) {
+        return ch;
+    }
+    if (sb <= 191) {
+        // 0x80 to 0xBF: the continuation byte is the byte itself
+        return C2 + oneByte(sb);
+    }
+    return C3 + oneByte((sb & 63 | 128) as byte);
+}
+
+bool isLetter(String ch) {
+    return "a" <= ch && ch <= "z" || "A" <= ch && ch <= "Z" || ch == "_";
+}
+
+bool isDigit(String ch) {
+    return "0" <= ch && ch <= "9";
+}
+
+bool isHexDigit(String ch) {
+    return isDigit(ch) || "a" <= ch && ch <= "f" || "A" <= ch && ch <= "F";
+}
+
+// hexCharValue is hexByteValue over a character as readChar answers one: -1 at
+// the end of the input and for anything that is not a digit.
+int hexCharValue(String ch) {
+    if (ch == "") {
+        return -1;
+    }
+    byte[] b = string.toByteArray(ch);
+    return hexByteValue(b[0]);
+}
+
+// hexByteValue returns the value of one hexadecimal digit, or -1 for a byte that
+// is not one.
+int hexByteValue(int b) {
+    if (b >= 48 && b <= 57) { return b - 48; }
+    if (b >= 97 && b <= 102) { return b - 87; }
+    if (b >= 65 && b <= 70) { return b - 55; }
+    return -1;
+}
+
+// The largest value that the scan can multiply by 16 and add a digit to and stay
+// in an int64: (2^63 - 1) / 16. A test against it before the multiply keeps the
+// overflow check exact, so that the compiler accepts `0x7FFFFFFFFFFFFFFF`, the
+// largest literal.
+int const HEX_MAX_PREFIX = 576460752303423487;
+
+// intValue returns the value that the text of an INT token denotes, in either
+// notation of §1.6. It sits in this module and not in the parser, because this
+// module decides what a number literal looks like: a run of characters that
+// readNumber accepted is a run that this function can read.
+export int intValue(String text) {
+    int n = string.length(text);
+    if (n > 2 && text[0] == 48 && (text[1] == 120 || text[1] == 88)) {
+        int v = 0;
+        for (int i = 2; i < n; i++) {
+            int d = hexByteValue(text[i]);
+            if (d < 0) {
+                return Error("lexer.intValue " + text + ": not a hexadecimal integer");
+            }
+            if (v > HEX_MAX_PREFIX) {
+                return Error("lexer.intValue " + text + ": out of range");
+            }
+            v = v * 16 + d;
+        }
+        return v;
+    }
+    return string.toInt(text);
+}

@@ -1,0 +1,101 @@
+// Checks two modules against reference answers frozen under tests/golden/.
+// Nothing can regenerate these corpora. They cover string quoting and the path
+// helpers that src/loader.nio implements.
+//
+//   - src/lib/quote.nio quotes a string. Its table of printable ranges covers
+//     every rune above 0xFF. The AST printer and every %q in a diagnostic use
+//     it.
+//   - src/loader.nio carries isAbs, clean, dirOf, baseOf and stemOf, because
+//     §6.10 has join, localize and getCwd and no more. A wrong resolveImport
+//     loads the wrong file silently.
+import 'test';
+import 'string';
+import 'array';
+import './repo' as repo;
+import './bytes' as bytes;
+import '../src/lib/quote' as quote;
+import '../src/loader' as loader;
+
+test.start("golden: quote matches the reference corpus", void () -> {
+    int n = 0;
+    forEach(string.split(repo.readText("tests/golden/quote_cases.txt"), "\n"), line) {
+        if (string.length(line) == 0 || line[0] == 35) {    // '#'
+            continue;
+        }
+        String[] f = string.split(line, " ");
+        if (f.length != 2) {
+            return Error("malformed golden line: " + line);
+        }
+        // The corpus holds bytes: every byte value, invalid UTF-8, and random
+        // bytes. bytes.unhex decodes them from hex.
+        String input = bytes.unhex(f[0]);
+        String want = bytes.unhex(f[1]);
+        String got = quote.quote(input);
+        if (got != want) {
+            return Error("quote of " + f[0] + ":\n got  " + f[1] + "\n want "
+                + hexOf(got));
+        }
+        n++;
+    }
+    test.assert(n > 30000, "the corpus has shrunk to " + string.from(n) + " cases");
+});
+
+test.start("golden: the loader's path helpers match the reference corpus", void () -> {
+    int n = 0;
+    forEach(string.split(repo.readText("tests/golden/loader_path_cases.txt"), "\n"), line) {
+        if (string.length(line) == 0 || line[0] == 35) {
+            continue;
+        }
+        String[] f = string.split(line, " ");
+        if (f.length != 6) {
+            return Error("malformed golden line: " + line);
+        }
+        String dir = bytes.unhex(f[0]);
+        String p = bytes.unhex(f[1]);
+        n++;
+        // A path that begins with a separator is absolute on a POSIX host. On
+        // Windows it is rooted on the current drive, so the answers differ
+        // between the two hosts. tests/path_win_test.nio checks the Windows
+        // form against a Windows table.
+        if (loader.hostOS() == "windows" && (rooted(p) || rooted(dir))) {
+            continue;
+        }
+        String where = "dir=\"" + dir + "\" path=\"" + p + "\": ";
+        expectEq(where + "resolveImport", loader.resolveImport(dir, p), bytes.unhex(f[2]));
+        expectEq(where + "dirOf", loader.dirOf(p), bytes.unhex(f[3]));
+        expectEq(where + "baseOf", loader.baseOf(p), bytes.unhex(f[4]));
+        expectEq(where + "stemOf", loader.stemOf(p), bytes.unhex(f[5]));
+    }
+    test.assert(n > 400, "the corpus has shrunk to " + string.from(n) + " cases");
+});
+
+// Whether a path begins with a separator, which the two hosts read differently.
+bool rooted(String p) {
+    if (string.length(p) == 0) {
+        return false;
+    }
+    return p[0] == 47 || p[0] == 92;    // '/' or '\\'
+}
+
+void expectEq(String what, String got, String want) {
+    // The corpus holds the answers on Unix. Windows writes its own separator
+    // into the same shape.
+    if (loader.hostOS() == "windows") {
+        got = string.replaceAll(got, "\\", "/");
+    }
+    if (got != want) {
+        return Error(what + " = \"" + got + "\", want \"" + want + "\"");
+    }
+}
+
+// Renders a string back as hex, for a failure message.
+String hexOf(String s) {
+    String const DIGITS = "0123456789abcdef";
+    String[] out = [];
+    for (int i = 0; i < string.length(s); i++) {
+        int v = s[i];
+        array.push(out, string.substring(DIGITS, v / 16, v / 16 + 1)
+            + string.substring(DIGITS, v % 16, v % 16 + 1));
+    }
+    return string.join(out, "");
+}

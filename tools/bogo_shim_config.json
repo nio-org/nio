@@ -1,0 +1,147 @@
+{
+  "_comment": [
+    "Configuration for BoGo, BoringSSL's TLS protocol test suite, run against",
+    "tools/bogo_shim.nio. tools/bogo.sh runs it.",
+    "",
+    "Almost nothing is skipped here. The shim itself skips by exiting 89 for",
+    "every flag it does not implement and for a peer that answers its",
+    "ClientHello with protocol_version. That is precise, needs no upkeep,",
+    "and covers the thousands of tests aimed at TLS 1.2, DTLS, QUIC,",
+    "resumption, client certificates and everything else this stack does not",
+    "do. DisabledTests is the residue: the handful of cases whose premise",
+    "cannot be reached from a flag or an alert, each one a written statement",
+    "about this client rather than a test that was inconvenient.",
+    "",
+    "Every entry below should be re-read whenever `tls` gains a feature. Three",
+    "of these four reasons stop being true the moment this client offers a new",
+    "extension."
+  ],
+
+  "DisabledTests": {
+    "CheckRecordVersion-TLS13": "RFC 8446 §5.1 says legacy_record_version 'is deprecated and MUST be ignored for all purposes', and this client ignores it. BoringSSL chooses to be stricter than the text and reject 0x03ff. Being strict here would cost interoperability with any peer or middlebox that writes something else into a field the standard promises nobody reads, and would buy nothing: the field is not covered by anything and decides nothing. Deliberate divergence, not a gap.",
+
+    "EMS-Forbidden-TLS13": "The premise is a server echoing extended_master_secret at TLS 1.3, which the runner only does when the ClientHello offered it. This client offers no extended_master_secret (a TLS 1.2 extension, and this stack has no TLS 1.2), so the response the test forbids is never sent to it. Unsolicited extensions in general *are* refused; see UnknownExtension-Client-TLS13, which passes.",
+
+    "RenegotiationInfo-Forbidden-TLS13": "Same shape as EMS-Forbidden: the runner echoes renegotiation_info only when the ClientHello carried it, and this client never sends it, having no renegotiation to secure. The general rule is enforced and tested elsewhere.",
+
+    "UnsolicitedServerNameAck-TLS-TLS13": "The premise is a server acknowledging SNI that was never sent. This client sends SNI on every connection whose host is a name rather than an address literal, so the acknowledgement is always solicited and the case cannot arise. When SNI is absent the acknowledgement is refused by the same checkSolicited call, driven by what the ClientHello actually offered.",
+
+    "SendEmptySessionTicket-TLS13": "No ticket is ever sent to this client: it offers no psk_key_exchange_modes, so the runner's server has nothing to answer with, and the record the test is about never reaches the wire. NewSessionTicket is parsed and validated when one arrives unsolicited (tls.checkNewSessionTicket), but BoGo cannot be made to send one here.",
+    "TLS13-Client-EmptyTicketFlags": "Same reason as SendEmptySessionTicket-TLS13: no psk_key_exchange_modes offered, so no NewSessionTicket is sent.",
+    "TLS13-Client-NonminimalTicketFlags": "Same reason as SendEmptySessionTicket-TLS13: no psk_key_exchange_modes offered, so no NewSessionTicket is sent.",
+    "TLS13-DuplicateTicketEarlyDataSupport": "Same reason as SendEmptySessionTicket-TLS13: no psk_key_exchange_modes offered, so no NewSessionTicket is sent.",
+
+    "MinimumVersion-Client-*": "A TLS 1.0/1.1/1.2 version-floor test. The runner rejects this client's offer on cipher suites before it ever reaches the version question, so the peer answers handshake_failure rather than the protocol_version alert the shim skips on. Same skip, reached a step earlier.",
+    "MinimumVersion-Client2-*": "As MinimumVersion-Client-*.",
+
+    "CurveTest-Client-X25519-TLS13": "The runner is configured with the full ECDHE cipher list, which includes TLS_AES_256_GCM_SHA384 and the TLS 1.2 suites; this stack offers two suites and neither is in that set, so the handshake fails on ciphers before the group under test matters. x25519 itself is covered by every other test here, all of which use it.",
+    "CurveTest-SetX25519HighBit-Client-X25519-TLS13": "As CurveTest-Client-X25519-TLS13: refused on cipher suites before the high-bit behaviour is reached.",
+    "TLS-TLS13-AES_256_GCM_SHA384-LargeRecord": "TLS_AES_256_GCM_SHA384 is not implemented (the two suites are AES-128-GCM and ChaCha20-Poly1305, both with SHA-256, so SHA-384 is never used in the key schedule).",
+
+    "HelloRetryRequest-*": "This client offers exactly one group, so there is nothing it could retry with, and it answers any HelloRetryRequest with handshake_failure by design (tls.handshakeClient). Most of these tests configure the runner with a group this client does not offer, so the handshake is refused on the ClientHello and the retry scenario is never reached at all. These tests apply once a second group, such as P-256, is offered.",
+    "*HelloRetryRequest*": "As HelloRetryRequest-*: no retry path, one group offered.",
+    "*-HRR-*": "As HelloRetryRequest-*, spelled with the abbreviation.",
+
+    "UnencryptedEncryptedExtensions": "A deliberate difference in which check fires first. The runner sends the EncryptedExtensions as an unprotected record; this client refuses it on the outer content type (a protected record must claim application_data, RFC 8446 §5.2) and answers unexpected_message, where BoringSSL attempts the decryption and answers bad_record_mac. Both refuse the record and neither reads it. Naming the actual defect seems better than reporting a MAC failure for bytes that were never a protected record.",
+    "SecondServerHello*": "Reached only through a HelloRetryRequest, which this client refuses; see HelloRetryRequest-*.",
+    "UnknownCurve-*": "The runner is configured with a group this client does not offer, so it refuses the ClientHello before the behaviour under test.",
+    "SkipHelloRetryRequest-TLS13": "As HelloRetryRequest-*: the runner wants a group this client does not offer.",
+    "TLS-ECH-Client-UnsolictedHRRExtension": "Encrypted Client Hello is not implemented, and the case is reached through a HelloRetryRequest besides.",
+
+    "Downgrade-TLS1-Client-TLS": "The runner offers only TLS 1.2-and-below cipher suites, so it refuses this client's ClientHello before the downgrade sentinel is reached. TLS 1.3's downgrade protection is moot for a client that offers no earlier version to be downgraded to.",
+    "Downgrade-TLS11-Client-TLS": "As Downgrade-TLS1-Client-TLS.",
+    "Downgrade-TLS12-Client-TLS": "As Downgrade-TLS1-Client-TLS.",
+    "NoSSL3-Client-Unsolicited": "The runner is configured with TLS 1.2 cipher suites only and refuses the ClientHello first. SSL 3.0 is not implemented and cannot be negotiated by a client that offers only TLS 1.3.",
+    "CurveTest-Invalid-*": "The runner is configured with the full ECDHE cipher list, none of which this stack offers, so the handshake fails on cipher suites before the malformed key share is reached. The three x25519 rejections these cover (a truncated share, a padded share, and a low-order point) are held by tests/tls_test.nio and tests/crypto_test.nio instead, the last being crypto.x25519SharedSecret's mandatory RFC 8446 §7.4.2 check.",
+    "TLS-TLS13-AES_256_GCM_SHA384-BadRecord": "TLS_AES_256_GCM_SHA384 is not implemented; see TLS-TLS13-AES_256_GCM_SHA384-LargeRecord.",
+
+    "RejectEmptyCertificateAuthorities-Client-*": "The certificate_authorities extension is read for well-formedness and then dropped: this client has no certificate to select with it, and never sends one. Rejecting a malformed one is BoringSSL choosing to parse a field it can act on. Revisit if client certificates are ever implemented.",
+    "ExtensionTrailingData-CertificateAuthorities-Client-*": "As RejectEmptyCertificateAuthorities-Client-*.",
+
+    "Ed25519DefaultDisable-NoAccept": "Ed25519 certificates are not supported, so the chain fails to build and the error is 'untrusted root' rather than BoringSSL's more specific 'wrong signature type'. The certificate is refused either way, which is the behaviour the test is protecting; only the name of the reason differs.",
+
+    "KeyUpdate-Requested": "The runner sends five KeyUpdates each requesting a reply, and expects exactly one reply, because BoringSSL coalesces them. This client answers each one, which is what RFC 8446 §4.6.3 says to do ('the receiver MUST send a KeyUpdate of its own') and is bounded by tls's MAX_KEY_UPDATES, so it is not the unbounded amplification coalescing exists to prevent. A deliberate difference in a place the RFC leaves to the implementation.",
+
+    "ClientHelloPadding": "The padding extension (RFC 7685) exists to work around one vendor's middlebox mishandling ClientHellos of certain lengths. This client does not send it, so its ClientHello is not padded to 512 bytes. Not a protocol requirement.",
+
+    "PostQuantumEnabledByDefaultInClients": "Expects X25519MLKEM768 in the default key shares. This stack offers x25519 alone; post-quantum key agreement is not in TLS.md."
+  },
+
+  "_error_comment": [
+    "ErrorMap translates BoringSSL's canonical error strings into the tokens",
+    "tools/bogo_shim.nio prints on stderr. A test that expects a failure",
+    "checks that the expected string appears in the shim's output, so without",
+    "this every correct rejection would still be reported as the wrong",
+    "rejection.",
+    "",
+    "The tokens are derived from tls.ErrorCode and x509.ErrorCode (§6.18,",
+    "§6.19), so what a test matches against is the same code a program",
+    "catching a failed tls.connect would dispatch on. There is no separate",
+    "vocabulary invented for the test suite.",
+    "",
+    "Where several of ours can legitimately answer one of theirs, all are",
+    "listed: BoringSSL distinguishes causes that this stack deliberately does",
+    "not, and mapping many-to-one is honest where inventing new codes to match",
+    "would not be."
+  ],
+
+  "ErrorMap": {
+    ":UNEXPECTED_EXTENSION:": [":NIO_UNSUPPORTED_EXTENSION:"],
+    ":ERROR_PARSING_EXTENSION:": [":NIO_UNSUPPORTED_EXTENSION:", ":NIO_DECODE_ERROR:", ":NIO_ILLEGAL_PARAMETER:"],
+    ":DUPLICATE_EXTENSION:": [":NIO_ILLEGAL_PARAMETER:"],
+    ":UNEXPECTED_MESSAGE:": [":NIO_UNEXPECTED_MESSAGE:"],
+    ":EXCESS_HANDSHAKE_DATA:": [":NIO_UNEXPECTED_MESSAGE:"],
+    ":TOO_MANY_EMPTY_FRAGMENTS:": [":NIO_TOO_MANY_MESSAGES:"],
+    ":TOO_MANY_KEY_UPDATES:": [":NIO_TOO_MANY_MESSAGES:"],
+    ":TOO_MANY_WARNING_ALERTS:": [":NIO_TOO_MANY_MESSAGES:"],
+    ":BAD_ALERT:": [":NIO_PEER_ALERT:", ":NIO_DECODE_ERROR:"],
+    ":DECODE_ERROR:": [":NIO_DECODE_ERROR:", ":NIO_ILLEGAL_PARAMETER:"],
+    ":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:": [":NIO_BAD_RECORD_MAC:", ":NIO_DECODE_ERROR:", ":NIO_UNEXPECTED_MESSAGE:"],
+    ":BAD_HANDSHAKE_MSG:": [":NIO_DECODE_ERROR:"],
+    ":BAD_DECOMPRESSION:": [":NIO_DECODE_ERROR:"],
+    ":DATA_LENGTH_TOO_LONG:": [":NIO_RECORD_OVERFLOW:"],
+    ":ENCRYPTED_LENGTH_TOO_LONG:": [":NIO_RECORD_OVERFLOW:"],
+    ":DIGEST_CHECK_FAILED:": [":NIO_DECRYPT_ERROR:"],
+    ":WRONG_SIGNATURE_TYPE:": [":NIO_UNSUPPORTED_CERTIFICATE:", ":NIO_ILLEGAL_PARAMETER:"],
+    ":BAD_SIGNATURE:": [":NIO_DECRYPT_ERROR:", ":NIO_DECODE_ERROR:"],
+    ":UNKNOWN_ALERT_TYPE:": [":NIO_ILLEGAL_PARAMETER:"],
+    ":SSLV3_ALERT_DECOMPRESSION_FAILURE:": [":NIO_PEER_ALERT:"],
+    ":BAD_DECRYPT:": [":NIO_BAD_RECORD_MAC:"],
+    ":BAD_ECPOINT:": [":NIO_ILLEGAL_PARAMETER:"],
+    ":EMPTY_HELLO_RETRY_REQUEST:": [":NIO_ILLEGAL_PARAMETER:", ":NIO_HANDSHAKE_FAILURE:"],
+    ":INVALID_OUTER_RECORD_TYPE:": [":NIO_UNEXPECTED_MESSAGE:"],
+    ":UNEXPECTED_RECORD:": [":NIO_UNEXPECTED_MESSAGE:"],
+    ":PARSE_TLSEXT:": [":NIO_ILLEGAL_PARAMETER:", ":NIO_DECODE_ERROR:"],
+    ":UNSUPPORTED_ALGORITHM:": [":NIO_UNSUPPORTED_CERTIFICATE:", ":NIO_CERT_UNSUPPORTED:"],
+    ":WRONG_CURVE:": [":NIO_ILLEGAL_PARAMETER:"],
+    ":WRONG_CIPHER_RETURNED:": [":NIO_ILLEGAL_PARAMETER:"],
+    ":WRONG_VERSION_NUMBER:": [":NIO_ILLEGAL_PARAMETER:"],
+    ":UNSUPPORTED_PROTOCOL:": [":NIO_ILLEGAL_PARAMETER:", ":NIO_PEER_ALERT:"],
+    ":SERVER_CERT_CHANGED:": [":NIO_CERT_UNTRUSTED:"],
+    ":CERTIFICATE_VERIFY_FAILED:": [":NIO_CERT_UNTRUSTED:", ":NIO_CERT_HOSTNAME:", ":NIO_CERT_EXPIRED:", ":NIO_CERT_MALFORMED:", ":NIO_CERT_CONSTRAINT:", ":NIO_CERT_BAD_SIGNATURE:", ":NIO_CERT_UNSUPPORTED:"],
+    ":KEY_USAGE_BIT_INCORRECT:": [":NIO_CERT_CONSTRAINT:"],
+    ":NO_CERTIFICATE_ASSIGNED:": [":NIO_CERT_MALFORMED:"],
+    ":CANNOT_PARSE_LEAF_CERT:": [":NIO_CERT_MALFORMED:"],
+    ":UNKNOWN_CERTIFICATE_TYPE:": [":NIO_CERT_UNSUPPORTED:"],
+    ":MISSING_KEY_SHARE:": [":NIO_ILLEGAL_PARAMETER:"],
+    ":SECOND_SERVERHELLO_VERSION_MISMATCH:": [":NIO_ILLEGAL_PARAMETER:"],
+    ":NO_SHARED_CIPHER:": [":NIO_ILLEGAL_PARAMETER:", ":NIO_PEER_ALERT:"],
+    ":NO_SHARED_GROUP:": [":NIO_ILLEGAL_PARAMETER:", ":NIO_PEER_ALERT:"],
+    ":NO_APPLICATION_PROTOCOL:": [":NIO_ILLEGAL_PARAMETER:", ":NIO_PEER_ALERT:"],
+    ":INVALID_ALPN_PROTOCOL:": [":NIO_ILLEGAL_PARAMETER:", ":NIO_ALPN_MISMATCH:"],
+    ":INVALID_COMPRESSION_LIST:": [":NIO_ILLEGAL_PARAMETER:"],
+    ":SSLV3_ALERT_HANDSHAKE_FAILURE:": [":NIO_PEER_ALERT:"],
+    ":SSLV3_ALERT_ILLEGAL_PARAMETER:": [":NIO_PEER_ALERT:"],
+    ":TLSV1_ALERT_DECODE_ERROR:": [":NIO_PEER_ALERT:"],
+    ":TLSV1_ALERT_PROTOCOL_VERSION:": [":NIO_PEER_ALERT:"],
+    ":TLSV1_ALERT_INTERNAL_ERROR:": [":NIO_PEER_ALERT:"],
+    ":TLSV1_ALERT_UNKNOWN_CA:": [":NIO_PEER_ALERT:"],
+    ":TLSV1_ALERT_NO_APPLICATION_PROTOCOL:": [":NIO_PEER_ALERT:"],
+    ":TLSV1_CERTIFICATE_REQUIRED:": [":NIO_PEER_ALERT:"],
+    ":HANDSHAKE_FAILURE_ON_CLIENT_HELLO:": [":NIO_PEER_ALERT:", ":NIO_HANDSHAKE_FAILURE:"],
+    ":PEER_DID_NOT_RETURN_A_CERTIFICATE:": [":NIO_ILLEGAL_PARAMETER:"],
+    ":APPLICATION_DATA_INSTEAD_OF_HANDSHAKE:": [":NIO_UNEXPECTED_MESSAGE:"],
+    ":APPLICATION_DATA_ON_SHUTDOWN:": [":NIO_UNEXPECTED_DATA:"],
+    "Unexpected SSL_shutdown result: -1 != 1": [":NIO_NO_CLOSE_NOTIFY:"]
+  }
+}

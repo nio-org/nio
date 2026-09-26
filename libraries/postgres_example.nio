@@ -1,0 +1,85 @@
+// Using the `postgres` library.
+//
+//     nio run libraries/postgres_example.nio
+//
+// It needs a server it can reach. The defaults are a local one on port 5432.
+// It writes only to a temporary table.
+import 'postgres';
+import 'json';
+import 'string';
+
+// This is a function because a `catch` block bound to a value must leave the
+// enclosing scope (§3.7), and top-level code has no `return`.
+void async main() {
+    postgres.ClientOptions o = postgres.clientOptions();
+    o.host = "127.0.0.1";
+    o.port = 5432;
+    o.user = "postgres";
+    o.password = "postgres";
+    o.database = "postgres";
+
+    postgres.Client pg = postgres.createClient(o);
+
+    await pg.connect() catch e {
+        print("Unable to connect: " + e.message);
+        return;
+    };
+    print("connected to " + string.from(pg.parameter("server_version")));
+
+    // `print` takes only scalars (§6.1), so a Result goes through `json.toText`.
+    postgres.Result now = await pg.query("SELECT NOW() AS now") catch e {
+        print("query failed: " + e.message);
+        return;
+    };
+    print(json.toText(now));
+    print("just the value: " + (json.asText(now.rows[0]["now"]) catch "?"));
+
+    // `numeric` stays text. It holds values that no float can hold.
+    postgres.Result mixed = await pg.query(
+        "SELECT 42 AS n, 1.5::float8 AS f, 1.5::numeric AS exact, "
+        + "true AS yes, NULL AS nothing, '{\"a\":[1,2]}'::jsonb AS doc") catch e {
+        print("query failed: " + e.message);
+        return;
+    };
+    print(json.toText(mixed));
+    print("doc.a[1] = " + string.from(json.asInt(mixed.rows[0]["doc"]["a"][1]) catch -1));
+
+    // The simple query protocol has no bound parameters, so quote every value
+    // put into a statement. An unquoted value is a SQL injection.
+    String name = "o'brien";
+    await pg.query("CREATE TEMP TABLE people (id serial primary key, name text)") catch e {
+        print("create failed: " + e.message);
+        return;
+    };
+    postgres.Result ins = await pg.query(
+        "INSERT INTO people (name) VALUES (" + (postgres.quoteLiteral(name) catch "''") + ")") catch e {
+        print("insert failed: " + e.message);
+        return;
+    };
+    print("inserted " + string.from(ins.rowCount) + " row");
+
+    postgres.Result people = await pg.query("SELECT id, name FROM people ORDER BY id") catch e {
+        print("select failed: " + e.message);
+        return;
+    };
+    forEach(people.rows, row) {
+        print("  " + string.from(json.asInt(row["id"]) catch 0)
+            + ": " + (json.asText(row["name"]) catch "?"));
+    }
+
+    // A statement the server rejects raises code `SERVER` and leaves the
+    // connection open, so the next query works.
+    await pg.query("SELECT * FROM no_such_table") catch e {
+        print("expected: " + e.message);
+    };
+    postgres.Result after = await pg.query("SELECT 1 AS still_here") catch e {
+        print("connection did not survive: " + e.message);
+        return;
+    };
+    print(json.toText(after));
+
+    await pg.disconnect();
+    print("disconnected");
+}
+
+await main();

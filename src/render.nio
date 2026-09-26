@@ -1,0 +1,170 @@
+// Writes a diagnostic together with the source it is about:
+//
+//	error: cannot use String as int in declaration of "x"
+//	 --> prog.nio:1:9
+//	  |
+//	1 | int x = "hello";
+//	  |         ^^^^^^^
+//
+// The structured form in src/diag.nio is the source of truth, and this module
+// is one view of it. A language server reads the numbers and does not use this
+// module. Every diagnostic carries the span of the source it names
+// (token.Token records where a token ends), so the underline covers the
+// incorrect text.
+//
+// When a diagnostic names a second place, that place gets its own excerpt
+// under `note:`. Two excerpts read the same when the places are one line apart
+// and when they are in different modules. The second case is frequent: an
+// argument and its parameter are often in different files.
+import 'fs';
+import 'string';
+import 'array';
+import 'map';
+import './diag' as diag;
+
+// Reads each file once, however many diagnostics name it. In a diagnostic the
+// entry file has no path (`file` is ""), so the caller gives its text.
+export type Sources {
+    String entryPath;
+    String entry;
+    Map<String, String> read;
+}
+
+export Sources sources(String entryPath, String entry) {
+    Sources s = { entryPath: entryPath, entry: entry, read: {} };
+    return s;
+}
+
+// The name to print for a diagnostic's file.
+String nameOf(Sources s, String file) {
+    if (file == "") {
+        return s.entryPath;
+    }
+    return file;
+}
+
+// The lines of the file a diagnostic names. It is an empty array when the file
+// cannot be read, for example a deleted file or an unsaved editor buffer. The
+// header still prints without the excerpt.
+String[] linesOf(Sources s, String file) {
+    if (file == "") {
+        return string.split(s.entry, "\n");
+    }
+    String? had = s.read[file];
+    if (had != null) {
+        return string.split(had, "\n");
+    }
+    byte[] data = fs.readFile(file) catch e {
+        s.read[file] = "";
+        return [];
+    };
+    String text = string.fromByteArray(data);
+    s.read[file] = text;
+    return string.split(text, "\n");
+}
+
+// Right-aligns s in a field of the given width.
+String pad(String s, int width) {
+    String out = s;
+    while (string.length(out) < width) {
+        out = " " + out;
+    }
+    return out;
+}
+
+String spaces(int n) {
+    String out = "";
+    for (int i = 0; i < n; i++) {
+        out = out + " ";
+    }
+    return out;
+}
+
+// The underline row for a span. A tab in the source is a tab in the row, so
+// the two align in a terminal for any tab width.
+String underline(String line, int col, int endCol, String mark) {
+    String out = "";
+    int i = 1;
+    while (i < col) {
+        if (i <= string.length(line) && line[i - 1] == 9) {
+            out = out + "\t";
+        } else {
+            out = out + " ";
+        }
+        i++;
+    }
+    int stop = endCol;
+    // A span with no end, or one that ends where it starts, gets one mark that
+    // points at the position.
+    if (stop <= col) {
+        stop = col + 1;
+    }
+    for (int k = col; k < stop; k++) {
+        out = out + mark;
+    }
+    return out;
+}
+
+// One excerpt: the location, the source line, and the underline under it.
+// `label` is written after the underline when it is not empty.
+String[] excerpt(Sources s, String file, int line, int col, int endLine, int endCol,
+    String mark, String label) {
+    String[] out = [];
+    array.push(out, " --> " + nameOf(s, file) + ":" + string.from(line) + ":" + string.from(col));
+    String[] ls = linesOf(s, file);
+    if (line < 1 || line > ls.length) {
+        return out;
+    }
+    String text = ls[line - 1];
+    String num = string.from(line);
+    String gutter = spaces(string.length(num));
+    array.push(out, gutter + " |");
+    array.push(out, num + " | " + text);
+    // A span that continues past this line is underlined to the end of the
+    // line. Only a string or a comment can do that, and the first line locates
+    // it. underline gives one mark to a span with no end or with no width.
+    int stop = endCol;
+    if (endLine > line) {
+        stop = string.length(text) + 1;
+    }
+    String row = gutter + " | " + underline(text, col, stop, mark);
+    if (label != "") {
+        row = row + " " + label;
+    }
+    array.push(out, row);
+    return out;
+}
+
+// One diagnostic, with its excerpt, its second place and its suggested fix.
+export String one(Sources s, diag.Diagnostic d) {
+    String[] out = [];
+    array.push(out, "error: " + d.message);
+    forEach(excerpt(s, d.file, d.line, d.col, d.endLine, d.endCol, "^", ""), l) {
+        array.push(out, l);
+    }
+    diag.Label? rel = d.related;
+    if (rel != null) {
+        array.push(out, "note: " + rel.message);
+        forEach(excerpt(s, rel.at.file, rel.at.line, rel.at.col, rel.at.endLine,
+            rel.at.endCol, "-", ""), l) {
+            array.push(out, l);
+        }
+    }
+    forEach(d.notes, note) {
+        array.push(out, "note: " + note);
+    }
+    diag.Fix? fix = d.fix;
+    if (fix != null) {
+        array.push(out, "help: " + fix.title);
+    }
+    return string.join(out, "\n");
+}
+
+// Every diagnostic, one after another, with a blank line between them.
+export String all(Sources s, diag.Diagnostic[] ds) {
+    String[] out = [];
+    forEach(ds, d) {
+        array.push(out, one(s, d));
+    }
+    return string.join(out, "\n\n");
+}

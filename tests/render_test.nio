@@ -1,0 +1,132 @@
+// The rendered form of a diagnostic: the excerpt, the underline under the
+// source the diagnostic is about, the second place, and the offered fix.
+//
+// src/diag.nio defines the diagnostic and this is one view of it. The cases
+// here build diagnostics by hand and compile no programs. tests/diag_test.nio
+// covers what real programs produce. These cases check that the underline
+// matches the span, and that a missing or impossible source falls back to the
+// header and does not crash.
+import 'test';
+import 'string';
+import 'array';
+import '../src/diag' as diag;
+import '../src/render' as render;
+import '../src/token' as token;
+
+// A token covering [col, endCol) of one line, as the lexer would record it.
+token.Token tok(int line, int col, int endCol) {
+    token.Token t = {
+        type: token.IDENT, literal: "", line: line, col: col,
+        note: "", quote: "", endLine: line, endCol: endCol,
+    };
+    return t;
+}
+
+String[] renderLines(String src, diag.Diagnostic d) {
+    render.Sources s = render.sources("prog.nio", src);
+    return string.split(render.one(s, d), "\n");
+}
+
+test.start("render: the underline covers the span and nothing else", void () -> {
+    String src = "int x = \"hello\";";
+    // The string literal: columns 9 through 15, so seven carets.
+    diag.Diagnostic d = diag.atTok(tok(1, 9, 16), "cannot use String as int");
+    String[] ls = renderLines(src, d);
+    test.expectString(ls[0], "error: cannot use String as int");
+    test.expectString(ls[1], " --> prog.nio:1:9");
+    test.expectString(ls[2], "  |");
+    test.expectString(ls[3], "1 | int x = \"hello\";");
+    test.expectString(ls[4], "  |         ^^^^^^^");
+    test.expectInt(ls.length, 5);
+});
+
+test.start("render: a second place is its own excerpt", void () -> {
+    String src = "int x = \"hello\";";
+    diag.Diagnostic d = diag.atTok(tok(1, 9, 16), "cannot use String as int");
+    d = diag.related(d, diag.spanOf(tok(1, 1, 4)), "expected because of this type");
+    String[] ls = renderLines(src, d);
+    test.expectString(ls[4], "  |         ^^^^^^^");
+    test.expectString(ls[5], "note: expected because of this type");
+    test.expectString(ls[6], " --> prog.nio:1:1");
+    test.expectString(ls[8], "1 | int x = \"hello\";");
+    // A second place has a different mark, so two excerpts of one line do not
+    // read as the same claim.
+    test.expectString(ls[9], "  | ---");
+});
+
+test.start("render: a fix is offered under help", void () -> {
+    diag.Diagnostic d = diag.atTok(tok(1, 1, 5), "path is a built-in library");
+    diag.Span at = { file: "", line: 1, col: 1, endLine: 1, endCol: 1 };
+    d = diag.suggests(d, at, "import 'path';\n", "add import 'path';");
+    String[] ls = renderLines("path.join(\"a\");", d);
+    test.expectString(ls[ls.length - 1], "help: add import 'path';");
+});
+
+test.start("render: the gutter widens with the line number", void () -> {
+    String[] many = [];
+    for (int i = 0; i < 120; i++) {
+        array.push(many, "// filler");
+    }
+    array.push(many, "int x = 1;");
+    diag.Diagnostic d = diag.atTok(tok(121, 1, 4), "just a message");
+    String[] ls = renderLines(string.join(many, "\n"), d);
+    test.expectString(ls[2], "    |");
+    test.expectString(ls[3], "121 | int x = 1;");
+    test.expectString(ls[4], "    | ^^^");
+});
+
+test.start("render: a tab keeps the underline aligned", void () -> {
+    // A tab before the span must also be a tab in the underline row.
+    // Otherwise the caret lands wherever the terminal puts a tab stop.
+    String src = "\tint x = 1;";
+    diag.Diagnostic d = diag.atTok(tok(1, 2, 5), "about the type");
+    String[] ls = renderLines(src, d);
+    test.expectString(ls[4], "  | \t^^^");
+});
+
+test.start("render: a span that outruns its line stops at the end of it", void () -> {
+    // Only a string or a comment spans lines. The first line locates it, so
+    // only that line is underlined.
+    String src = "String s = `one\ntwo`;";
+    token.Token t = {
+        type: token.STRING, literal: "", line: 1, col: 12,
+        note: "", quote: "`", endLine: 2, endCol: 5,
+    };
+    diag.Diagnostic d = diag.atTok(t, "about the string");
+    String[] ls = renderLines(src, d);
+    test.expectString(ls[3], "1 | String s = `one");
+    test.expectString(ls[4], "  |            ^^^^");
+});
+
+test.start("render: an excerpt it cannot read is the header alone", void () -> {
+    // A line past the end of the file, which a stale diagnostic can name.
+    diag.Diagnostic d = diag.atTok(tok(99, 1, 4), "nothing there");
+    String[] ls = renderLines("int x = 1;", d);
+    test.expectString(ls[0], "error: nothing there");
+    test.expectString(ls[1], " --> prog.nio:99:1");
+    test.expectInt(ls.length, 2);
+
+    // And a file that is not the entry and is not on disk.
+    diag.Diagnostic other = diag.atTok(tok(1, 1, 4), "in another module");
+    other.file = "/no/such/file.nio";
+    String[] ls2 = renderLines("int x = 1;", other);
+    test.expectString(ls2[1], " --> /no/such/file.nio:1:1");
+    test.expectInt(ls2.length, 2);
+});
+
+test.start("render: a position with no span still gets one caret", void () -> {
+    // A diagnostic with a position and no span gets one caret at the position.
+    diag.Diagnostic d = diag.at(1, 5, "somewhere here");
+    String[] ls = renderLines("int x = 1;", d);
+    test.expectString(ls[4], "  |     ^");
+});
+
+test.start("render: every diagnostic in turn, with a blank line between", void () -> {
+    diag.Diagnostic a = diag.atTok(tok(1, 1, 4), "first");
+    diag.Diagnostic b = diag.atTok(tok(1, 5, 6), "second");
+    render.Sources s = render.sources("prog.nio", "int x = 1;");
+    String[] ls = string.split(render.all(s, [a, b]), "\n");
+    test.expectString(ls[0], "error: first");
+    test.expectString(ls[5], "");
+    test.expectString(ls[6], "error: second");
+});

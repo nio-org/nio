@@ -1,0 +1,289 @@
+// Reading a tar archive, and writing one out to a directory.
+//
+// The format is 512-byte headers, each followed by the file's bytes rounded up
+// to 512 (ustar, POSIX.1-1988). Only what a source package needs is read: files
+// and directories, the pax and GNU records that carry a long name, and nothing
+// else. A link is refused. Skipping it would extract the package wrong and
+// hash it as though it were whole.
+//
+// Everything here reads what a host sent, so no field is trusted: the checksum
+// is verified, every size is bounded, and a name that leaves the destination is
+// refused (`..`, an absolute path, a drive letter).
+import 'array';
+import 'string';
+import 'fs';
+import 'path';
+import 'lib/str' as str;
+
+int const BLOCK = 512;
+
+// The largest number of entries read from one archive.
+int const MAX_ENTRIES = 100000;
+
+export type Entry {
+    String name;
+    byte[] data;
+    bool dir;
+}
+
+// The entries of an archive, in the order they were written.
+export Entry[] read(byte[] data) {
+    Entry[] out = [];
+    String longName = "";
+    int at = 0;
+    while (at + BLOCK <= data.length) {
+        if (zeroBlock(data, at)) {
+            return out;
+        }
+        if (out.length >= MAX_ENTRIES) {
+            return Error("the archive holds more than " + string.from(MAX_ENTRIES) + " entries");
+        }
+        checkSum(data, at);
+        String name = field(data, at, 0, 100);
+        String prefix = field(data, at, 345, 155);
+        int size = octal(data, at + 124, 12);
+        int kind = data[at + 156];
+        int body = at + BLOCK;
+        if (body + size > data.length) {
+            return Error("an entry of the archive runs past its end");
+        }
+        int next = body + roundUp(size);
+        // 'x' and 'L' carry the name of the entry that follows, for a path
+        // longer than the header's own field. 'g' is the archive's own record,
+        // which GitHub writes into every tarball it generates.
+        if (kind == 120 || kind == 76) {
+            longName = nameFrom(kind, array.slice(data, body, body + size));
+            at = next;
+            continue;
+        }
+        if (kind == 103) {
+            at = next;
+            continue;
+        }
+        if (kind == 49 || kind == 50) {
+            return Error("the archive holds a link, which nio does not extract: "
+                + join(prefix, name));
+        }
+        if (kind != 48 && kind != 0 && kind != 53) {
+            return Error("the archive holds an entry of a kind nio does not read: "
+                + string.from(kind));
+        }
+        String full = join(prefix, name);
+        if (longName != "") {
+            full = longName;
+            longName = "";
+        }
+        bool isDir = kind == 53 || str.hasSuffix(full, "/");
+        byte[] body2 = [];
+        if (!isDir) {
+            body2 = array.slice(data, body, body + size);
+        }
+        Entry e = { name: trimSlash(full), data: body2, dir: isDir };
+        array.push(out, e);
+        at = next;
+    }
+    return out;
+}
+
+// Writes an archive into a directory. strip drops that many leading path
+// components from every name, which is how a host's generated tarball loses the
+// one directory it wraps the tree in. The answer is a message, or null.
+export String? extract(byte[] data, String into, int strip) {
+    Entry[] entries = read(data) catch e {
+        return e.message;
+    };
+    forEach(entries, e) {
+        String rel = stripComponents(e.name, strip);
+        if (rel == "") {
+            continue;
+        }
+        String? bad = safe(rel);
+        if (bad != null) {
+            return bad;
+        }
+        String dest = path.join(into, path.localize(rel));
+        if (e.dir) {
+            createDirAll(dest);
+            continue;
+        }
+        createDirAll(dirOf(dest));
+        fs.writeFile(dest, e.data) catch err {
+            return err.message;
+        };
+    }
+    return null;
+}
+
+// Why a name may not be written, or null. No size limit bounds a name that
+// leaves the destination, so each name is checked here.
+String? safe(String name) {
+    if (str.hasPrefix(name, "/") || str.hasPrefix(name, "\\")) {
+        return "the archive holds an absolute path: " + name;
+    }
+    if (string.length(name) >= 2 && name[1] == 58) {
+        return "the archive holds an absolute path: " + name;
+    }
+    forEach(string.split(string.replace(name, "\\", "/"), "/"), part) {
+        if (part == "..") {
+            return "the archive holds a path that leaves the directory: " + name;
+        }
+    }
+    if (string.contains(name, "\0")) {
+        return "the archive holds a name with a zero byte in it";
+    }
+    return null;
+}
+
+// The name with its first n components removed, or "" when it has no more than
+// that. The "" case is the wrapping directory itself, which nothing needs.
+String stripComponents(String name, int n) {
+    String[] parts = string.split(name, "/");
+    String[] kept = [];
+    forEach(parts, p, i) {
+        if (i >= n && p != "") {
+            array.push(kept, p);
+        }
+    }
+    return string.join(kept, "/");
+}
+
+// A header block of zeros ends the archive.
+bool zeroBlock(byte[] data, int at) {
+    for (int i = 0; i < BLOCK; i++) {
+        if (data[at + i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The header's own checksum: the sum of its bytes, with the checksum field read
+// as spaces. Historical writers signed those bytes, so both sums are accepted.
+void checkSum(byte[] data, int at) {
+    int want = octal(data, at + 148, 8);
+    int sum = 0;
+    int signed = 0;
+    for (int i = 0; i < BLOCK; i++) {
+        int b = data[at + i];
+        if (i >= 148 && i < 156) {
+            b = 32;
+        }
+        sum = sum + b;
+        if (b > 127) {
+            signed = signed + b - 256;
+        } else {
+            signed = signed + b;
+        }
+    }
+    if (want != sum && want != signed) {
+        return Error("an entry of the archive does not match its checksum");
+    }
+}
+
+// An octal field, ended by a space or a zero byte.
+int octal(byte[] data, int at, int len) {
+    int out = 0;
+    for (int i = 0; i < len; i++) {
+        int c = data[at + i];
+        if (c == 0 || c == 32) {
+            return out;
+        }
+        if (c < 48 || c > 55) {
+            return Error("an entry of the archive holds a number that is not octal");
+        }
+        out = out * 8 + (c - 48);
+    }
+    return out;
+}
+
+// A header field, up to its first zero byte.
+String field(byte[] data, int at, int off, int len) {
+    byte[] out = [];
+    for (int i = 0; i < len; i++) {
+        int c = data[at + off + i];
+        if (c == 0) {
+            return string.fromByteArray(out);
+        }
+        array.push(out, c as byte);
+    }
+    return string.fromByteArray(out);
+}
+
+// The name a pax record or a GNU long-name entry carries. A pax record is a run
+// of `<length> key=value\n` lines and only `path` is read.
+String nameFrom(int kind, byte[] body) {
+    if (kind == 76) {
+        return trimZero(string.fromByteArray(body));
+    }
+    String text = string.fromByteArray(body);
+    String found = "";
+    forEach(string.split(text, "\n"), line) {
+        int sp = string.find(line, " ");
+        if (sp < 0) {
+            continue;
+        }
+        String rest = string.substring(line, sp + 1, string.length(line));
+        if (str.hasPrefix(rest, "path=")) {
+            found = string.substring(rest, 5, string.length(rest));
+        }
+    }
+    return found;
+}
+
+String trimZero(String s) {
+    int end = string.length(s);
+    while (end > 0 && s[end - 1] == 0) {
+        end = end - 1;
+    }
+    return string.substring(s, 0, end);
+}
+
+String join(String prefix, String name) {
+    if (prefix == "") {
+        return name;
+    }
+    return prefix + "/" + name;
+}
+
+String trimSlash(String s) {
+    if (str.hasSuffix(s, "/")) {
+        return string.substring(s, 0, string.length(s) - 1);
+    }
+    return s;
+}
+
+int roundUp(int n) {
+    int over = n % BLOCK;
+    if (over == 0) {
+        return n;
+    }
+    return n + BLOCK - over;
+}
+
+void createDirAll(String dir) {
+    if (dir == "" || fs.exists(dir)) {
+        return;
+    }
+    String parent = dirOf(dir);
+    if (parent != dir) {
+        createDirAll(parent);
+    }
+    fs.createDir(dir) catch e { };
+}
+
+String dirOf(String p) {
+    int cut = -1;
+    int n = string.length(p);
+    for (int i = 0; i < n; i++) {
+        if (p[i] == 47 || p[i] == 92) {
+            cut = i;
+        }
+    }
+    if (cut < 0) {
+        return "";
+    }
+    if (cut == 0) {
+        return string.substring(p, 0, 1);
+    }
+    return string.substring(p, 0, cut);
+}

@@ -1,0 +1,22 @@
+// 10,000 tasks sleep one millisecond at the same time. This measures timer
+// bookkeeping and wakeups. The wall time is 1 ms plus that cost.
+import 'time';
+import 'array';
+
+int woken = 0;
+
+void async sleeper() {
+    await time.sleep(1);
+    woken = woken + 1;
+}
+
+Future<void>[] fs = [];
+int i = 0;
+while (i < 10000) {
+    array.push(fs, sleeper());
+    i = i + 1;
+}
+forEach(fs, f) {
+    await f;
+}
+printInline(woken);

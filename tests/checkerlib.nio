@@ -1,0 +1,101 @@
+// Runs the checker from a test: parse, check, and return the diagnostics.
+// tests/checker_test.nio and tests/checker_errors_test.nio use it.
+import 'string';
+import 'array';
+import 'map';
+import '../src/checker' as checker;
+import '../src/parser' as parser;
+import '../src/lexer' as lexer;
+import '../src/ast' as ast;
+import '../src/types' as types;
+
+// The checker's result and the tree it checked.
+export type Checked {
+    checker.Info info;
+    ast.Program prog;
+    String[] errs;
+}
+
+// A test source that does not parse is an error in the test. It says nothing
+// about the checker.
+export ast.Program parseOrRaise(String src) {
+    parser.Parser p = parser.newParser(lexer.newLexer(src));
+    ast.Program prog = p.parseProgram();
+    if (p.errs.length > 0) {
+        return Error("parse errors in test source:\n" + string.join(p.errs, "\n"));
+    }
+    return prog;
+}
+
+export Checked checkProg(String src) {
+    ast.Program prog = parseOrRaise(src);
+    checker.CheckResult res = checker.check(prog);
+    Checked out = { info: res.info, prog: prog, errs: res.errs };
+    return out;
+}
+
+export String[] check(String src) {
+    return checkProg(src).errs;
+}
+
+// Checks a module against a dependency that is already checked, as the loader
+// does.
+export Checked checkModuleWith(String src, String qual, Map<String, checker.ModuleExports> deps) {
+    ast.Program prog = parseOrRaise(src);
+    checker.CheckResult res = checker.checkModule(prog, qual, deps);
+    Checked out = { info: res.info, prog: prog, errs: res.errs };
+    return out;
+}
+
+// A row of either table: a name for the failure message, the source, and a
+// substring of the diagnostic for the tables that must fail.
+export type Named {
+    String name;
+    String src;
+    String want;
+}
+
+export Named ok(String name, String src) {
+    Named n = { name: name, src: src, want: "" };
+    return n;
+}
+
+export Named bad(String name, String src, String want) {
+    Named n = { name: name, src: src, want: want };
+    return n;
+}
+
+// Requires every program to check with no diagnostics.
+export void accepts(Named[] table) {
+    forEach(table, t) {
+        String[] errs = check(t.src);
+        if (errs.length > 0) {
+            return Error(t.name + ": unexpected errors:\n" + string.join(errs, "\n"));
+        }
+    }
+}
+
+// Requires a diagnostic mentioning want.
+export void rejects(Named[] table) {
+    forEach(table, t) {
+        String[] errs = check(t.src);
+        if (errs.length == 0) {
+            return Error(t.name + ": expected an error containing \"" + t.want
+                + "\", got none");
+        }
+        if (!has(errs, t.want)) {
+            return Error(t.name + ": no error containing \"" + t.want + "\" in:\n"
+                + string.join(errs, "\n"));
+        }
+    }
+}
+
+// Reports whether some diagnostic holds want.
+export bool has(String[] errs, String want) {
+    forEach(errs, e) {
+        if (string.contains(e, want)) {
+            return true;
+        }
+    }
+    return false;
+}

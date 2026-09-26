@@ -1,0 +1,101 @@
+// Conversion between `file://` URIs and file system paths. The server answers
+// with the URI the client sent where it has one. A URI built here can encode a
+// path differently and name a document the editor does not know. fromPath serves
+// a file reached through an import, for which no URI arrived.
+import 'string';
+import 'array';
+
+String[] const hexDigits = [
+    "0", "1", "2", "3", "4", "5", "6", "7",
+    "8", "9", "A", "B", "C", "D", "E", "F",
+];
+
+// Returns a hex digit's value, or -1 for anything else.
+int hexValue(byte b) {
+    if (b >= 48 && b <= 57) {
+        return b - 48;
+    }
+    if (b >= 97 && b <= 102) {
+        return b - 87;    // 'a' is 10
+    }
+    if (b >= 65 && b <= 70) {
+        return b - 55;    // 'A' is 10
+    }
+    return -1;
+}
+
+// A byte a URI path can carry as itself: the unreserved set of RFC 3986, plus
+// the separator. Every other byte is escaped, including a Windows drive colon.
+bool isSafeByte(byte b) {
+    return (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57)
+        || b == 45 || b == 46 || b == 95 || b == 126 || b == 47;
+}
+
+// Expands the %XX escapes in s. A `%` with no two hex digits after it stays as
+// itself, because a path with a literal percent character is the likely case.
+export String decode(String s) {
+    int n = string.length(s);
+    byte[] out = [];
+    int i = 0;
+    while (i < n) {
+        byte b = s[i];
+        if (b == 37 && i + 2 < n) {
+            int hi = hexValue(s[i + 1]);
+            int lo = hexValue(s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                array.push(out, (hi * 16 + lo) as byte);
+                i = i + 3;
+                continue;
+            }
+        }
+        array.push(out, b);
+        i++;
+    }
+    return string.fromByteArray(out);
+}
+
+// The inverse of decode. It escapes every byte outside the safe set.
+export String encode(String s) {
+    int n = string.length(s);
+    String[] parts = [];
+    for (int i = 0; i < n; i++) {
+        byte b = s[i];
+        if (isSafeByte(b)) {
+            array.push(parts, string.fromByteArray([b]));
+        } else {
+            array.push(parts, "%" + hexDigits[b / 16] + hexDigits[b % 16]);
+        }
+    }
+    return string.join(parts, "");
+}
+
+// Returns the file system path a `file://` URI names, or "" for a URI that
+// names anything else, such as an unsaved buffer. It skips the authority, so a
+// UNC path loses its host.
+export String toPath(String uri) {
+    if (string.find(uri, "file://") != 0) {
+        return "";
+    }
+    String rest = string.substring(uri, 7, string.length(uri));
+    int slash = string.find(rest, "/");
+    if (slash < 0) {
+        return "";
+    }
+    String p = decode(string.substring(rest, slash, string.length(rest)));
+    // `file:///C:/x` starts with a slash the drive letter does not need. The
+    // test looks at the path shape only, so all platforms convert the same.
+    if (string.length(p) >= 3 && p[0] == 47 && p[2] == 58) {
+        return string.substring(p, 1, string.length(p));
+    }
+    return p;
+}
+
+// Returns the URI for a file system path. A relative path stays relative, and
+// no editor matches such a URI.
+export String fromPath(String p) {
+    String enc = encode(p);
+    if (string.length(enc) > 0 && enc[0] == 47) {
+        return "file://" + enc;
+    }
+    return "file:///" + enc;
+}

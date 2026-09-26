@@ -1,0 +1,580 @@
+// The shim that the BoringSSL BoGo TLS test runner drives.
+//
+// The runner starts this program once for each test case, with a set of flags.
+// The program connects to loopback:`-port` and writes `-shim-id` as eight
+// little-endian bytes. That socket is then the TLS transport, and this end is
+// the client. The exit status is the result: 0 passed, 89 skipped, any other
+// value failed, with a reason on stderr.
+//
+// Each known flag is on a list, and an unknown flag exits 89. If the shim
+// ignored an unknown flag, it would report a pass for the feature that the
+// flag tests. `tools/bogo.sh` counts the skips.
+import 'net';
+import 'tls';
+import 'x509';
+import 'string';
+import 'array';
+import 'crypto';
+import 'process';
+import 'fs';
+import 'async';
+import 'map';
+
+// The runner's `errUnimplemented` status. The runner skips the test and counts
+// no pass or failure.
+int const EXIT_UNIMPLEMENTED = 89;
+int const EXIT_FAILURE = 1;
+
+// The runner finds its `expectedError` as a substring of stderr.
+// tools/bogo_shim_config.json maps BoringSSL error names onto these tokens.
+void fail(String token, String detail) {
+    process.stderr.write(token + " " + detail + "\n");
+    process.exit(EXIT_FAILURE);
+}
+
+void unimplemented(String what) {
+    process.stderr.write("unimplemented: " + what + "\n");
+    process.exit(EXIT_UNIMPLEMENTED);
+}
+
+// Turns a caught error into the stable string the runner matches on.
+String tokenFor(int code) {
+    if (code == tls.ErrorCode.DECODE_ERROR) { return ":NIO_DECODE_ERROR:"; }
+    if (code == tls.ErrorCode.UNEXPECTED_MESSAGE) { return ":NIO_UNEXPECTED_MESSAGE:"; }
+    if (code == tls.ErrorCode.ILLEGAL_PARAMETER) { return ":NIO_ILLEGAL_PARAMETER:"; }
+    if (code == tls.ErrorCode.HANDSHAKE_FAILURE) { return ":NIO_HANDSHAKE_FAILURE:"; }
+    if (code == tls.ErrorCode.DECRYPT_ERROR) { return ":NIO_DECRYPT_ERROR:"; }
+    if (code == tls.ErrorCode.RECORD_OVERFLOW) { return ":NIO_RECORD_OVERFLOW:"; }
+    if (code == tls.ErrorCode.UNSUPPORTED_CERTIFICATE) { return ":NIO_UNSUPPORTED_CERTIFICATE:"; }
+    if (code == tls.ErrorCode.UNSUPPORTED_EXTENSION) { return ":NIO_UNSUPPORTED_EXTENSION:"; }
+    if (code == tls.ErrorCode.TOO_MANY_MESSAGES) { return ":NIO_TOO_MANY_MESSAGES:"; }
+    if (code == tls.ErrorCode.PEER_ALERT) { return ":NIO_PEER_ALERT:"; }
+    if (code == crypto.ErrorCode.AUTHENTICATION) { return ":NIO_BAD_RECORD_MAC:"; }
+    if (code == x509.ErrorCode.BAD_CERTIFICATE) { return ":NIO_CERT_MALFORMED:"; }
+    if (code == x509.ErrorCode.UNSUPPORTED_ALGORITHM) { return ":NIO_CERT_UNSUPPORTED:"; }
+    if (code == x509.ErrorCode.EXPIRED) { return ":NIO_CERT_EXPIRED:"; }
+    if (code == x509.ErrorCode.NOT_YET_VALID) { return ":NIO_CERT_NOT_YET_VALID:"; }
+    if (code == x509.ErrorCode.UNTRUSTED_ROOT) { return ":NIO_CERT_UNTRUSTED:"; }
+    if (code == x509.ErrorCode.HOSTNAME_MISMATCH) { return ":NIO_CERT_HOSTNAME:"; }
+    if (code == x509.ErrorCode.CONSTRAINT_VIOLATION) { return ":NIO_CERT_CONSTRAINT:"; }
+    if (code == x509.ErrorCode.BAD_SIGNATURE) { return ":NIO_CERT_BAD_SIGNATURE:"; }
+    return ":NIO_ERROR:";
+}
+
+// All flags the runner can pass, and whether each takes a value. A flag that
+// is in neither table exits 89. A listed flag is not always supported:
+// `configure` decides which of these the shim can satisfy.
+Map<String, bool> const BOOL_FLAGS = {
+    "-ipv6": true,
+    "-server": true,
+    "-dtls": true,
+    "-quic": true,
+    "-fuzzer-mode": true,
+    "-shim-writes-first": true,
+    "-shim-shuts-down": true,
+    "-check-close-notify": true,
+    "-no-tls1": true,
+    "-no-tls11": true,
+    "-no-tls12": true,
+    "-no-tls13": true,
+    "-async": true,
+    "-verify-peer": true,
+    "-verify-fail": true,
+    "-expect-no-session": true,
+    "-expect-session-miss": true,
+    "-expect-hrr": true,
+    "-expect-no-hrr": true,
+    "-enable-early-data": true,
+    "-enable-ocsp-stapling": true,
+    "-enable-signed-cert-timestamps": true,
+    "-false-start": true,
+    "-renegotiate-freely": true,
+    "-require-any-client-certificate": true,
+    "-use-custom-verify-callback": true,
+    "-partial-write": true,
+    "-no-ticket": true,
+    "-peek-then-read": true,
+    "-read-with-unfinished-write": true,
+    "-tls-unique": true,
+    "-key-update-before-read": true,
+    "-export-traffic-secrets": true,
+    "-use-export-context": true,
+    "-wait-for-debugger": true,
+    "-is-handshaker-supported": true,
+    "-handshaker-resume": true,
+    "-allow-hint-mismatch": true,
+    "-reverify-on-resume": true,
+    "-no-op-extra-handshake": true,
+    "-install-cert-compression-algs": true,
+    "-enable-ech-grease": true,
+    "-ech-is-retry-config": true,
+    "-expect-ech-accept": true,
+    "-send-channel-id": true,
+    "-server-supports-padding": true,
+    "-request-server-padding": true,
+    "-alps-use-new-codepoint": true,
+    "-cnsa2-202603": true,
+    "-jdk11-workaround": true,
+    "-forbid-renegotiation-after-handshake": true,
+    "-implicit-handshake": true,
+    "-decline-alps": true,
+    "-on-resume-expect-accept-early-data": true,
+    "-on-resume-expect-reject-early-data": true,
+    "-on-resume-shim-writes-first": true,
+    "-expect-ticket-supports-early-data": true,
+    "-expect-accept-early-data": true,
+    "-expect-reject-early-data": true,
+    "-expect-extended-master-secret": true,
+    "-expect-secure-renegotiation": true,
+    "-expect-no-secure-renegotiation": true,
+    "-expect-sha256-client-cert": true,
+    "-expect-no-sha256-client-cert": true,
+    "-fail-early-callback": true,
+    "-fail-cert-callback": true,
+    "-handoff": true,
+    "-handshake-twice": true,
+    "-retain-only-sha256-client-cert": true,
+    "-expect-draft-downgrade": true,
+    "-permute-extensions": true,
+    "-expect-key-usage-invalid": true,
+    "-expect-cert-verify-fail": true,
+    "-expect-verify-result": true,
+    "-send-alert": true,
+};
+
+Map<String, bool> const VALUE_FLAGS = {
+    "-port": true,
+    "-shim-id": true,
+    "-trust-cert": true,
+    "-host-name": true,
+    "-max-version": true,
+    "-min-version": true,
+    "-expect-version": true,
+    "-advertise-alpn": true,
+    "-expect-alpn": true,
+    "-expect-advertised-alpn": true,
+    "-select-alpn": true,
+    "-select-next-proto": true,
+    "-advertise-npn": true,
+    "-curves": true,
+    "-key-shares": true,
+    "-expect-curve-id": true,
+    "-cipher": true,
+    "-expect-cipher": true,
+    "-resume-count": true,
+    "-key-file": true,
+    "-cert-file": true,
+    "-mtu": true,
+    "-psk": true,
+    "-psk-identity": true,
+    "-srtp-profiles": true,
+    "-signing-prefs": true,
+    "-verify-prefs": true,
+    "-expect-peer-signature-algorithm": true,
+    "-expect-server-name": true,
+    "-export-keying-material": true,
+    "-export-label": true,
+    "-export-context": true,
+    "-ticket-key": true,
+    "-resumption-delay": true,
+    "-max-cert-list": true,
+    "-expect-total-renegotiations": true,
+    "-expect-selected-credential": true,
+    "-application-settings": true,
+    "-expect-peer-application-settings": true,
+    "-ech-config-list": true,
+    "-ech-server-key": true,
+    "-ech-server-config": true,
+    "-quic-transport-params": true,
+    "-expect-quic-transport-params": true,
+    "-quic-use-legacy-codepoint": true,
+    "-quic-early-data-context": true,
+    "-write-settings": true,
+    "-expect-early-data-reason": true,
+    "-on-resume-expect-early-data-reason": true,
+    "-on-retry-expect-early-data-reason": true,
+    "-server-supported-groups-hint": true,
+    "-requested-trust-anchors": true,
+    "-accepted-peer-cert-types": true,
+    "-expect-ticket-age-skew": true,
+    "-expect-peer-verify-pref": true,
+    "-expect-msg-callback": true,
+    "-shim-prefix": true,
+    "-resume-shim-prefix": true,
+    "-expect-client-ca-list": true,
+    "-signed-cert-timestamps": true,
+    "-ocsp-response": true,
+    "-expect-ocsp-response": true,
+    "-expect-signed-cert-timestamps": true,
+    "-new-x509-credential": true,
+    "-on-resume-new-x509-credential": true,
+    "-delegated-credential": true,
+    "-expect-cipher-aes": true,
+    "-expect-cipher-no-aes": true,
+};
+
+// The flags this shim satisfies. Any other recognized flag exits 89.
+Map<String, bool> const SUPPORTED = {
+    "-port": true,
+    "-shim-id": true,
+    "-ipv6": true,
+    "-trust-cert": true,
+    "-host-name": true,
+    "-max-version": true,
+    "-min-version": true,
+    "-expect-version": true,
+    "-advertise-alpn": true,
+    "-expect-alpn": true,
+    "-curves": true,
+    "-expect-curve-id": true,
+    "-expect-cipher": true,
+    "-shim-writes-first": true,
+    "-shim-shuts-down": true,
+    "-check-close-notify": true,
+    "-no-tls1": true,
+    "-no-tls11": true,
+    "-no-tls12": true,
+    "-expect-server-name": true,
+    "-shim-prefix": true,
+    // The runner adds these to almost all client tests, and this client
+    // already does what they ask.
+    "-verify-peer": true,
+    "-expect-no-session": true,
+    "-expect-total-renegotiations": true,
+};
+
+// The parsed command line: each flag maps to its value, or "" for a flag with
+// no value.
+type Flags {
+    Map<String, String> set;
+
+    bool has(String name) {
+        String? v = self.set[name];
+        return v != null;
+    }
+
+    String get(String name, String fallback) {
+        String? v = self.set[name];
+        if (v == null) { return fallback; }
+        return v;
+    }
+
+    int number(String name, int fallback) {
+        String? v = self.set[name];
+        if (v == null) { return fallback; }
+        return string.toInt(v) catch e {
+            fail(":NIO_BAD_FLAG:", name + " is not a number: " + v);
+            return fallback;
+        };
+    }
+}
+
+Flags parseFlags(String[] argv) {
+    Map<String, String> set = {};
+    int i = 0;
+    while (i < argv.length) {
+        String a = argv[i];
+        bool? isBool = BOOL_FLAGS[a];
+        if (isBool != null) {
+            set[a] = "";
+            i++;
+            continue;
+        }
+        bool? takesValue = VALUE_FLAGS[a];
+        if (takesValue != null) {
+            if (i + 1 >= argv.length) {
+                fail(":NIO_BAD_FLAG:", a + " wants a value");
+            }
+            set[a] = argv[i + 1];
+            i = i + 2;
+            continue;
+        }
+        // An unlisted flag tests a feature that the shim does not check.
+        unimplemented("flag " + a);
+    }
+    return { set: set };
+}
+
+int const VERSION_TLS13 = 772;    // 0x0304
+int const GROUP_X25519 = 29;      // RFC 8446 §4.2.7
+
+// Skips each flag that asks for a feature this client does not have. The list
+// of unsupported features is in this one function.
+void configure(Flags f) {
+    forEach(map.keys(f.set), name) {
+        bool? ok = SUPPORTED[name];
+        if (ok == null) {
+            unimplemented(name);
+        }
+    }
+
+    // Only TLS 1.3.
+    if (f.has("-no-tls13")) { unimplemented("TLS versions below 1.3"); }
+    if (f.number("-max-version", VERSION_TLS13) < VERSION_TLS13) {
+        unimplemented("a maximum version below TLS 1.3");
+    }
+    if (f.number("-min-version", VERSION_TLS13) > VERSION_TLS13) {
+        unimplemented("a minimum version above TLS 1.3");
+    }
+    if (f.number("-expect-version", VERSION_TLS13) != VERSION_TLS13) {
+        unimplemented("a negotiated version other than TLS 1.3");
+    }
+
+    // x25519 is the only group this client offers.
+    if (f.has("-curves")) {
+        forEach(string.split(f.get("-curves", ""), ":"), c) {
+            int id = string.toInt(c) catch e {
+                unimplemented("curve " + c);
+                return;
+            };
+            if (id != GROUP_X25519) { unimplemented("curve " + c); }
+        }
+    }
+    if (f.number("-expect-curve-id", GROUP_X25519) != GROUP_X25519) {
+        unimplemented("a negotiated group other than x25519");
+    }
+
+    // TLS 1.3 removed renegotiation, so only zero is supported.
+    if (f.number("-expect-total-renegotiations", 0) != 0) {
+        unimplemented("renegotiation");
+    }
+}
+
+// Opens the socket and writes the runner's framing: eight bytes of shim id,
+// little-endian. All bytes after those are the TLS stream.
+Socket async dialRunner(Flags f) {
+    int port = f.number("-port", 0);
+    if (port == 0) { fail(":NIO_BAD_FLAG:", "no -port"); }
+    String host = "127.0.0.1";
+    if (f.has("-ipv6")) { host = "[::1]"; }
+
+    Socket s = await net.tcp.connect(host + ":" + string.from(port),
+        { timeout: 30000 });
+
+    int id = f.number("-shim-id", 0);
+    byte[] hello = [0, 0, 0, 0, 0, 0, 0, 0];
+    int i = 0;
+    while (i < 8) {
+        hello[i] = ((id / pow256(i)) % 256) as byte;
+        i++;
+    }
+    await net.write(s, hello, { timeout: 30000 });
+    return s;
+}
+
+// §3.1 has no `>>`. The shim id is small, so a division does the shift.
+int pow256(int n) {
+    int out = 1;
+    int i = 0;
+    while (i < n) {
+        out = out * 256;
+        i++;
+    }
+    return out;
+}
+
+// The runner writes -advertise-alpn in the wire format: each protocol after a
+// one-byte length.
+String[] parseAlpnFlag(String v) {
+    byte[] b = string.toByteArray(v);
+    String[] out = [];
+    int at = 0;
+    while (at < b.length) {
+        int n = b[at];
+        if (at + 1 + n > b.length) {
+            fail(":NIO_BAD_FLAG:", "-advertise-alpn is malformed");
+        }
+        array.push(out, string.fromByteArray(array.slice(b, at + 1, at + 1 + n)));
+        at = at + 1 + n;
+    }
+    return out;
+}
+
+// -trust-cert names a PEM file with the root that signed the runner's test
+// certificate. `Options.roots` limits trust to that root, so this shim does
+// not need insecureSkipVerify.
+x509.Certificate[] loadRoots(String path) {
+    // An empty path means a credential with a raw public key. This stack cannot
+    // trust it.
+    if (string.length(path) == 0) {
+        unimplemented("a credential with no root certificate");
+    }
+    byte[] data = fs.readFile(path) catch e {
+        fail(":NIO_BAD_FLAG:", "cannot read -trust-cert " + path + ": " + e.message);
+        return [];
+    };
+    byte[][] ders = x509.parsePem(string.fromByteArray(data)) catch e {
+        fail(":NIO_CERT_MALFORMED:", "-trust-cert is not PEM: " + e.message);
+        return [];
+    };
+    x509.Certificate[] out = [];
+    forEach(ders, der) {
+        x509.Certificate c = x509.parseCertificate(der) catch e {
+            fail(":NIO_CERT_MALFORMED:", "-trust-cert does not parse: " + e.message);
+            return [];
+        };
+        array.push(out, c);
+    }
+    return out;
+}
+
+// The runner sends a message and expects each byte back, complemented.
+byte[] complement(byte[] b) {
+    byte[] out = [];
+    forEach(b, one) {
+        array.push(out, (255 - one) as byte);
+    }
+    return out;
+}
+
+// The size of a full plaintext record, the maximum for one message
+// (RFC 8446 §5.1). The longest test message of the runner has this size.
+int const MAX_MESSAGE = 16384;
+
+// Echoes what the runner sends until the stream ends. It works one chunk at a
+// time, because no flag gives the message count and length. The runner
+// reassembles with ReadFull, so this end needs no framing.
+void async exchange(tls.Conn c) {
+    while (true) {
+        byte[] msg = await c.read(MAX_MESSAGE);
+        if (msg.length == 0) { return; }
+        await c.write(complement(msg));
+    }
+}
+
+// Implements `-check-close-notify`: the stream must end with close_notify from
+// the peer. A stream that stops without close_notify is a truncation attack.
+void async awaitCloseNotify(tls.Conn c) {
+    byte[] b = await c.read(MAX_MESSAGE) catch e {
+        // An alert from the peer in place of close_notify is a different
+        // result. It is not a truncation.
+        if (e.code == tls.ErrorCode.PEER_ALERT) {
+            fail(tokenFor(e.code), e.message);
+            return;
+        }
+        fail(":NIO_NO_CLOSE_NOTIFY:", "the connection ended without a close_notify: "
+            + e.message);
+        return;
+    };
+    if (b.length != 0) {
+        fail(":NIO_UNEXPECTED_DATA:", "peer sent data after the exchange");
+    }
+    if (c.in.closed) { return; }
+    fail(":NIO_NO_CLOSE_NOTIFY:", "peer closed without sending close_notify");
+}
+
+void async runTest(Flags f) {
+    Socket s = await dialRunner(f);
+    tls.Transport io = tls.socketTransport(s, 30000);
+
+    String serverName = f.get("-host-name", "test");
+    tls.Options opts = { timeout: 30000 };
+    if (f.has("-trust-cert")) {
+        opts.roots = loadRoots(f.get("-trust-cert", ""));
+    }
+    if (f.has("-expect-cipher-aes") || f.has("-expect-cipher-no-aes")) {
+        // §6.17 offers AES-GCM only where the CPU runs it in constant time.
+        // Thus the host decides the suite, and this stack has no preference.
+        unimplemented("a cipher preference by AES-ness");
+    }
+    if (f.has("-advertise-alpn")) {
+        opts.alpn = parseAlpnFlag(f.get("-advertise-alpn", ""));
+    }
+
+    tls.Conn c = await tls.handshakeClient(io, serverName, opts) catch e {
+        // `handshakeClient` already sent the alert to the peer, at the
+        // protection level it reached.
+        net.close(s);
+
+        // The TLS version of a test is in the runner's config, and no flag
+        // gives it to the shim. Thus a protocol_version alert is the only
+        // sign of a pre-1.3 test. The message is the full text that `tls`
+        // builds.
+        if (e.code == tls.ErrorCode.PEER_ALERT
+            && e.message == "peer sent protocol_version") {
+            unimplemented("TLS versions below 1.3");
+        }
+        fail(tokenFor(e.code), e.message);
+        return;
+    };
+
+    if (f.has("-expect-alpn")) {
+        String want = f.get("-expect-alpn", "");
+        if (c.alpn != want) {
+            fail(":NIO_ALPN_MISMATCH:",
+                "negotiated ALPN \"" + c.alpn + "\", expected \"" + want + "\"");
+        }
+    }
+    if (f.has("-expect-cipher")) {
+        int want = f.number("-expect-cipher", 0);
+        if (c.out.suite != want) {
+            fail(":NIO_CIPHER_MISMATCH:", "negotiated cipher suite "
+                + string.from(c.out.suite) + ", expected " + string.from(want));
+        }
+    }
+
+    // The runner's `shimInitialWrite`. The runner expects this string.
+    if (f.has("-shim-writes-first")) {
+        await c.write(string.toByteArray("hello"));
+    }
+    if (f.has("-shim-prefix")) {
+        await c.write(string.toByteArray(f.get("-shim-prefix", "")));
+    }
+
+    // -shim-shuts-down: close without an exchange of data, so the test checks
+    // only the close_notify.
+    if (f.has("-shim-shuts-down")) {
+        // Use closeWrite, not close. The shim must continue to read after it
+        // closes its side, for the peer's close_notify and for post-handshake
+        // messages that the peer can still send.
+        await c.closeWrite();
+        if (f.has("-check-close-notify")) {
+            await awaitCloseNotify(c);
+        }
+        c.io.close();
+        net.close(s);
+        return;
+    }
+
+    // A failure after the handshake also sends an alert to the peer. Several
+    // BoGo cases send a forged record here and check the reply.
+    await exchange(c) catch e {
+        await c.abort(tls.alertFor(e.code));
+        net.close(s);
+        fail(tokenFor(e.code), e.message);
+        return;
+    };
+
+    if (f.has("-check-close-notify") && !c.in.closed) {
+        fail(":NIO_NO_CLOSE_NOTIFY:", "peer closed without sending close_notify");
+    }
+
+    await c.close();
+    net.close(s);
+}
+
+// `async.run` takes a future that cannot fail (§6.8). Thus the error goes to
+// the exit status and to a token on stderr.
+void async main(Flags f) {
+    await runTest(f) catch e {
+        process.stderr.write(tokenFor(e.code) + " " + e.message + "\n");
+        process.exit(EXIT_FAILURE);
+        return;
+    };
+}
+
+String[] argv = process.getArgs();
+
+// Before the tests, the runner starts the shim with only this flag and reads
+// stdout. It learns if the shim can split a handshake across a separate
+// handshaker process. The shim must answer, because an exit of 89 here stops
+// the run.
+if (array.indexOf(argv, "-is-handshaker-supported") >= 0) {
+    print("No");
+    process.exit(0);
+}
+
+Flags flags = parseFlags(argv);
+configure(flags);
+
+async.run(main(flags), void () -> { process.exit(0); });

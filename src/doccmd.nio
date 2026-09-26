@@ -1,0 +1,381 @@
+// `nio doc`: the exported surface of a module, as text (§3.3).
+//
+// It follows the godoc model. The prose above a declaration is its
+// documentation, with no markup language and no tags. The prose comes from the
+// reader that a hover uses (src/lsp/doc.nio). The declarations come from the
+// writers that a hover uses (src/lsp/form.nio, src/lsp/sig.nio). Thus a
+// reference and an editor cannot describe one declaration differently.
+//
+// A declaration is written back from the file's own tree, so the reference
+// reads as the file does. Two things come from the checker, because no file
+// holds them: the `!` on a function, which §2.9 infers from the body, and the
+// members of a `union` (§2.11), which the parser generates.
+import './loader' as loader;
+import './driver' as driver;
+import './checker' as checker;
+import './builtins' as builtins;
+import './ast' as ast;
+import './types' as types;
+import './embed/stdlib' as stdlib;
+import './lsp/doc' as prose;
+import './lsp/sig' as sig;
+import './lsp/form' as form;
+import './lib/str' as str;
+import 'fs';
+import 'string';
+import 'array';
+import 'process';
+
+void writeOut(String s) {
+    process.stdout.write(s);
+}
+
+void writeErr(String s) {
+    process.stderr.write(s);
+}
+
+export void usage() {
+    writeErr("usage: nio doc [-u] <module|file.nio> [name]\n");
+    writeErr("  a module is a built-in one, such as `http` or `fs`; anything\n");
+    writeErr("  holding a separator or ending in .nio is a file\n");
+    writeErr("  -u   the whole module, and not the exported names alone\n");
+}
+
+// `nio doc`. The status is 0 when the module is written out. It is 1 when the
+// module does not check or does not declare the name, and 2 for a command line
+// error.
+export int docCmd(String[] args) {
+    bool all = false;
+    String[] rest = [];
+    forEach(args, a) {
+        if (a == "-u") {
+            all = true;
+            continue;
+        }
+        if (a == "--help") {
+            usage();
+            return 0;
+        }
+        if (str.hasPrefix(a, "-")) {
+            writeErr("unknown flag " + a + "\n");
+            usage();
+            return 2;
+        }
+        array.push(rest, a);
+    }
+    if (rest.length < 1 || rest.length > 2) {
+        usage();
+        return 2;
+    }
+    String target = rest[0];
+    String want = "";
+    if (rest.length == 2) {
+        want = rest[1];
+    }
+    if (isModuleName(target)) {
+        return builtinDoc(target, want, all);
+    }
+    return fileDoc(target, want, all);
+}
+
+// A bare word is the name of a built-in module. A word with a separator or with
+// the extension is a path: `nio doc fs` is the module, and `nio doc ./fs.nio`
+// is the file in the current directory.
+bool isModuleName(String p) {
+    return !string.contains(p, "/") && !string.contains(p, "\\")
+        && !str.hasSuffix(p, ".nio");
+}
+
+// A built-in module. The four modules written in Nio (§6.13, §6.16, §6.18,
+// §6.19) are source and read as a file does. The others come from the
+// compiler's tables, which hold signatures and no prose.
+int builtinDoc(String name, String want, bool all) {
+    if (loader.builtinNioModules[name] != null) {
+        String? src = stdlib.source(name);
+        if (src == null) {
+            writeErr("the bake holds no " + name + "\n");
+            return 1;
+        }
+        return render(src, ".", name, name, want, all);
+    }
+    if (builtins.members(name).length == 0) {
+        writeErr("no built-in module named " + name + "\n");
+        return 1;
+    }
+    return tableDoc(name, want);
+}
+
+int fileDoc(String file, String want, bool all) {
+    byte[] data = fs.readFile(file) catch e {
+        writeErr(e.message + "\n");
+        return 1;
+    };
+    return render(string.fromByteArray(data), loader.dirOf(file), file, file, want, all);
+}
+
+// Checks the module and writes it out. For a module that does not check, it
+// reports the errors only. A tree that the checker rejects can name types that
+// are not valid.
+int render(String src, String dir, String entryPath, String title, String want, bool all) {
+    loader.CompileResult res = loader.checkEntry(src, dir, entryPath, {});
+    if (res.errs.length > 0) {
+        writeErr(driver.compileErrors(title, src, res) + "\n");
+        return 1;
+    }
+    loader.Checked m = res.checked[res.checked.length - 1];
+    String[] out = [];
+    array.push(out, "module " + title);
+    String top = prose.atTop(m.prog.comments, firstDeclLine(m.prog));
+    if (top != "" && want == "") {
+        array.push(out, "");
+        array.push(out, top);
+    }
+    int found = 0;
+    forEach(m.prog.statements, st) {
+        String block = entry(m, st, want, all);
+        if (block == "") {
+            continue;
+        }
+        found++;
+        array.push(out, "");
+        array.push(out, block);
+    }
+    if (want != "" && found == 0) {
+        writeErr(title + " declares no " + want + "\n");
+        return 1;
+    }
+    writeOut(string.join(out, "\n") + "\n");
+    return 0;
+}
+
+// The line on which the first declaration begins. It separates a comment on the
+// module from a comment on that declaration.
+int firstDeclLine(ast.Program p) {
+    int line = 0;
+    forEach(p.statements, st) {
+        if (line == 0 && documented(st)) {
+            line = st.tok.line;
+        }
+    }
+    return line;
+}
+
+bool documented(ast.Statement st) {
+    if (st as ast.VarDeclStatement != null) {
+        return true;
+    }
+    if (st as ast.FunctionDeclStatement != null) {
+        return true;
+    }
+    if (st as ast.TypeDeclStatement != null) {
+        return true;
+    }
+    return st as ast.EnumDeclStatement != null;
+}
+
+// One declaration and its prose, or "" for a statement that is not shown: a
+// name that the filter removes, an unexported name without -u, a generated
+// union member, and each top-level statement that declares nothing.
+String entry(loader.Checked m, ast.Statement st, String want, bool all) {
+    checker.Info info = m.info;
+    ast.VarDeclStatement? v = st as ast.VarDeclStatement;
+    if (v != null) {
+        if (!shown(v.name, v.exported, want, all)) {
+            return "";
+        }
+        return withProse(m, st.tok.line, varHead(info, v), "");
+    }
+    ast.FunctionDeclStatement? fn = st as ast.FunctionDeclStatement;
+    if (fn != null) {
+        if (!shown(fn.name, fn.exported, want, all)) {
+            return "";
+        }
+        return withProse(m, st.tok.line, funcHead(info, fn), "");
+    }
+    ast.TypeDeclStatement? td = st as ast.TypeDeclStatement;
+    if (td != null) {
+        types.Record? rec = info.records[td.name];
+        if (rec != null && checker.unionPayload(rec) != null) {
+            // A generated member of a union. The union writes its members.
+            return "";
+        }
+        if (!shown(td.name, td.exported, want, all)) {
+            return "";
+        }
+        String head = form.recordWritten(td);
+        if (rec != null && checker.isUnion(rec)) {
+            head = form.unionDecl(rec);
+            if (td.exported) {
+                head = "export " + head;
+            }
+        }
+        return withProse(m, st.tok.line, head, methods(m, td, all));
+    }
+    ast.ReExportStatement? re = st as ast.ReExportStatement;
+    if (re != null) {
+        // The statement need not list the names that it publishes, so the
+        // reference writes them out. When a part gains an export, the package
+        // API shows it here.
+        String[] pub = checker.reExportedNames(info, re);
+        if (pub.length == 0 || !reShown(re, pub, want)) {
+            return "";
+        }
+        return withProse(m, st.tok.line, reHead(re),
+            "republished from " + re.alias + ": " + string.join(pub, ", "));
+    }
+    ast.EnumDeclStatement? en = st as ast.EnumDeclStatement;
+    if (en != null) {
+        if (!shown(en.name, en.exported, want, all)) {
+            return "";
+        }
+        return withProse(m, st.tok.line, form.enumWritten(en), "");
+    }
+    return "";
+}
+
+String reHead(ast.ReExportStatement re) {
+    if (re.mode == "all") {
+        return "export " + re.alias;
+    }
+    return "export " + re.alias + " " + re.mode + " " + string.join(re.names, ", ");
+}
+
+// A re-export is always public, so only a name filter can hide it. It matches
+// the module that it names and each name that it publishes.
+bool reShown(ast.ReExportStatement re, String[] pub, String want) {
+    if (want == "") {
+        return true;
+    }
+    if (re.alias == want) {
+        return true;
+    }
+    return array.contains(pub, want);
+}
+
+bool shown(String name, bool exported, String want, bool all) {
+    if (want != "") {
+        return name == want;
+    }
+    return exported || all;
+}
+
+// The methods of a type, written under it. A program reaches a method through a
+// value of the type. Thus `export` on the type makes it public, and a method
+// has no marker of its own.
+String methods(loader.Checked m, ast.TypeDeclStatement td, bool all) {
+    String[] out = [];
+    forEach(td.methods, fn) {
+        String head = sig.fromDecl(fn, fn.name, fallible(m.info, td.name + "." + fn.name));
+        array.push(out, withProse(m, fn.tok.line, head, ""));
+    }
+    if (out.length == 0) {
+        return "";
+    }
+    return string.join(out, "\n");
+}
+
+// A declaration, then its prose indented under it, then `below` indented one
+// more step.
+String withProse(loader.Checked m, int line, String head, String below) {
+    String[] out = [];
+    array.push(out, head);
+    String text = prose.above(m.prog.comments, line);
+    if (text != "") {
+        array.push(out, indent(text, "    "));
+    }
+    if (below != "") {
+        array.push(out, "");
+        array.push(out, indent(below, "    "));
+    }
+    return string.join(out, "\n");
+}
+
+String indent(String text, String pad) {
+    String[] out = [];
+    forEach(string.split(text, "\n"), l) {
+        if (l == "") {
+            array.push(out, "");
+            continue;
+        }
+        array.push(out, pad + l);
+    }
+    return string.join(out, "\n");
+}
+
+String varHead(checker.Info info, ast.VarDeclStatement v) {
+    String written = ast.typeNodeString(v.type);
+    types.Type? t = info.declTypes[v.id];
+    if (t != null) {
+        written = types.typeString(t);
+    }
+    if (v.const) {
+        written = written + " const";
+    }
+    if (v.exported) {
+        return "export " + written + " " + v.name;
+    }
+    return written + " " + v.name;
+}
+
+String funcHead(checker.Info info, ast.FunctionDeclStatement fn) {
+    String head = sig.fromDecl(fn, fn.name, fallible(info, fn.name));
+    if (fn.exported) {
+        return "export " + head;
+    }
+    return head;
+}
+
+// Whether §2.9 inferred that this function can fail. No declaration writes a
+// `!`, but a caller must handle the failure.
+bool fallible(checker.Info info, String key) {
+    types.FuncType? fn = info.funcs[key];
+    if (fn == null) {
+        return false;
+    }
+    return fn.fallible;
+}
+
+// A built-in module that the compiler implements. It has no source with prose,
+// so this writes the signatures from §6, in the order that §6 lists them.
+int tableDoc(String key, String want) {
+    String[] out = [];
+    array.push(out, "module " + key);
+    int found = 0;
+    forEach(builtins.members(key), name) {
+        if (want != "" && want != name) {
+            continue;
+        }
+        found++;
+        array.push(out, "");
+        if (builtins.isNamespace(key, name)) {
+            array.push(out, key + "." + name + " {");
+            forEach(builtins.members(key + "." + name), inner) {
+                array.push(out, "    " + memberHead(key + "." + name, inner) + ";");
+            }
+            array.push(out, "}");
+            continue;
+        }
+        array.push(out, memberHead(key, name));
+    }
+    if (want != "" && found == 0) {
+        writeErr(key + " has no " + want + "\n");
+        return 1;
+    }
+    writeOut(string.join(out, "\n") + "\n");
+    return 0;
+}
+
+// One member of a built-in module: its signature, the sentence from §6 for a
+// member that has no signature, or only the name.
+String memberHead(String key, String name) {
+    types.FuncType? f = builtins.lookupSig(key, name);
+    if (f != null) {
+        return sig.fromType(f, key + "." + name, builtins.paramNames(key, name),
+            builtins.hasOptionalTail(key, name));
+    }
+    String written = builtins.shape(key, name);
+    if (written != "") {
+        return written;
+    }
+    return key + "." + name;
+}

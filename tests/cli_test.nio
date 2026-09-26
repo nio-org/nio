@@ -1,0 +1,483 @@
+// End-to-end tests of the command line. Argument parsing, exit statuses and the
+// two streams exist only in a running program, so these cases run a real
+// binary. h.compiler() holds the build of src/nio.nio that these cases share
+// with tests/lsp_e2e_test.nio. That build is the most expensive step of the
+// suite.
+import 'test';
+import 'string';
+import 'array';
+import 'path';
+import 'fs';
+import './harness' as h;
+import './repo' as repo;
+import '../src/driver' as driver;
+import '../src/version' as version;
+
+h.Run nio(String[] args) {
+    return h.nio(args);
+}
+
+// Writes a program into its own directory, so `-o` and a coverage report have
+// a place to go.
+String prog(String src) {
+    return h.writeTo(h.scratch(), "prog.nio", src);
+}
+
+test.start("cli: run", void () -> {
+    h.Run r = nio(["run", prog("print(\"hi\");")]);
+    test.assert(r.code == 0, "exit " + string.from(r.code) + ", stderr: " + r.err);
+    test.expectString(r.out, "hi\n");
+});
+
+test.start("cli: build", void () -> {
+    String p = prog("print(41 + 1);");
+    String bin = driver.exeName(path.join(h.scratch(), "out.bin"));
+    h.Run r = nio(["build", p, "-o", bin]);
+    test.assert(r.code == 0, "exit " + string.from(r.code) + ", stderr: " + r.err);
+    test.expectString(h.runBinary(bin, []).out, "42\n");
+});
+
+// The two build modes differ only in the clang flags, so the test checks that
+// both make a working program. It does not measure build time, because a timed
+// case fails on a loaded machine.
+test.start("cli: --release builds the same program", void () -> {
+    String p = prog("print(6 * 7);");
+    String fast = driver.exeName(path.join(h.scratch(), "fast.bin"));
+    String rel = driver.exeName(path.join(h.scratch(), "rel.bin"));
+    h.Run a = nio(["build", p, "-o", fast]);
+    test.assert(a.code == 0, "fast: exit " + string.from(a.code) + ", stderr: " + a.err);
+    h.Run b = nio(["build", "--release", p, "-o", rel]);
+    test.assert(b.code == 0, "release: exit " + string.from(b.code) + ", stderr: " + b.err);
+    test.expectString(h.runBinary(fast, []).out, "42\n");
+    test.expectString(h.runBinary(rel, []).out, "42\n");
+});
+
+// `run` and `emit` also accept the flag, because parseFlags reads it before the
+// file for every command. `emit` ignores it, because the IR is the same.
+test.start("cli: --release on run and emit", void () -> {
+    h.Run r = nio(["run", "--release", prog("print(\"hi\");")]);
+    test.assert(r.code == 0, "exit " + string.from(r.code) + ", stderr: " + r.err);
+    test.expectString(r.out, "hi\n");
+    String p = prog("print(1);");
+    test.expectString(nio(["emit", "--release", p]).out, nio(["emit", p]).out);
+});
+
+test.start("cli: emit", void () -> {
+    h.Run r = nio(["emit", prog("print(1);")]);
+    test.assert(r.code == 0, "exit " + string.from(r.code) + ", stderr: " + r.err);
+    test.assert(string.contains(r.out, "define i32 @main(i32 %argc, ptr %argv)"),
+        "emit output missing the main definition");
+});
+
+test.start("cli: emit reports a compile error", void () -> {
+    h.Run r = nio(["emit", prog("int x = \"a\";")]);
+    test.expectInt(r.code, 1);
+    test.assert(string.contains(r.err, "cannot use String as int"), "stderr = \"" + r.err + "\"");
+});
+
+test.start("cli: build reports a compile error", void () -> {
+    test.expectInt(nio(["build", prog("int x = ;")]).code, 1);
+});
+
+test.start("cli: run passes the program's exit code through", void () -> {
+    h.Run r = nio(["run", prog("\nint zero = 0;\nprint(1 / zero);\n")]);
+    test.expectInt(r.code, 1);
+    test.assert(string.contains(r.err, "division by zero"), "stderr = \"" + r.err + "\"");
+});
+
+test.start("cli: a missing file", void () -> {
+    test.expectInt(nio(["emit", "/nonexistent/x.nio"]).code, 1);
+    test.expectInt(nio(["run", "/nonexistent/x.nio"]).code, 1);
+});
+
+// --coverage sits before the file.
+test.start("cli: the coverage flag", void () -> {
+    String p = prog("print(1);");
+    h.Run on = nio(["emit", "--coverage", p]);
+    test.assert(on.code == 0, "exit " + string.from(on.code) + ", stderr: " + on.err);
+    test.assert(string.contains(on.out, "@nio.cov.counts"),
+        "emit --coverage produced no instrumentation");
+
+    h.Run off = nio(["emit", p]);
+    test.assert(off.code == 0, "exit " + string.from(off.code) + ", stderr: " + off.err);
+    test.assert(!string.contains(off.out, "nio.cov"),
+        "emit without the flag produced instrumentation");
+});
+
+// Everything after the file under `run` belongs to the program.
+test.start("cli: flags stop at the file", void () -> {
+    String p = prog("\nimport 'process';\nforEach(process.getArgs(), a) { print(a); }\n");
+    h.Run r = nio(["run", p, "--coverage"]);
+    test.assert(r.code == 0, "exit " + string.from(r.code) + ", stderr: " + r.err);
+    test.expectString(r.out, "--coverage\n");
+    test.assert(!string.contains(r.err, "coverage:"),
+        "a flag after the file instrumented the build");
+});
+
+test.start("cli: an unknown flag", void () -> {
+    h.Run r = nio(["emit", "--nope", "x.nio"]);
+    test.expectInt(r.code, 2);
+    test.assert(string.contains(r.err, "unknown flag --nope"), "stderr = \"" + r.err + "\"");
+});
+
+test.start("cli: a flag without a file", void () -> {
+    test.expectInt(nio(["emit", "--coverage"]).code, 2);
+});
+
+test.start("cli: usage", void () -> {
+    test.expectInt(nio([]).code, 2);
+    h.Run r = nio(["frobnicate", "x.nio"]);
+    test.expectInt(r.code, 2);
+    test.assert(string.contains(r.err, "usage: nio"), "stderr = \"" + r.err + "\"");
+});
+
+// ---- the version ----
+
+// tests/version_test.nio checks that the version is the one in the newest
+// CHANGELOG.md entry. This test checks that the binary writes it to stdout
+// and exits 0.
+test.start("cli: version", void () -> {
+    h.Run r = nio(["version"]);
+    test.assert(r.code == 0, "exit " + string.from(r.code) + ", stderr: " + r.err);
+    h.expectContains(r.out, "nio " + version.VERSION + " ");
+    // The line includes the host, so that a bug report names it.
+    test.assert(string.contains(r.out, "/"), "no host in " + r.out);
+    test.expectString(nio(["--version"]).out, r.out);
+});
+
+// ---- nio doc ----
+
+String const DOC_MODULE = `// A module about shapes.
+//
+// The second paragraph of the module's own prose.
+import 'string';
+
+// How wide a box may be.
+export int const LIMIT = 40;
+
+// A box, and the two numbers that make one.
+export type Box {
+    int w;
+    int h;
+
+    // The area, which is what a box is asked for.
+    int area() {
+        return self.w * self.h;
+    }
+}
+
+// Fails on a negative side, which no box has.
+export Box make(int w, int h) {
+    if (w < 0) {
+        return Error("negative");
+    }
+    return { w: w, h: h };
+}
+
+int hidden() {
+    return 1;
+}
+`;
+
+test.start("cli: doc writes the exported surface and the prose above it", void () -> {
+    String p = h.writeTo(h.scratch(), "shapes.nio", DOC_MODULE);
+    h.Run r = nio(["doc", p]);
+    test.assert(r.code == 0, "exit " + string.from(r.code) + ", stderr: " + r.err);
+    // The prose of the module, from the block on line 1.
+    h.expectContains(r.out, "A module about shapes.");
+    h.expectContains(r.out, "export int const LIMIT");
+    // The declaration is as in the file, and the prose is indented below it.
+    h.expectContains(r.out, "export type Box {\n    int w;\n    int h;\n}");
+    h.expectContains(r.out, "    A box, and the two numbers that make one.");
+    // A method is below its type, one more level in.
+    h.expectContains(r.out, "    int area()\n        The area");
+    // §2.9 infers the `!`. The file does not write it, but a caller must
+    // handle the failure.
+    h.expectContains(r.out, "export Box! make(int w, int h)");
+    h.expectAbsent(r.out, "hidden");
+});
+
+test.start("cli: doc -u shows what is not exported, and a name selects one", void () -> {
+    String p = h.writeTo(h.scratch(), "shapes.nio", DOC_MODULE);
+    h.expectContains(nio(["doc", "-u", p]).out, "int hidden()");
+    h.Run one = nio(["doc", p, "LIMIT"]);
+    test.assert(one.code == 0, "exit " + string.from(one.code));
+    h.expectContains(one.out, "export int const LIMIT");
+    h.expectAbsent(one.out, "export type Box");
+    // A name that the module does not declare fails. The output is not empty
+    // with success.
+    test.assert(nio(["doc", p, "Nope"]).code == 1, "an absent name should fail");
+});
+
+// `nio get` is the only command that uses a network. Every case here stops
+// before a request: a bad version, a host the fetcher does not serve, and the
+// usage. The suite makes no network request.
+test.start("cli: get refuses what it cannot fetch, before any request", void () -> {
+    h.Run help = nio(["get", "--help"]);
+    test.assert(help.code == 0, "exit " + string.from(help.code));
+    h.expectContains(help.out, "nio get [<package> <version>]");
+
+    // A requirement is exact. A range is not a version, and a two-number tag
+    // is not a version.
+    h.Run range = nio(["get", "github.com/a/b", "^1.2.3"]);
+    test.assert(range.code == 2, "a range should not run: exit " + string.from(range.code));
+    h.expectContains(range.err, "because nothing in a manifest is a range");
+    test.assert(nio(["get", "github.com/a/b", "v1.2"]).code == 2, "v1.2 is not a version");
+
+    // A package without a version means that the command could not run
+    // (status 2). A case below covers the form with no arguments.
+    test.assert(nio(["get", "github.com/a/b"]).code == 2, "a lone package should be status 2");
+
+    // The error names a host that the fetcher has no tarball convention for.
+    h.Run host = nio(["get", "example.com/a/b", "v1.0.0"]);
+    test.assert(host.code == 1, "exit " + string.from(host.code));
+    h.expectContains(host.err, "only github.com/ packages can be fetched");
+});
+
+String manifestOf(String dir) {
+    byte[] data = fs.readFile(path.join(dir, "nio.deps")) catch e {
+        return "";
+    };
+    return string.fromByteArray(data);
+}
+
+// The loader finds a package in the project's modules/ before the cache and
+// before a request, so `nio get` runs here with no network.
+String vendored(String dir, String pkg, String tag) {
+    return h.writeTo(dir, "modules/" + pkg + "@" + tag + "/lib.nio",
+        "export String const VERSION = \"" + tag + "\";\n");
+}
+
+// A fresh clone runs `nio get` with no arguments. With a package, `nio get`
+// moves the line of that package and does not write a second line.
+test.start("cli: get follows nio.deps, and moves a line without its alias", void () -> {
+    String dir = h.scratch();
+    h.writeTo(dir, "nio.deps", "package demo\n\n"
+        + "require 'github.com/a/nio-log' v1.0.0 as logger;   // ours\n");
+    vendored(dir, "github.com/a/nio-log", "v1.0.0");
+    vendored(dir, "github.com/a/nio-log", "v2.1.0");
+
+    h.Run all = h.runBinaryIn(h.compiler(), ["get"], dir, {});
+    test.assert(all.code == 0, "exit " + string.from(all.code) + ", stderr: " + all.err);
+    h.expectContains(manifestOf(dir), "resolved 'github.com/a/nio-log' v1.0.0 sha256:");
+
+    // A second run changes nothing.
+    String once = manifestOf(dir);
+    h.Run again = h.runBinaryIn(h.compiler(), ["get"], dir, {});
+    test.assert(again.code == 0, "exit " + string.from(again.code) + ", stderr: " + again.err);
+    test.expectString(manifestOf(dir), once);
+
+    // A new version replaces the old one on its line, also across a band. The
+    // alias and the comment stay, because imports use `logger`.
+    h.Run moved = h.runBinaryIn(h.compiler(), ["get", "github.com/a/nio-log", "v2.1.0"], dir, {});
+    test.assert(moved.code == 0, "exit " + string.from(moved.code) + ", stderr: " + moved.err);
+    h.expectContains(moved.out, "moved `logger` from v1.0.0 to v2.1.0");
+    String after = manifestOf(dir);
+    h.expectContains(after, "require 'github.com/a/nio-log' v2.1.0 as logger;   // ours\n");
+    h.expectAbsent(after, "v1.0.0");
+    test.expectInt(string.split(after, "require ").length, 2);
+
+    // A second package whose default alias is in use is refused. It is not
+    // renamed.
+    h.Run taken = h.runBinaryIn(h.compiler(), ["get", "github.com/b/logger", "v1.0.0"], dir, {});
+    test.assert(taken.code == 2, "exit " + string.from(taken.code) + ", stderr: " + taken.err);
+    h.expectContains(taken.err, "the alias `logger` is already github.com/a/nio-log's");
+    test.expectString(manifestOf(dir), after);
+
+    // A tree that does not match its recorded hash is refused, and the hash
+    // stays.
+    h.writeTo(dir, "modules/github.com/a/nio-log@v2.1.0/lib.nio", "export int const EDITED = 1;\n");
+    h.Run edited = h.runBinaryIn(h.compiler(), ["get"], dir, {});
+    test.assert(edited.code == 1, "exit " + string.from(edited.code) + ", stderr: " + edited.err);
+    h.expectContains(edited.err, "does not match the hash");
+    test.expectString(manifestOf(dir), after);
+});
+
+// Two bands of one package are two packages and build correctly. `nio get`
+// accepts them and names the package that requires each band.
+test.start("cli: get names a package held at two bands", void () -> {
+    String dir = h.scratch();
+    h.writeTo(dir, "nio.deps", "package demo\n"
+        + "require 'nio-log' v0.2.5 as log;\n"
+        + "require 'nio-old' v1.0.0 as old;\n");
+    vendored(dir, "nio-log", "v0.2.5");
+    vendored(dir, "nio-log", "v0.1.4");
+    vendored(dir, "nio-old", "v1.0.0");
+    h.writeTo(dir, "modules/nio-old@v1.0.0/nio.deps", "package nio-old\nrequire 'nio-log' v0.1.4 as log;\n");
+    h.Run r = h.runBinaryIn(h.compiler(), ["get"], dir, {});
+    test.assert(r.code == 0, "exit " + string.from(r.code) + ", stderr: " + r.err);
+    h.expectContains(r.out, "note: nio-log is in this build at 2 bands");
+    h.expectContains(r.out, "v0.1.4 (required by nio-old v1.0.0)");
+    h.expectContains(r.out, "v0.2.5 (required by demo)");
+});
+
+// A package replaced by a directory is under edit. `nio get` records no hash
+// for it, and `nio vendor` does not move it.
+test.start("cli: a package replaced by a directory is neither hashed nor vendored", void () -> {
+    String dir = h.scratch();
+    h.writeTo(dir, "nio.deps", "package demo\n"
+        + "require 'github.com/a/nio-log' v1.0.0 as logger;\n"
+        + "replace 'github.com/a/nio-log' with './mylog';\n");
+    h.writeTo(dir, "mylog/lib.nio", "export int const V = 1;\n");
+    h.Run got = h.runBinaryIn(h.compiler(), ["get"], dir, {});
+    test.assert(got.code == 0, "exit " + string.from(got.code) + ", stderr: " + got.err);
+    h.expectContains(got.out, "replaced by");
+    h.expectAbsent(manifestOf(dir), "resolved ");
+    h.Run v = h.runBinaryIn(h.compiler(), ["vendor"], dir, {});
+    test.assert(v.code == 0, "exit " + string.from(v.code) + ", stderr: " + v.err);
+    h.expectContains(v.out, "not vendored");
+    test.assert(!fs.exists(path.join(dir, "modules")), "a replaced package was vendored");
+});
+
+// Two lines can require two bands of one package. A version in neither band
+// can apply to either line, so the command refuses it.
+test.start("cli: get refuses a move it cannot place", void () -> {
+    String dir = h.scratch();
+    String text = "package demo\n"
+        + "require 'github.com/a/nio-log' v0.1.0 as oldlog;\n"
+        + "require 'github.com/a/nio-log' v0.2.0 as log;\n";
+    h.writeTo(dir, "nio.deps", text);
+    h.Run r = h.runBinaryIn(h.compiler(), ["get", "github.com/a/nio-log", "v0.3.0"], dir, {});
+    test.assert(r.code == 2, "exit " + string.from(r.code) + ", stderr: " + r.err);
+    h.expectContains(r.err, "required on more than one line");
+    test.expectString(manifestOf(dir), text);
+
+    h.Run none = h.runBinaryIn(h.compiler(), ["get"], h.scratch(), {});
+    test.assert(none.code == 2, "exit " + string.from(none.code) + ", stderr: " + none.err);
+    h.expectContains(none.err, "no nio.deps here or above");
+});
+
+// `nio update` asks a host which versions exist. Every case here stops before
+// that: the usage, no manifest, a name that the manifest does not require, and
+// a manifest that requires nothing.
+test.start("cli: update refuses what it cannot ask about, before any request", void () -> {
+    h.Run help = nio(["update", "--help"]);
+    test.assert(help.code == 0, "exit " + string.from(help.code));
+    h.expectContains(help.out, "nio update [package]...");
+
+    h.Run none = h.runBinaryIn(h.compiler(), ["update"], h.scratch(), {});
+    test.assert(none.code == 2, "exit " + string.from(none.code) + ", stderr: " + none.err);
+    h.expectContains(none.err, "no nio.deps here or above");
+
+    String dir = h.scratch();
+    h.writeTo(dir, "nio.deps", "package demo\nrequire 'github.com/a/nio-b' v1.0.0 as b;\n");
+    h.Run unknown = h.runBinaryIn(h.compiler(), ["update", "github.com/a/other"], dir, {});
+    test.assert(unknown.code == 2, "exit " + string.from(unknown.code) + ", stderr: " + unknown.err);
+    h.expectContains(unknown.err, "github.com/a/other is not a requirement");
+
+    String empty = h.scratch();
+    h.writeTo(empty, "nio.deps", "package demo\n");
+    h.Run nothing = h.runBinaryIn(h.compiler(), ["update"], empty, {});
+    test.assert(nothing.code == 0, "exit " + string.from(nothing.code) + ", stderr: " + nothing.err);
+    h.expectContains(nothing.out, "requires no packages");
+});
+
+test.start("cli: vendor needs a manifest", void () -> {
+    h.Run help = nio(["vendor", "--help"]);
+    test.assert(help.code == 0, "exit " + string.from(help.code));
+    h.expectContains(help.out, "./modules");
+});
+
+// A re-export publishes names that the statement does not have to list, so
+// the reference writes all the published names.
+test.start("cli: doc writes the surface a module republishes", void () -> {
+    String dir = h.scratch();
+    h.writeTo(dir, "der.nio", "export int helper(int n) { return n; }\n"
+        + "export int other(int n) { return n; }\n");
+    String p = h.writeTo(dir, "lib.nio", "// A surface built from parts.\n"
+        + "import './der' as der;\n\nexport der hide helper;\n");
+    h.Run r = nio(["doc", p]);
+    test.assert(r.code == 0, "exit " + string.from(r.code) + ", stderr: " + r.err);
+    h.expectContains(r.out, "export der hide helper");
+    h.expectContains(r.out, "republished from der: other");
+    h.expectAbsent(r.out, "republished from der: helper");
+});
+
+// A bare word is a built-in module. The four modules written in Nio (§6.13,
+// §6.16, §6.18, §6.19) have their own prose. The others use the compiler's
+// tables.
+test.start("cli: doc names a built-in module", void () -> {
+    h.Run t = nio(["doc", "test"]);
+    test.assert(t.code == 0, "exit " + string.from(t.code) + ", stderr: " + t.err);
+    h.expectContains(t.out, "export void run()");
+    h.expectContains(t.out, "Waits for every test started with startAsync");
+    h.expectContains(nio(["doc", "fs"]).out, "bool fs.exists(String p)");
+    h.expectContains(nio(["doc", "process"]).out, "process.child {");
+    test.assert(nio(["doc", "nosuch"]).code == 1, "an absent module should fail");
+});
+
+// The checker rejected the tree, so its types are not valid. The command
+// reports the error and writes no reference.
+test.start("cli: doc refuses a module that does not check", void () -> {
+    String p = h.writeTo(h.scratch(), "broken.nio", "export int f() { return \"no\"; }\n");
+    h.Run r = nio(["doc", p]);
+    test.assert(r.code == 1, "exit " + string.from(r.code));
+    test.expectString(r.out, "");
+    h.expectContains(r.err, "error:");
+});
+
+// ---- nio test ----
+
+String const PASSING = `import 'test';
+
+test.start("adds", void () -> {
+    test.expectInt(1 + 1, 2);
+});
+`;
+
+String const OTHER = `import 'test';
+
+test.start("subtracts", void () -> {
+    test.expectInt(3 - 1, 2);
+});
+`;
+
+String testTree() {
+    String d = h.scratch();
+    h.writeTo(d, "a_test.nio", PASSING);
+    h.writeTo(d, "b_test.nio", OTHER);
+    // Not a test file, and no file imports it. Discovery must ignore it.
+    h.writeTo(d, "helper.nio", "export int two() { return 2; }\n");
+    return d;
+}
+
+test.start("cli: test finds every *_test.nio under a path", void () -> {
+    h.Run r = nio(["test", testTree()]);
+    test.assert(r.code == 0, "exit " + string.from(r.code) + ", stderr: " + r.err);
+    h.expectContains(r.out, "ok   adds");
+    h.expectContains(r.out, "ok   subtracts");
+    h.expectContains(r.out, "2 passed, 0 failed");
+});
+
+// The test module (§6.13) reads the filter from the program's command line, so
+// `nio run tests/all.nio --filter x` selects the same tests.
+test.start("cli: test --filter runs the tests whose title holds the text", void () -> {
+    String d = testTree();
+    h.Run r = nio(["test", "--filter", "subtr", d]);
+    test.assert(r.code == 0, "exit " + string.from(r.code) + ", stderr: " + r.err);
+    h.expectContains(r.out, "ok   subtracts");
+    h.expectAbsent(r.out, "ok   adds");
+    h.expectContains(r.out, "1 passed, 0 failed, 1 filtered out");
+    h.expectContains(nio(["test", "--filter=adds", d]).out, "ok   adds");
+});
+
+// The status is the test program's status when it ran, and 2 when it could not
+// run.
+test.start("cli: test exit statuses", void () -> {
+    String d = h.scratch();
+    h.writeTo(d, "bad_test.nio", `import 'test';
+
+test.start("wrong", void () -> {
+    test.expectInt(1, 2);
+});
+`);
+    test.assert(nio(["test", d]).code == 1, "a failed test should give 1");
+    String empty = h.scratch();
+    h.Run none = nio(["test", empty]);
+    test.assert(none.code == 2, "no test file should give 2");
+    h.expectContains(none.err, "no *_test.nio file");
+    String broken = h.scratch();
+    h.writeTo(broken, "c_test.nio", "import 'test';\nint x = \"no\";\n");
+    test.assert(nio(["test", broken]).code == 2, "a program that does not build should give 2");
+    test.assert(nio(["test", "--bogus", d]).code == 2, "an unknown flag should give 2");
+});

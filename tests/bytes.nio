@@ -1,0 +1,29 @@
+// Hex decoding for the test corpora that hold binary data. Hex keeps a NUL
+// byte, a newline and a quote out of a line-oriented data file.
+import 'string';
+import 'array';
+
+export int hexDigit(byte c) {
+    if (c >= 48 && c <= 57) {
+        return c - 48;
+    }
+    if (c >= 97 && c <= 102) {
+        return c - 87;
+    }
+    if (c >= 65 && c <= 70) {
+        return c - 55;
+    }
+    return Error("not a hex digit: " + string.from(c));
+}
+
+// Decodes a hex-encoded string. Two digits are 0..255, so `as byte` discards
+// nothing. A character that is not a hex digit raises an error.
+export String unhex(String h) {
+    byte[] out = [];
+    int i = 0;
+    while (i + 1 < string.length(h)) {
+        array.push(out, (hexDigit(h[i]) * 16 + hexDigit(h[i + 1])) as byte);
+        i = i + 2;
+    }
+    return string.fromByteArray(out);
+}

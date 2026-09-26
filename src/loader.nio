@@ -1,0 +1,1088 @@
+// Module loading: import path to file, one parse per module, dependency order.
+// The path helpers are held to tests/golden/loader_path_cases.txt.
+// Built-in Nio modules load from the bake; re-run tools/bake.nio after a
+// stdlib change.
+import 'ast';
+import 'checker';
+import 'types';
+import 'diag';
+import 'codegen';
+import 'lexer';
+import 'parser';
+import 'token';
+import 'module';
+import 'embed/stdlib';
+import 'deps' as pkgs;
+import 'lib/fmt';
+import 'fs';
+import 'os';
+import 'path';
+import 'string';
+import 'lib/str';
+import 'array';
+import 'map';
+
+// ---- path helpers ----
+
+// Only the separator matters, so ask path.localize instead of os.getPlatform.
+bool windowsHost() {
+    return path.localize("/") == "\\";
+}
+
+bool isSep(String ch) {
+    if (ch == "/") {
+        return true;
+    }
+    return ch == "\\" && windowsHost();
+}
+
+String charAt(String s, int i) {
+    if (i < 0 || i >= string.length(s)) {
+        return "";
+    }
+    return string.substring(s, i, i + 1);
+}
+
+bool isLetter(String ch) {
+    return (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z");
+}
+
+// Length of the Windows volume prefix ("C:"). UNC and \\?\ paths do not count.
+int volumeLen(String p) {
+    if (!windowsHost()) {
+        return 0;
+    }
+    if (string.length(p) >= 2 && charAt(p, 1) == ":" && isLetter(charAt(p, 0))) {
+        return 2;
+    }
+    return 0;
+}
+
+export bool isAbs(String p) {
+    if (!windowsHost()) {
+        return charAt(p, 0) == "/";
+    }
+    int v = volumeLen(p);
+    if (v == 0) {
+        return false;
+    }
+    return isSep(charAt(p, v));
+}
+
+// path.join cleans a single element; the empty path must map to ".".
+String clean(String p) {
+    if (p == "") {
+        return ".";
+    }
+    return path.join(p);
+}
+
+export String dirOf(String p) {
+    int v = volumeLen(p);
+    int i = string.length(p) - 1;
+    while (i >= v && !isSep(charAt(p, i))) {
+        i--;
+    }
+    String d = clean(string.substring(p, v, i + 1));
+    if (d == "." && v > 2) {
+        return string.substring(p, 0, v);
+    }
+    return string.substring(p, 0, v) + d;
+}
+
+export String baseOf(String p) {
+    if (p == "") {
+        return ".";
+    }
+    String s = p;
+    while (string.length(s) > 0 && isSep(charAt(s, string.length(s) - 1))) {
+        s = string.substring(s, 0, string.length(s) - 1);
+    }
+    s = string.substring(s, volumeLen(s), string.length(s));
+    int i = string.length(s) - 1;
+    while (i >= 0 && !isSep(charAt(s, i))) {
+        i--;
+    }
+    if (i >= 0) {
+        s = string.substring(s, i + 1, string.length(s));
+    }
+    if (s == "") {
+        return path.localize("/");
+    }
+    return s;
+}
+
+// Last path element without its extension. `nio build` uses it as the default
+// output name.
+export String stemOf(String p) {
+    String base = baseOf(p);
+    for (int i = string.length(base) - 1; i >= 0 && !isSep(charAt(base, i)); i--) {
+        if (charAt(base, i) == ".") {
+            return string.substring(base, 0, i);
+        }
+    }
+    return base;
+}
+
+// ---- the tables ----
+
+// C files that every program links.
+export String[] const coreCFiles = ["runtime.c", "gc.c"];
+
+// Linked only when coverage is on.
+String const covCFile = "coverage.c";
+
+// Built-in modules written in Nio. Must agree with builtinNioModules in the
+// checker.
+export Map<String, String> builtinNioModules = {
+    "test": "stdlib/test.nio",
+    "http": "stdlib/http.nio",
+    "tls": "stdlib/tls.nio",
+    "x509": "stdlib/x509.nio",
+};
+
+// Runtime C file per built-in module, linked only when the program imports it.
+// Must agree with builtinModules in the checker.
+export Map<String, String> builtinCFiles = {
+    "time": "lib/time.c",
+    "json": "lib/json.c",
+    "array": "lib/array.c",
+    "string": "lib/string.c",
+    "map": "lib/map.c",
+    "async": "lib/async.c",
+    "os": "lib/os.c",
+    "path": "lib/path.c",
+    "fs": "lib/fs.c",
+    "process": "lib/process.c",
+    "regexp": "lib/regexp.c",
+    "net": "lib/net.c",
+    "crypto": "lib/crypto.c",
+    "math": "lib/math.c",
+    "random": "lib/random.c",
+};
+
+// Sources a module's C file includes and that nothing compiles alone. The
+// driver writes every named file beside the IR and hands only .c files to
+// clang.
+export Map<String, String[]> const builtinExtraSources = {
+    "crypto": ["lib/fiat_curve25519_64.h", "lib/fiat_p256_64.h", "lib/fiat_p384_64.h"],
+};
+
+// Linker flags a built-in module needs, per host family: net and crypto reach
+// Winsock and CNG on Windows, and math reaches libm, which every Unix but
+// macOS links as a library of its own. The driver and the generated bootstrap
+// script must both pass them.
+export type LinkFlags {
+    String[] windows;
+    String[] unix;
+}
+
+export Map<String, LinkFlags> const builtinLinkFlags = {
+    "net": { windows: ["-lws2_32"], unix: [] },
+    "crypto": { windows: ["-lbcrypt"], unix: [] },
+    "math": { windows: [], unix: ["-lm"] },
+    "random": { windows: ["-lbcrypt"], unix: [] },
+};
+
+// The host as `native flags` names it (§5.8): "darwin", "linux" or "windows".
+// The runtime says "win32" for the last, so the two are mapped here.
+export String hostOS() {
+    String p = os.getPlatform();
+    if (p == "win32") {
+        return "windows";
+    }
+    return p;
+}
+
+// nio compiles for the host (§6.9), so the flags are chosen here.
+String[] hostLinkFlags(String mod) {
+    LinkFlags? flags = builtinLinkFlags[mod];
+    if (flags == null) {
+        return [];
+    }
+    if (hostOS() == "windows") {
+        return flags.windows;
+    }
+    return flags.unix;
+}
+
+// Quals taken before any module loads. A same-named user module gets a suffix,
+// or its types collide with the built-in ones in codegen's TypeDesc table.
+// Every module in the checker's builtinModuleTypes needs its name here.
+Map<String, bool> reservedQuals() {
+    Map<String, bool> quals = { "": true, "os": true, "fs": true, "process": true, "net": true };
+    forEach(map.keys(builtinNioModules), name) {
+        quals[name] = true;
+    }
+    return quals;
+}
+
+// ---- modules ----
+
+// One source file under compilation.
+type Unit {
+    String path;    // resolved file path
+    String dir;     // directory imports inside this file resolve against
+    // The directory of the manifest that governs this file: the project root,
+    // or the package's own directory for a file inside one. Package aliases
+    // are per-manifest, so this directory tells which `log` an import means.
+    String home;
+    String qual;    // unique symbol prefix ("" for the entry module)
+    // What a type declared here is shown by, when not the qual: the package and
+    // path of a module inside a package (Loader.nameModules).
+    String shown;
+    String file;    // name shown in diagnostics; "" for the entry module
+    bool stdlib;    // a built-in module written in Nio
+    ast.Program prog;
+    checker.Info? info;
+    checker.ModuleExports? exports;
+
+    // File for coverage output. A stdlib module gets "" and no instrumentation.
+    String covPath() {
+        if (self.stdlib) {
+            return "";
+        }
+        return self.path;
+    }
+}
+
+// One module as the checker left it. Only the language server reads it.
+export type Checked {
+    String file;    // as diag.Diagnostic spells it: "" for the entry
+    ast.Program prog;
+    checker.Info info;
+}
+
+// The result of compileEntry and checkEntry.
+export type CompileResult {
+    String ir;
+    String[] cfiles;
+    // Linker flags for this host. `native flags` (§5.8) join the list.
+    String[] libs;
+    // The same flags for each host family, which a generated build script needs
+    // because it is written on one host and run on another.
+    LinkFlags hostLibs;
+    // Resolved disk paths of every `native source` (§5.8), in dependency
+    // order. Separate from cfiles, which name entries in the runtime bake.
+    NativeSource[] natives;
+    // Sentence form of diags: the CLI prints errs, the server reads diags.
+    String[] errs;
+    diag.Diagnostic[] diags;
+    // Every checked module in dependency order, failed checks included: they
+    // still hold types around the mistake. Empty on a parse failure.
+    Checked[] checked;
+}
+
+export type Loader {
+    Map<String, Unit> modules;    // resolved path -> module
+    Map<String, Unit> builtin;    // built-in module written in Nio -> module
+    Map<String, bool> loading;    // modules whose imports are being loaded (cycle detection)
+    Unit[] order;                 // dependency order: every module after its imports
+    Map<String, bool> quals;      // taken symbol prefixes
+    String[] errs;
+    diag.Diagnostic[] diags;
+
+    // The packages this build resolved, and the alias tables built from it on
+    // demand. A table is keyed by the manifest's directory and the alias,
+    // because aliases are local to the manifest that bound them.
+    pkgs.Resolution packages;
+    Map<String, pkgs.Package> aliases;
+    Map<String, bool> homesDone;
+
+    // Unsaved editor buffers by resolved path. An entry replaces the file on
+    // disk.
+    Map<String, String> open;
+
+    // The module for import p in m. null for a built-in C module, which has no
+    // Nio source.
+    Unit? dependency(Unit m, String p) {
+        if (builtinCFiles[p] != null) {
+            return null;
+        }
+        Unit? nio = self.builtin[p];
+        if (nio != null) {
+            return nio;
+        }
+        return self.modules[self.modulePath(m, p)];
+    }
+
+    // The file an import names. A package alias resolves against the package's
+    // own directory, and any other path against the importer's. loadImports
+    // and dependency both use it, so a module is loaded and looked up under the
+    // same path.
+    String modulePath(Unit m, String importPath) {
+        pkgs.Package? pkg = self.packageFor(m, importPath);
+        if (pkg == null) {
+            return resolveImport(m.dir, importPath);
+        }
+        return packageModule(pkg, importPath);
+    }
+
+    // The runtime sources this program needs, core first.
+    String[] runtimeCFiles(bool coverage) {
+        String[] files = [];
+        forEach(coreCFiles, f) {
+            array.push(files, f);
+        }
+        if (coverage) {
+            array.push(files, covCFile);
+        }
+        Map<String, bool> seen = {};
+        forEach(self.order, m) {
+            forEach(m.prog.imports, imp) {
+                String? f = builtinCFiles[imp.path];
+                if (f != null && seen[f] == null) {
+                    seen[f] = true;
+                    array.push(files, f);
+                    String[]? extra = builtinExtraSources[imp.path];
+                    if (extra != null) {
+                        forEach(extra, e) {
+                            if (seen[e] == null) {
+                                seen[e] = true;
+                                array.push(files, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return files;
+    }
+
+    // Linker flags the imported built-in modules need on this host.
+    String[] runtimeLibs() {
+        return self.libsForHost(hostOS());
+    }
+
+    // The same, for each host family. A generated build script is written on
+    // one host and run on another, so it must name the flags of every family.
+    LinkFlags everyHostLibs() {
+        LinkFlags out = { windows: self.libsForHost("windows"), unix: self.libsForHost("linux") };
+        return out;
+    }
+
+    String[] libsForHost(String host) {
+        String[] libs = [];
+        Map<String, bool> seen = {};
+        forEach(self.order, m) {
+            forEach(m.prog.imports, imp) {
+                LinkFlags? flags = builtinLinkFlags[imp.path];
+                if (flags == null) {
+                    continue;
+                }
+                String[] want = flags.unix;
+                if (host == "windows") {
+                    want = flags.windows;
+                }
+                forEach(want, flag) {
+                    if (seen[flag] == null) {
+                        seen[flag] = true;
+                        array.push(libs, flag);
+                    }
+                }
+            }
+        }
+        return libs;
+    }
+
+    void errorIn(String file, token.Token tok, String msg) {
+        diag.Diagnostic d = diag.atTok(tok, msg);
+        forEach(diag.inFile(file, [d]), moved) {
+            array.push(self.errs, diag.format(moved));
+            array.push(self.diags, moved);
+        }
+    }
+
+    // Collects native sources, link flags and externs (§5.8). An extern symbol
+    // must keep one signature in the whole program, or clang gets two
+    // declarations that disagree.
+    NativeInputs nativeInputs(module.Module[] mods) {
+        NativeInputs out = { sources: [], flags: [] };
+        Map<String, bool> seenSrc = {};
+        Map<String, String> baseOwner = {};    // base name -> the path that claimed it
+        Map<String, bool> seenFlags = {};
+        Map<String, types.FuncType> externSeen = {};
+        Map<String, String> externWhere = {};
+        String host = hostOS();
+        forEach(self.order, m, i) {
+            checker.Info inf = mods[i].info;
+            forEach(m.prog.statements, s) {
+                ast.NativeStatement? ns = s as ast.NativeStatement;
+                if (ns != null) {
+                    if (ns.kind == "flags") {
+                        if (ns.os != "" && ns.os != host) {
+                            continue;
+                        }
+                        String key = ns.os + "\n" + ns.value;
+                        if (seenFlags[key] != null) {
+                            continue;
+                        }
+                        seenFlags[key] = true;
+                        forEach(string.split(ns.value, " "), part) {
+                            if (part != "") {
+                                array.push(out.flags, part);
+                            }
+                        }
+                        continue;
+                    }
+                    String resolved = ns.value;
+                    if (!isAbs(resolved)) {
+                        resolved = path.join(m.dir, resolved);
+                    }
+                    resolved = clean(resolved);
+                    if (!fs.exists(resolved)) {
+                        self.errorIn(m.file, ns.valueTok,
+                            "native source '" + ns.value + "' not found (resolved to " + resolved + ")");
+                        continue;
+                    }
+                    if (seenSrc[resolved] != null) {
+                        continue;
+                    }
+                    seenSrc[resolved] = true;
+                    // Two modules may each ship a `util.c`, since each is
+                    // written under its own qual. One module may not, because
+                    // they would land on each other.
+                    String b = m.qual + "\n" + baseOf(resolved);
+                    String? owner = baseOwner[b];
+                    if (owner != null) {
+                        self.errorIn(m.file, ns.valueTok,
+                            "native sources " + owner + " and " + resolved
+                            + " share the base name '" + baseOf(resolved)
+                            + "'; this module writes both under that name, so they must differ");
+                        continue;
+                    }
+                    baseOwner[b] = resolved;
+                    NativeSource src = { path: resolved, qual: m.qual };
+                    array.push(out.sources, src);
+                    continue;
+                }
+                ast.FunctionDeclStatement? fd = s as ast.FunctionDeclStatement;
+                if (fd == null || !fd.extern) {
+                    continue;
+                }
+                types.FuncType? sig = inf.externs[fd.name];
+                if (sig == null) {
+                    continue;    // rejected at collection; already reported
+                }
+                types.FuncType? prev = externSeen[fd.name];
+                if (prev == null) {
+                    externSeen[fd.name] = sig;
+                    externWhere[fd.name] = displayFile(m.file);
+                    continue;
+                }
+                if (!types.equal(prev, sig)) {
+                    String where = "another module";
+                    String? w = externWhere[fd.name];
+                    if (w != null) {
+                        where = w;
+                    }
+                    self.errorIn(m.file, fd.nameTok,
+                        "extern function '" + fd.name + "' is declared with a different signature in "
+                        + where + "; one C symbol has one type");
+                }
+            }
+        }
+        return out;
+    }
+
+    // Parses one module; null on a parse error. The parser gives positions
+    // only, so a diagnostic learns its file here.
+    Unit? parse(String src, String p, String d, String file) {
+        parser.Parser ps = parser.newParser(lexer.newLexer(src));
+        ast.Program prog = ps.parseProgram();
+        if (ps.errs.length > 0) {
+            forEach(diag.inFile(file, ps.diags), moved) {
+                array.push(self.errs, diag.format(moved));
+                array.push(self.diags, moved);
+            }
+            return null;
+        }
+        Unit u = {
+            path: p, dir: d, home: d, qual: "", shown: "", file: file, stdlib: false,
+            prog: prog, info: null, exports: null,
+        };
+        return u;
+    }
+
+    // Loads the imports of m, recursively. Each module lands in order before
+    // its importers. chain holds the import path for cycle messages.
+    void loadImports(Unit m, String[] chain) {
+        forEach(m.prog.imports, imp) {
+            if (builtinCFiles[imp.path] != null) {
+                continue;
+            }
+            String? nioSrc = builtinNioModules[imp.path];
+            if (nioSrc != null) {
+                self.loadBuiltinNio(m, imp.tok, imp.path, nioSrc);
+                continue;
+            }
+            // A package alias resolves against the package's own directory.
+            // It adds no dependency edge of its own. The alias comes from a
+            // manifest, so it cannot make a cycle that the imports do not
+            // already have.
+            String p = self.modulePath(m, imp.path);
+            String home = m.home;
+            pkgs.Package? pkgOpt = self.packageFor(m, imp.path);
+            if (pkgOpt != null) {
+                home = pkgOpt.dir;
+            }
+            if (self.loading[p] != null) {
+                String[] cycle = chain;
+                bool trimmed = false;
+                forEach(chain, c, i) {
+                    if (c == p && !trimmed) {
+                        cycle = array.slice(chain, i);
+                        trimmed = true;
+                    }
+                }
+                self.errorAt(m, imp.tok, "import cycle: %s imports %s",
+                    string.join(cycle, " imports "), p);
+                continue;
+            }
+            if (self.modules[p] != null) {
+                continue;
+            }
+            // An open buffer replaces the file on disk and its existence check.
+            String? buffer = self.open[p];
+            String text = "";
+            if (buffer != null) {
+                text = buffer;
+            } else {
+                byte[] srcBytes = fs.readFile(p) catch e {
+                    self.errorAt(m, imp.tok, "cannot import '%s': no module at %s", imp.path, p);
+                    continue;
+                };
+                text = string.fromByteArray(srcBytes);
+            }
+            Unit? depOpt = self.parse(text, p, dirOf(p), p);
+            if (depOpt == null) {
+                continue;
+            }
+            Unit dep = depOpt;
+            dep.home = home;
+            self.modules[p] = dep;
+            self.loading[p] = true;
+            String[] next = array.copy(chain);
+            array.push(next, p);
+            self.loadImports(dep, next);
+            map.remove(self.loading, p);
+            dep.qual = self.newQual(p);
+            array.push(self.order, dep);
+        }
+    }
+
+    // The package an import names, or null when it names none. The first
+    // segment is the alias, so `log` is the package's entry module and
+    // `log/rotate` a module beside it.
+    pkgs.Package? packageFor(Unit m, String importPath) {
+        if (m.home == "" || str.hasPrefix(importPath, ".")) {
+            return null;
+        }
+        String head = importPath;
+        int slash = string.find(importPath, "/");
+        if (slash >= 0) {
+            head = string.substring(importPath, 0, slash);
+        }
+        self.loadHome(m.home);
+        return self.aliases[m.home + "\n" + head];
+    }
+
+    // Builds one manifest's alias table, once. Aliases are local to the
+    // manifest that bound them, so a package's own names are read from its own
+    // manifest and never from the project's.
+    void loadHome(String home) {
+        if (self.homesDone[home] != null) {
+            return;
+        }
+        self.homesDone[home] = true;
+        Map<String, pkgs.Package> table = pkgs.aliasesFor(self.packages, pkgs.manifestIn(home));
+        forEach(map.keys(table), a) {
+            pkgs.Package? pk = table[a];
+            if (pk != null) {
+                self.aliases[home + "\n" + a] = pk;
+            }
+        }
+    }
+
+    // Names every module inside a package by that package, for the types it
+    // declares (types.Record.shown). A qual comes from a file name, so without
+    // this two bands of one package disagree as `lib.Logger` and
+    // `lib_2.Logger`, and two different packages read the same way.
+    //
+    // A module is shown by the package's short name (the default alias in a
+    // manifest), plus its path below the package when it is not the entry.
+    // The version is added only when the build holds two bands of that
+    // package. When two packages share a short name, or a project module
+    // already uses it, each such package is shown by its full path.
+    void nameModules() {
+        Map<String, int> bands = {};
+        Map<String, String> owner = {};
+        Map<String, bool> clash = {};
+        forEach(self.packages.selected, p) {
+            int? n = bands[p.pkg];
+            if (n == null) {
+                bands[p.pkg] = 1;
+            } else {
+                bands[p.pkg] = n + 1;
+            }
+            String short = pkgs.aliasFor(p.pkg);
+            String? had = owner[short];
+            if (had != null && had != p.pkg) {
+                clash[short] = true;
+            }
+            owner[short] = p.pkg;
+        }
+        Map<String, pkgs.Package> byDir = {};
+        forEach(self.packages.selected, p) {
+            byDir[p.dir] = p;
+        }
+        forEach(self.order, u) {
+            if (byDir[u.home] == null && owner[u.qual] != null) {
+                clash[u.qual] = true;
+            }
+        }
+        forEach(self.order, u) {
+            pkgs.Package? found = byDir[u.home];
+            if (found == null || u.stdlib) {
+                continue;
+            }
+            pkgs.Package p = found;
+            String name = pkgs.aliasFor(p.pkg);
+            if (clash[name] != null) {
+                name = p.pkg;
+            }
+            int? n = bands[p.pkg];
+            if (n != null && n > 1) {
+                name = name + "@" + p.version;
+            }
+            String sub = subPath(p, u.path);
+            if (sub != "") {
+                name = name + "/" + sub;
+            }
+            u.shown = name;
+        }
+    }
+
+    // Adds notes that name who required each band of a package, when a
+    // diagnostic shows that package's name with its version. When two types
+    // that disagree are both called Logger, the notes tell which dependency
+    // brought in each one.
+    //
+    // Where the message names two bands of one package, a last note says how
+    // to make them one: the entry manifest's `unify`, at the newest of them.
+    diag.Diagnostic[] withProvenance(diag.Diagnostic[] ds) {
+        forEach(ds, d) {
+            Map<String, String> newest = {};
+            Map<String, int> named = {};
+            forEach(self.packages.selected, p) {
+                if (p.version == "") {
+                    continue;
+                }
+                String label = pkgs.aliasFor(p.pkg) + "@" + p.version;
+                String full = p.pkg + "@" + p.version;
+                if (!string.contains(d.message, label + ".") && !string.contains(d.message, label + "/")
+                    && !string.contains(d.message, full + ".") && !string.contains(d.message, full + "/")) {
+                    continue;
+                }
+                String shown = label;
+                if (string.contains(d.message, full)) {
+                    shown = full;
+                }
+                String note = shown + " is " + p.pkg + " " + p.version + ", required by "
+                    + string.join(p.by, ", ");
+                if (!array.contains(d.notes, note)) {
+                    array.push(d.notes, note);
+                }
+                int? count = named[p.pkg];
+                if (count == null) {
+                    named[p.pkg] = 1;
+                } else {
+                    named[p.pkg] = count + 1;
+                }
+                String? top = newest[p.pkg];
+                if (top == null || pkgs.compare(p.version, top) > 0) {
+                    newest[p.pkg] = p.version;
+                }
+            }
+            forEach(map.keys(named), pkg) {
+                int? count = named[pkg];
+                String? top = newest[pkg];
+                if (count != null && count > 1 && top != null) {
+                    array.push(d.notes, "these are different types, and no value crosses between them; "
+                        + "`unify '" + pkg + "' " + top + ";` in the project's " + pkgs.MANIFEST
+                        + " makes every band of it one version");
+                }
+            }
+        }
+        return ds;
+    }
+
+    // Reads the manifest governing d and resolves the whole graph from it.
+    // Returns the project root, or "" when there is no manifest. A program
+    // that uses no package has no manifest.
+    String resolvePackages(String d) {
+        String file = pkgs.manifestPath(d);
+        if (file == "") {
+            return "";
+        }
+        String root = dirOf(file);
+        pkgs.Manifest man = pkgs.manifestIn(root);
+        forEach(man.errs, e) {
+            self.manifestError(man, e);
+        }
+        self.packages = pkgs.resolve(root, man);
+        forEach(self.packages.errs, e) {
+            self.manifestError(man, e);
+        }
+        // Every build checks what is on disk against the hashes the manifest
+        // recorded. This is local and needs no network. A package with no
+        // recorded hash is not an error. The check finds a tree that changed
+        // after its hash was recorded.
+        forEach(pkgs.verify(man, self.packages.selected), e) {
+            self.manifestError(man, e);
+        }
+        return root;
+    }
+
+    // Reports a problem with the packages as a diagnostic in the manifest, at
+    // the line it is about when one is known. The driver and the language
+    // server show only diagnostics, so a plain string would not be seen.
+    void manifestError(pkgs.Manifest man, String e) {
+        String file = man.file;
+        int line = 1;
+        String message = e;
+        // A manifest's own errors read `<file>:<line>: <message>`.
+        int cut = string.find(e, ": ");
+        if (cut > 0) {
+            String head = string.substring(e, 0, cut);
+            int colon = -1;
+            forEach(head, c, i) {
+                if (c == 58) {
+                    colon = i;
+                }
+            }
+            if (colon > 0) {
+                String named = string.substring(head, 0, colon);
+                int? n = parseLine(string.substring(head, colon + 1, string.length(head)));
+                if (n != null && str.hasSuffix(named, pkgs.MANIFEST)) {
+                    file = named;
+                    line = n;
+                    message = string.substring(e, cut + 2, string.length(e));
+                }
+            }
+        }
+        // Resolution names the package first; the line is where this manifest
+        // records or requires it.
+        if (file == man.file && line == 1 && str.hasPrefix(e, "package ")) {
+            String rest = string.substring(e, 8, string.length(e));
+            int sp = string.find(rest, " ");
+            if (sp > 0) {
+                String pkg = string.substring(rest, 0, sp);
+                forEach(man.directives, d) {
+                    if (d.pkg == pkg) {
+                        line = d.line;
+                    }
+                }
+                forEach(man.requires, r) {
+                    if (r.pkg == pkg) {
+                        line = r.line;
+                    }
+                }
+                if (string.contains(e, "does not match the hash")) {
+                    forEach(man.resolved, r) {
+                        if (r.pkg == pkg) {
+                            line = r.line;
+                        }
+                    }
+                }
+            }
+        }
+        diag.Diagnostic d = diag.at(line, 1, message);
+        d.file = file;
+        // The span is the whole line: a manifest line is one statement.
+        String[] lines = string.split(textOf(file), "\n");
+        if (line >= 1 && line <= lines.length) {
+            d.endLine = line;
+            d.endCol = string.length(lines[line - 1]) + 1;
+        }
+        array.push(self.errs, diag.format(d));
+        array.push(self.diags, d);
+    }
+
+    // Loads a built-in Nio module at its first import. Its qual is its own
+    // name, reserved by reservedQuals.
+    void loadBuiltinNio(Unit importer, token.Token at, String name, String srcPath) {
+        if (self.builtin[name] != null) {
+            return;
+        }
+        // A loading key that no file path can equal.
+        String key = "<stdlib>/" + name;
+        if (self.loading[key] != null) {
+            self.errorAt(importer, at, "import cycle in the standard library: '%s' imports itself", name);
+            return;
+        }
+        String? src = stdlib.source(name);
+        if (src == null) {
+            self.errorAt(importer, at, "missing embedded standard library module '%s': %s",
+                name, "no such module in src/stdlib.nio");
+            return;
+        }
+        Unit? modOpt = self.parse(src, srcPath, "", srcPath);
+        if (modOpt == null) {
+            return;
+        }
+        Unit mod = modOpt;
+        mod.stdlib = true;
+        self.loading[key] = true;
+        String[] chain = [];
+        array.push(chain, srcPath);
+        self.loadImports(mod, chain);
+        map.remove(self.loading, key);
+        // Register only after the module and its imports are in order.
+        self.builtin[name] = mod;
+        mod.qual = name;
+        array.push(self.order, mod);
+    }
+
+    void errorAt(Unit m, token.Token tok, String format, ...String args) {
+        String msg = fmt.fmtArr(format, args);
+        diag.Diagnostic d = diag.atTok(tok, msg);
+        d.file = m.file;
+        array.push(self.errs, diag.format(d));
+        array.push(self.diags, d);
+    }
+
+    // Chooses a unique symbol prefix that LLVM accepts, from the file name.
+    String newQual(String p) {
+        String stem = baseOf(p);
+        if (str.hasSuffix(stem, ".nio")) {
+            stem = string.substring(stem, 0, string.length(stem) - 4);
+        }
+        byte[] data = string.toByteArray(stem);
+        String[] parts = [];
+        forEach(data, ch) {
+            bool ok = ch == 95 || (ch >= 97 && ch <= 122) || (ch >= 65 && ch <= 90)
+                || (ch >= 48 && ch <= 57);
+            if (ok) {
+                array.push(parts, string.fromByteArray([ch]));
+            } else {
+                array.push(parts, "_");
+            }
+        }
+        String qual = string.join(parts, "");
+        if (qual == "") {
+            qual = "m";
+        }
+        String candidate = qual;
+        int n = 2;
+        while (self.quals[candidate] != null) {
+            candidate = qual + "_" + string.from(n);
+            n++;
+        }
+        self.quals[candidate] = true;
+        return candidate;
+    }
+}
+
+export Loader newLoader() {
+    pkgs.Resolution none = pkgs.emptyResolution();
+    Loader ld = {
+        modules: {}, builtin: {}, loading: {}, order: [],
+        quals: reservedQuals(), errs: [], diags: [], open: {},
+        packages: none, aliases: {}, homesDone: {},
+    };
+    return ld;
+}
+
+// One native source (§5.8) and the module that shipped it. The qual keeps two
+// packages that both ship `util.c` apart. The driver writes the natives of each
+// module into a directory of its own, so a base name must be unique only
+// within a module.
+export type NativeSource {
+    String path;
+    String qual;
+}
+
+// Native source paths and host-filtered link flags, in dependency order.
+type NativeInputs {
+    NativeSource[] sources;
+    String[] flags;
+}
+
+String displayFile(String file) {
+    if (file == "") {
+        return "the entry file";
+    }
+    return file;
+}
+
+// The text of a file, or "" when it cannot be read.
+String textOf(String file) {
+    byte[] data = fs.readFile(file) catch e {
+        return "";
+    };
+    return string.fromByteArray(data);
+}
+
+// A line number written in decimal, or null.
+int? parseLine(String s) {
+    if (s == "") {
+        return null;
+    }
+    int n = 0;
+    forEach(s, c) {
+        if (c < 48 || c > 57) {
+            return null;
+        }
+        n = n * 10 + (c - 48);
+    }
+    return n;
+}
+
+// The path of a module below its package's directory, without `.nio` and with
+// `/` separators, or "" for the package's entry module.
+String subPath(pkgs.Package p, String modulePath) {
+    if (modulePath == clean(path.join(p.dir, p.entry))) {
+        return "";
+    }
+    String rel = modulePath;
+    String dir = clean(p.dir);
+    if (str.hasPrefix(modulePath, dir) && string.length(modulePath) > string.length(dir)) {
+        rel = string.substring(modulePath, string.length(dir) + 1, string.length(modulePath));
+    }
+    if (str.hasSuffix(rel, ".nio")) {
+        rel = string.substring(rel, 0, string.length(rel) - 4);
+    }
+    return string.replace(rel, "\\", "/");
+}
+
+// The file a package import names: its entry module for the bare alias, and a
+// module beside it for `alias/name`.
+String packageModule(pkgs.Package pkg, String importPath) {
+    int slash = string.find(importPath, "/");
+    if (slash < 0) {
+        return clean(path.join(pkg.dir, pkg.entry));
+    }
+    String rest = string.substring(importPath, slash + 1, string.length(importPath));
+    return resolveImport(pkg.dir, rest);
+}
+
+// Resolves an import path to a file path, against the importing directory.
+export String resolveImport(String d, String p) {
+    String out = p;
+    if (!str.hasSuffix(out, ".nio")) {
+        out = out + ".nio";
+    }
+    if (!isAbs(out)) {
+        out = path.join(d, out);
+    }
+    return clean(out);
+}
+
+// A compile that produced no IR, with what was checked before the stop.
+CompileResult failed(String[] errs, diag.Diagnostic[] diags, Checked[] checked) {
+    LinkFlags none = { windows: [], unix: [] };
+    CompileResult r = { ir: "", cfiles: [], libs: [], hostLibs: none, natives: [], errs: errs, diags: diags, checked: checked };
+    return r;
+}
+
+// failed, with the file name moved into both forms of the diagnostics.
+CompileResult failedIn(String file, String[] errs, diag.Diagnostic[] diags, Checked[] checked) {
+    diag.Diagnostic[] moved = diag.inFile(file, diags);
+    return failed(diag.formatAll(moved), moved, checked);
+}
+
+// Compiles the program whose entry source is src; imports resolve against d.
+// entryPath names the entry module in a coverage report. opts is what the
+// command line asks of code generation.
+export CompileResult compileEntry(String src, String d, String entryPath, codegen.Options opts) {
+    return load(src, d, entryPath, opts, {}, true);
+}
+
+// compileEntry without code generation, for the language server. open holds
+// unsaved editor buffers by resolved path; src is the entry file's text.
+export CompileResult checkEntry(String src, String d, String entryPath, Map<String, String> open) {
+    return load(src, d, entryPath, codegen.noOptions(), open, false);
+}
+
+// The shared body of compileEntry and checkEntry, so the two cannot disagree.
+CompileResult load(String src, String d, String entryPath, codegen.Options opts,
+    Map<String, String> open, bool emit) {
+    Loader ld = newLoader();
+    ld.open = open;
+    String root = ld.resolvePackages(d);
+    // A manifest that does not resolve breaks the imports that name its
+    // packages, and those would be reported in place of the cause.
+    if (ld.errs.length > 0) {
+        return failed(ld.errs, ld.diags, []);
+    }
+    Unit? entryOpt = ld.parse(src, entryPath, d, "");
+    if (entryOpt == null) {
+        return failed(ld.errs, ld.diags, []);
+    }
+    Unit entry = entryOpt;
+    entry.home = root;
+    ld.loading[""] = true;
+    String[] chain = [];
+    array.push(chain, "the entry file");
+    ld.loadImports(entry, chain);
+    if (ld.errs.length > 0) {
+        return failed(ld.errs, ld.diags, []);
+    }
+    array.push(ld.order, entry);
+    ld.nameModules();
+
+    module.Module[] mods = [];
+    Checked[] checked = [];
+    forEach(ld.order, m) {
+        Map<String, checker.ModuleExports> deps = {};
+        forEach(m.prog.imports, imp) {
+            Unit? dep = ld.dependency(m, imp.path);
+            if (dep != null) {
+                checker.ModuleExports? de = dep.exports;
+                if (de != null) {
+                    deps[imp.path] = de;
+                }
+            }
+        }
+        checker.CheckResult res = checker.checkModuleShown(m.prog, m.qual, m.shown, deps);
+        // Record before the error test: a rejected module still holds types an
+        // editor needs.
+        Checked c = { file: m.file, prog: m.prog, info: res.info };
+        array.push(checked, c);
+        if (res.errs.length > 0) {
+            // Stop at the first failing module: it exports nothing, so
+            // importers would report only the consequences.
+            return failedIn(m.file, res.errs, ld.withProvenance(res.diags), checked);
+        }
+        m.info = res.info;
+        checker.ModuleExports exp = checker.exportsOf(m.prog, res.info, m.qual);
+        exp.source = m.path;
+        m.exports = exp;
+        module.Module cm = { prog: m.prog, info: res.info, qual: m.qual, path: m.covPath() };
+        array.push(mods, cm);
+    }
+    NativeInputs native = ld.nativeInputs(mods);
+    if (ld.errs.length > 0) {
+        return failed(ld.errs, ld.diags, checked);
+    }
+    String ir = "";
+    if (emit) {
+        ir = codegen.generate(mods, opts);
+    }
+    String[] libs = ld.runtimeLibs();
+    forEach(native.flags, f) {
+        array.push(libs, f);
+    }
+    CompileResult r = {
+        ir: ir,
+        cfiles: ld.runtimeCFiles(opts.coverage),
+        libs: libs,
+        hostLibs: ld.everyHostLibs(),
+        natives: native.sources,
+        errs: [],
+        diags: [],
+        checked: checked,
+    };
+    return r;
+}

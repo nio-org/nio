@@ -1,0 +1,781 @@
+// The language server behind `nio lsp`, over the standard streams.
+// The loop is synchronous and handles one message at a time.
+// diag.Diagnostic carries a byte column. The protocol Diagnostic below
+// carries a UTF-16 range.
+import '../loader' as loader;
+import '../diag' as diag;
+import './rpc' as rpc;
+import './uri' as docuri;
+import './pos' as pos;
+import './hover' as hoverer;
+import './complete' as completer;
+import './def' as definer;
+import 'json';
+import 'string';
+import 'array';
+import 'map';
+import 'path';
+import 'fs';
+
+// ---- what goes on the wire ----
+//
+// Field names must match the protocol: json.toText writes them as declared.
+
+export type Position {
+    int line;         // 0-based
+    int character;    // 0-based, in UTF-16 code units
+}
+
+export type Range {
+    Position start;
+    Position end;
+}
+
+export type Diagnostic {
+    Range range;
+    int severity;    // 1 is Error, the severity of every compiler diagnostic
+    String source;
+    String message;
+}
+
+type PublishParams {
+    String uri;
+    Diagnostic[] diagnostics;
+}
+
+type PublishNote {
+    String jsonrpc;
+    String method;
+    PublishParams params;
+}
+
+type SaveOptions {
+    // False: the text already arrived through didChange.
+    bool includeText;
+}
+
+type SyncOptions {
+    bool openClose;
+    // 1 is Full: every change carries the whole new text of the document.
+    int change;
+    SaveOptions save;
+}
+
+type Capabilities {
+    // Written in full. The short form `1` lets the client omit open, close
+    // and save.
+    SyncOptions textDocumentSync;
+    String positionEncoding;
+    bool hoverProvider;
+    bool definitionProvider;
+    CompletionOptions completionProvider;
+    // Quick fixes. A diagnostic carries an edit only when the compiler knows
+    // the full edit, so every offered fix is correct.
+    bool codeActionProvider;
+}
+
+// ---- quick fixes ----
+
+type TextEdit {
+    Range range;
+    String newText;
+}
+
+// `changes` is the widely supported half of the protocol's WorkspaceEdit: one
+// list of edits per document.
+type WorkspaceEdit {
+    Map<String, TextEdit[]> changes;
+}
+
+type CodeAction {
+    String title;
+    String kind;
+    WorkspaceEdit edit;
+}
+
+type CompletionOptions {
+    // A dot is the only trigger. The client asks about names by itself.
+    String[] triggerCharacters;
+    // False: each item is complete, so a second request would resolve nothing.
+    bool resolveProvider;
+}
+
+type CompletionList {
+    // False: the server sends the full list, so the client filters it alone.
+    bool isIncomplete;
+    completer.Item[] items;
+}
+
+type MarkupContent {
+    String kind;
+    String value;
+}
+
+type HoverResult {
+    MarkupContent contents;
+}
+
+type LocationResult {
+    String uri;
+    Range range;
+}
+
+type ServerInfo {
+    String name;
+}
+
+type InitResult {
+    Capabilities capabilities;
+    ServerInfo serverInfo;
+}
+
+type RpcError {
+    int code;
+    String message;
+}
+
+int const METHOD_NOT_FOUND = -32601;
+
+// The answer to a request whose result is a plain array. A completion list is
+// an object with an `items` field and has its own empty form (`emptyList`).
+// A code action request wants the array itself.
+String const NO_ACTIONS = "[]";
+
+// ---- the server ----
+
+export type Server {
+    Map<String, String> docs;     // document uri -> the text the editor holds
+    Map<String, String> paths;    // document uri -> resolved file path, "" if not a file
+    // URIs that the last check of each entry document sent diagnostics to.
+    // The protocol replaces the list of a document, so only an empty list
+    // clears it.
+    Map<String, String[]> reported;
+    // The last check of each document that produced a tree. A buffer under edit
+    // often fails to parse, so the stale tree still answers questions.
+    Map<String, loader.Checked[]> lastGood;
+    bool shutdownRequested;
+
+    // ---- documents ----
+
+    // path.join cleans the path as the loader does, so a diagnostic that names
+    // an imported file matches this document.
+    void track(String uri, String text) {
+        self.docs[uri] = text;
+        String p = docuri.toPath(uri);
+        if (p != "") {
+            p = path.join(p);
+        }
+        self.paths[uri] = p;
+    }
+
+    void forget(String uri) {
+        map.remove(self.docs, uri);
+        map.remove(self.paths, uri);
+        map.remove(self.lastGood, uri);
+    }
+
+    // Keeps a check only when it reached the entry module, whose file is "".
+    void remember(String uri, loader.CompileResult res) {
+        forEach(res.checked, c) {
+            if (c.file == "") {
+                self.lastGood[uri] = res.checked;
+            }
+        }
+    }
+
+    // This check's entry module, or the last one that parsed.
+    loader.Checked? checkedFor(String uri, loader.CompileResult res) {
+        self.remember(uri, res);
+        loader.Checked[]? had = self.lastGood[uri];
+        if (had == null) {
+            return null;
+        }
+        loader.Checked? entry = null;
+        forEach(had, c) {
+            if (c.file == "") {
+                entry = c;
+            }
+        }
+        return entry;
+    }
+
+    // Every module of the remembered check, keyed by file.
+    Map<String, loader.Checked> worldFor(String uri) {
+        Map<String, loader.Checked> world = {};
+        loader.Checked[]? had = self.lastGood[uri];
+        if (had != null) {
+            forEach(had, c) {
+                world[c.file] = c;
+            }
+        }
+        return world;
+    }
+
+    // Open documents keyed by path. The loader reads these in place of the
+    // disk (Loader.open in src/loader.nio).
+    Map<String, String> overlay() {
+        Map<String, String> open = {};
+        forEach(map.keys(self.docs), u) {
+            String? p = self.paths[u];
+            String? text = self.docs[u];
+            if (p != null && text != null && p != "") {
+                open[p] = text;
+            }
+        }
+        return open;
+    }
+
+    // The uri of an open document has priority, because the client can spell
+    // the same file differently.
+    String uriFor(String file) {
+        forEach(map.keys(self.paths), u) {
+            String? p = self.paths[u];
+            if (p != null && p == file) {
+                return u;
+            }
+        }
+        return docuri.fromPath(file);
+    }
+
+    String[]? linesOf(String file) {
+        forEach(map.keys(self.paths), u) {
+            String? p = self.paths[u];
+            String? text = self.docs[u];
+            if (p != null && text != null && p == file) {
+                return pos.lines(text);
+            }
+        }
+        byte[] data = fs.readFile(file) catch e {
+            return null;
+        };
+        return pos.lines(string.fromByteArray(data));
+    }
+
+    // ---- diagnostics ----
+
+    // Checks one document and publishes for every file the check reached,
+    // imported files included.
+    void recheck(String uri) {
+        String? textOpt = self.docs[uri];
+        if (textOpt == null) {
+            return;
+        }
+        String text = textOpt;
+        String? pathOpt = self.paths[uri];
+        String p = "";
+        if (pathOpt != null) {
+            p = pathOpt;
+        }
+        // A document that is not a file has no directory for its imports.
+        // The empty list clears what an earlier check reported.
+        if (p == "") {
+            self.publishOne(uri, []);
+            self.reported[uri] = [];
+            return;
+        }
+
+        loader.CompileResult res = loader.checkEntry(text, loader.dirOf(p), p, self.overlay());
+        self.remember(uri, res);
+
+        // The entry file always gets a notification. An empty list removes its
+        // old marks.
+        Map<String, Diagnostic[]> byUri = {};
+        String[] targets = [];
+        byUri[uri] = [];
+        array.push(targets, uri);
+        Map<String, String[]> lineCache = {};
+
+        forEach(res.diags, d) {
+            String target = uri;
+            if (d.file != "") {
+                target = self.uriFor(d.file);
+            }
+            Diagnostic[]? have = byUri[target];
+            Diagnostic[] list = [];
+            if (have != null) {
+                list = have;
+            } else {
+                byUri[target] = list;
+                array.push(targets, target);
+            }
+            array.push(list, wire(self.linesFor(lineCache, d.file, text), d));
+        }
+
+        forEach(targets, t) {
+            Diagnostic[]? list = byUri[t];
+            if (list != null) {
+                self.publishOne(t, list);
+            }
+        }
+        // A file with diagnostics before and none now gets an empty list.
+        String[]? before = self.reported[uri];
+        if (before != null) {
+            forEach(before, t) {
+                if (byUri[t] == null) {
+                    self.publishOne(t, []);
+                }
+            }
+        }
+        self.reported[uri] = targets;
+    }
+
+    // linesOf with a cache. "" is the entry file, the key its diagnostics
+    // carry.
+    String[] linesFor(Map<String, String[]> cache, String file, String entryText) {
+        String[]? had = cache[file];
+        if (had != null) {
+            return had;
+        }
+        String[] ls = [];
+        if (file == "") {
+            ls = pos.lines(entryText);
+        } else {
+            String[]? found = self.linesOf(file);
+            if (found != null) {
+                ls = found;
+            }
+        }
+        cache[file] = ls;
+        return ls;
+    }
+
+    // Checks every open document, the changed one first. An edit to an imported
+    // module makes the diagnostics of its importers stale.
+    void recheckAll(String first) {
+        if (first != "" && self.docs[first] != null) {
+            self.recheck(first);
+        }
+        forEach(map.keys(self.docs), u) {
+            if (u != first) {
+                self.recheck(u);
+            }
+        }
+    }
+
+    void publishOne(String uri, Diagnostic[] ds) {
+        PublishParams params = { uri: uri, diagnostics: ds };
+        PublishNote note = {
+            jsonrpc: "2.0", method: "textDocument/publishDiagnostics", params: params,
+        };
+        rpc.write(json.toText(note));
+    }
+
+    // Answers `textDocument/codeAction`. The editor asks about a range. The
+    // answer is every diagnostic in it that carries an edit, as a quick fix.
+    // The document is checked again, as for hover. A check costs milliseconds,
+    // which is less than the cost of keeping a stored check current.
+    String codeActions(String uri, int fromLine, int toLine) {
+        String? textOpt = self.docs[uri];
+        String? pathOpt = self.paths[uri];
+        if (textOpt == null || pathOpt == null || pathOpt == "") {
+            return NO_ACTIONS;
+        }
+        String text = textOpt;
+        String p = pathOpt;
+        loader.CompileResult res = loader.checkEntry(text, loader.dirOf(p), p, self.overlay());
+        String[] ls = pos.lines(text);
+        CodeAction[] out = [];
+        forEach(res.diags, d) {
+            diag.Fix? fixOpt = d.fix;
+            if (fixOpt == null) {
+                continue;
+            }
+            // Only the diagnostics of this document, because the editor asked
+            // about it. A quick fix here does not edit another file.
+            if (d.file != "" && d.file != p) {
+                continue;
+            }
+            int at = d.line - 1;
+            if (at < fromLine || at > toLine) {
+                continue;
+            }
+            diag.Fix fix = fixOpt;
+            int startLine = fix.at.line - 1;
+            if (startLine < 0) {
+                startLine = 0;
+            }
+            int endLine = fix.at.endLine - 1;
+            if (endLine < startLine) {
+                endLine = startLine;
+            }
+            Position from = {
+                line: startLine,
+                character: pos.utf16Col(pos.lineAt(ls, fix.at.line), fix.at.col),
+            };
+            Position to = {
+                line: endLine,
+                character: pos.utf16Col(pos.lineAt(ls, endLine + 1), fix.at.endCol),
+            };
+            Range r = { start: from, end: to };
+            TextEdit edit = { range: r, newText: fix.text };
+            Map<String, TextEdit[]> changes = {};
+            changes[uri] = [edit];
+            WorkspaceEdit we = { changes: changes };
+            CodeAction action = { title: fix.title, kind: "quickfix", edit: we };
+            array.push(out, action);
+        }
+        if (out.length == 0) {
+            return NO_ACTIONS;
+        }
+        return json.toText(out);
+    }
+
+    // ---- answering about a place ----
+
+    // Answers `textDocument/hover`. Each call checks the document again: a
+    // check costs milliseconds, less than a cache would save.
+    String hover(String uri, int line, int character) {
+        String? textOpt = self.docs[uri];
+        if (textOpt == null) {
+            return "null";
+        }
+        String text = textOpt;
+        String? pathOpt = self.paths[uri];
+        if (pathOpt == null || pathOpt == "") {
+            return "null";
+        }
+        String p = pathOpt;
+
+        loader.CompileResult res = loader.checkEntry(text, loader.dirOf(p), p, self.overlay());
+        loader.Checked? mine = self.checkedFor(uri, res);
+        if (mine == null) {
+            return "null";
+        }
+        loader.Checked doc = mine;
+
+        // The client counts UTF-16 units. The compiler counts bytes
+        // (src/lsp/pos.nio).
+        String[] ls = pos.lines(text);
+        String lineText = pos.lineAt(ls, line + 1);
+        int col = pos.byteCol(lineText, character);
+
+        String markdown = hoverer.render(doc, self.worldFor(uri), line + 1, col);
+        if (markdown == "") {
+            return "null";
+        }
+        MarkupContent content = { kind: "markdown", value: markdown };
+        HoverResult out = { contents: content };
+        return json.toText(out);
+    }
+
+    // Answers `textDocument/completion`. A half-typed name rarely parses, so
+    // the answer comes from this check or from the last tree that did.
+    String complete(String uri, int line, int character) {
+        String? textOpt = self.docs[uri];
+        if (textOpt == null) {
+            return emptyList();
+        }
+        String text = textOpt;
+        String? pathOpt = self.paths[uri];
+        if (pathOpt == null || pathOpt == "") {
+            return emptyList();
+        }
+        String p = pathOpt;
+
+        loader.CompileResult res = loader.checkEntry(text, loader.dirOf(p), p, self.overlay());
+        loader.Checked? mine = self.checkedFor(uri, res);
+        if (mine == null) {
+            return emptyList();
+        }
+        loader.Checked doc = mine;
+
+        String[] ls = pos.lines(text);
+        String lineText = pos.lineAt(ls, line + 1);
+        int col = pos.byteCol(lineText, character);
+        completer.Item[] items = completer.at(doc.prog, doc.info, lineText, line + 1, col);
+        CompletionList out = { isIncomplete: false, items: items };
+        return json.toText(out);
+    }
+
+    // Answers `textDocument/definition`. The range covers only the name of the
+    // declaration.
+    String definition(String uri, int line, int character) {
+        String? textOpt = self.docs[uri];
+        if (textOpt == null) {
+            return "null";
+        }
+        String text = textOpt;
+        String? pathOpt = self.paths[uri];
+        if (pathOpt == null || pathOpt == "") {
+            return "null";
+        }
+        String p = pathOpt;
+
+        loader.CompileResult res = loader.checkEntry(text, loader.dirOf(p), p, self.overlay());
+        loader.Checked? mine = self.checkedFor(uri, res);
+        if (mine == null) {
+            return "null";
+        }
+        loader.Checked doc = mine;
+
+        String[] ls = pos.lines(text);
+        String lineText = pos.lineAt(ls, line + 1);
+        int col = pos.byteCol(lineText, character);
+
+        definer.Target? found = definer.at(doc, self.worldFor(uri), line + 1, col);
+        if (found == null) {
+            return "null";
+        }
+        definer.Target t = found;
+
+        // "" is this document.
+        String targetUri = uri;
+        String[] targetLines = ls;
+        if (t.file != "") {
+            // A built-in module written in Nio has no file on the disk.
+            if (!fs.exists(t.file)) {
+                return "null";
+            }
+            targetUri = self.uriFor(t.file);
+            String[]? other = self.linesOf(t.file);
+            if (other == null) {
+                return "null";
+            }
+            targetLines = other;
+        }
+
+        String targetLine = pos.lineAt(targetLines, t.site.tok.line);
+        int startCol = t.site.tok.col;
+        int at = t.site.tok.line - 1;
+        if (at < 0) {
+            at = 0;
+        }
+        Position start = { line: at, character: pos.utf16Col(targetLine, startCol) };
+        Position end = {
+            line: at,
+            character: pos.utf16Col(targetLine, startCol + string.length(t.site.tok.literal)),
+        };
+        Range r = { start: start, end: end };
+        LocationResult out = { uri: targetUri, range: r };
+        return json.toText(out);
+    }
+
+    // ---- replies ----
+
+    // Built as text, because the shape of `result` changes with the method, and
+    // `id` can be a number or a string.
+    void respond(Json id, String result) {
+        rpc.write("{\"jsonrpc\":\"2.0\",\"id\":" + json.toText(id)
+            + ",\"result\":" + result + "}");
+    }
+
+    void respondError(Json id, int code, String message) {
+        RpcError e = { code: code, message: message };
+        rpc.write("{\"jsonrpc\":\"2.0\",\"id\":" + json.toText(id)
+            + ",\"error\":" + json.toText(e) + "}");
+    }
+
+    // ---- dispatch ----
+
+    // Handles one message. Returns the exit status on a stop message, and null
+    // otherwise.
+    int? handle(String body) {
+        Json? parsed = json.parse(body) catch null;
+        if (parsed == null) {
+            // A reply needs an id, and an unparsed message has none to trust.
+            rpc.log("ignoring a message that is not JSON");
+            return null;
+        }
+        Json msg = parsed;
+        String method = json.asText(msg["method"]) catch "";
+        Json id = msg["id"];
+        bool isRequest = json.getType(id) != json.Type.MISSING;
+
+        if (method == "initialize") {
+            SyncOptions sync = { openClose: true, change: 1, save: { includeText: false } };
+            CompletionOptions completion = {
+                triggerCharacters: ["."], resolveProvider: false,
+            };
+            Capabilities caps = {
+                textDocumentSync: sync, positionEncoding: "utf-16", hoverProvider: true,
+                definitionProvider: true, completionProvider: completion,
+                codeActionProvider: true,
+            };
+            ServerInfo info = { name: "nio" };
+            InitResult result = { capabilities: caps, serverInfo: info };
+            self.respond(id, json.toText(result));
+            return null;
+        }
+        if (method == "shutdown") {
+            self.shutdownRequested = true;
+            self.respond(id, "null");
+            return null;
+        }
+        if (method == "exit") {
+            // The protocol: exit without a prior shutdown reports status 1.
+            if (self.shutdownRequested) {
+                return 0;
+            }
+            return 1;
+        }
+        if (method == "textDocument/hover") {
+            String uri = json.asText(msg["params"]["textDocument"]["uri"]) catch "";
+            Json at = msg["params"]["position"];
+            int line = json.asInt(at["line"]) catch -1;
+            int character = json.asInt(at["character"]) catch -1;
+            if (uri == "" || line < 0 || character < 0) {
+                self.respond(id, "null");
+                return null;
+            }
+            self.respond(id, self.hover(uri, line, character));
+            return null;
+        }
+        if (method == "textDocument/definition") {
+            String uri = json.asText(msg["params"]["textDocument"]["uri"]) catch "";
+            Json at = msg["params"]["position"];
+            int line = json.asInt(at["line"]) catch -1;
+            int character = json.asInt(at["character"]) catch -1;
+            if (uri == "" || line < 0 || character < 0) {
+                self.respond(id, "null");
+                return null;
+            }
+            self.respond(id, self.definition(uri, line, character));
+            return null;
+        }
+        if (method == "textDocument/completion") {
+            String uri = json.asText(msg["params"]["textDocument"]["uri"]) catch "";
+            Json at = msg["params"]["position"];
+            int line = json.asInt(at["line"]) catch -1;
+            int character = json.asInt(at["character"]) catch -1;
+            if (uri == "" || line < 0 || character < 0) {
+                self.respond(id, emptyList());
+                return null;
+            }
+            self.respond(id, self.complete(uri, line, character));
+            return null;
+        }
+        if (method == "textDocument/codeAction") {
+            String uri = json.asText(msg["params"]["textDocument"]["uri"]) catch "";
+            Json rng = msg["params"]["range"];
+            int fromLine = json.asInt(rng["start"]["line"]) catch -1;
+            int toLine = json.asInt(rng["end"]["line"]) catch -1;
+            if (uri == "" || fromLine < 0 || toLine < 0) {
+                self.respond(id, NO_ACTIONS);
+                return null;
+            }
+            self.respond(id, self.codeActions(uri, fromLine, toLine));
+            return null;
+        }
+        if (method == "textDocument/didOpen") {
+            Json doc = msg["params"]["textDocument"];
+            String uri = json.asText(doc["uri"]) catch "";
+            String text = json.asText(doc["text"]) catch "";
+            if (uri != "") {
+                self.track(uri, text);
+                self.recheckAll(uri);
+            }
+            return null;
+        }
+        if (method == "textDocument/didChange") {
+            String uri = json.asText(msg["params"]["textDocument"]["uri"]) catch "";
+            Json changes = msg["params"]["contentChanges"];
+            int n = json.length(changes);
+            // Under Full sync the last change is the whole document.
+            if (uri != "" && n > 0) {
+                Json last = changes[n - 1];
+                // A change with a `range` is incremental. Its text is not the
+                // whole document, so refuse it.
+                if (json.getType(last["range"]) != json.Type.MISSING) {
+                    rpc.log("ignoring an incremental change: this server asked for whole documents");
+                    return null;
+                }
+                String text = json.asText(last["text"]) catch "";
+                self.track(uri, text);
+                self.recheckAll(uri);
+            }
+            return null;
+        }
+        if (method == "textDocument/didSave") {
+            String uri = json.asText(msg["params"]["textDocument"]["uri"]) catch "";
+            // The text already arrived through didChange. The save changes
+            // only the disk.
+            self.recheckAll(uri);
+            return null;
+        }
+        if (method == "textDocument/didClose") {
+            String uri = json.asText(msg["params"]["textDocument"]["uri"]) catch "";
+            if (uri != "") {
+                // The server withdraws what a closed document reported.
+                String[]? before = self.reported[uri];
+                if (before != null) {
+                    forEach(before, t) {
+                        self.publishOne(t, []);
+                    }
+                }
+                map.remove(self.reported, uri);
+                self.forget(uri);
+                self.publishOne(uri, []);
+                self.recheckAll("");
+            }
+            return null;
+        }
+        // The protocol: ignore an unknown notification, but answer an unknown
+        // request, or the client waits forever.
+        if (isRequest) {
+            self.respondError(id, METHOD_NOT_FOUND, "nio lsp does not implement " + method);
+        }
+        return null;
+    }
+}
+
+// An empty list. A client that gets null completes from buffer words instead.
+String emptyList() {
+    CompletionList out = { isIncomplete: false, items: [] };
+    return json.toText(out);
+}
+
+export Server newServer() {
+    Server s = {
+        docs: {}, paths: {}, reported: {}, lastGood: {}, shutdownRequested: false,
+    };
+    return s;
+}
+
+// Turns a compiler diagnostic into a protocol one. The range counts UTF-16
+// units.
+//
+// The range comes from the span of the diagnostic when it has one. Every
+// diagnostic from the parser and the checker has a span. A diagnostic with only
+// a position underlines the word at that position.
+export Diagnostic wire(String[] ls, diag.Diagnostic d) {
+    String line = pos.lineAt(ls, d.line);
+    // The protocol counts lines from 0, the compiler from 1. Stop at 0.
+    int atLine = d.line - 1;
+    if (atLine < 0) {
+        atLine = 0;
+    }
+    int endLine = atLine;
+    int endCol = pos.wordEnd(line, d.col);
+    if (d.endLine >= d.line && d.endCol > 0) {
+        endLine = d.endLine - 1;
+        endCol = d.endCol;
+        if (endLine != atLine) {
+            line = pos.lineAt(ls, d.endLine);
+        }
+    }
+    Position start = { line: atLine, character: pos.utf16Col(pos.lineAt(ls, d.line), d.col) };
+    Position end = { line: endLine, character: pos.utf16Col(line, endCol) };
+    Range r = { start: start, end: end };
+    String message = d.message;
+    forEach(d.notes, note) {
+        message = message + "\n" + note;
+    }
+    Diagnostic out = { range: r, severity: 1, source: "nio", message: message };
+    return out;
+}
+
+export int serve() {
+    Server s = newServer();
+    while (true) {
+        String? bodyOpt = rpc.read();
+        if (bodyOpt == null) {
+            // A closed pipe with no shutdown message is a normal editor stop.
+            return 0;
+        }
+        int? stop = s.handle(bodyOpt);
+        if (stop != null) {
+            return stop;
+        }
+    }
+    return 0;
+}

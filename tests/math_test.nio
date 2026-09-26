@@ -1,0 +1,129 @@
+// The math module (§6.21): libm behind one wrapper each, the four functions
+// generic over the number types, the two conversions that §3.6 does not make,
+// and the rule that a float with no answer is NaN or an infinity.
+import 'test';
+import 'math';
+
+float const CLOSE = 0.000000000001;
+
+test.start("math: the libm functions answer what libm answers", void () -> {
+    test.expectFloat(math.sqrt(16.0), 4.0);
+    test.expectFloat(math.pow(2.0, 10.0), 1024.0);
+    test.expectFloatNear(math.sin(math.PI / 2.0), 1.0, CLOSE);
+    test.expectFloatNear(math.cos(0.0), 1.0, CLOSE);
+    test.expectFloatNear(math.tan(math.PI / 4.0), 1.0, CLOSE);
+    test.expectFloatNear(math.asin(1.0), math.PI / 2.0, CLOSE);
+    test.expectFloatNear(math.acos(1.0), 0.0, CLOSE);
+    test.expectFloatNear(math.atan(1.0), math.PI / 4.0, CLOSE);
+    test.expectFloatNear(math.atan2(1.0, 1.0), math.PI / 4.0, CLOSE);
+    test.expectFloatNear(math.atan2(-1.0, -1.0), -3.0 * math.PI / 4.0, CLOSE);
+    test.expectFloatNear(math.log(math.E), 1.0, CLOSE);
+    test.expectFloat(math.log2(8.0), 3.0);
+    test.expectFloat(math.log10(1000.0), 3.0);
+    test.expectFloatNear(math.exp(1.0), math.E, CLOSE);
+});
+
+test.start("math: floor, ceil and round", void () -> {
+    test.expectFloat(math.floor(2.7), 2.0);
+    test.expectFloat(math.floor(-2.7), -3.0);
+    test.expectFloat(math.ceil(2.1), 3.0);
+    test.expectFloat(math.ceil(-2.1), -2.0);
+    test.expectFloat(math.round(2.4), 2.0);
+    // Half rounds away from zero.
+    test.expectFloat(math.round(2.5), 3.0);
+    test.expectFloat(math.round(-2.5), -3.0);
+});
+
+// The policy §6.21 writes down: no function raises or stops the program
+// (toInt aside). NaN is not equal to anything, itself included, so isNaN is
+// the only way to ask, and every operation on a NaN answers NaN.
+test.start("math: a float with no answer is NaN or an infinity, never a stop", void () -> {
+    float none = math.sqrt(-1.0);
+    test.expectBool(math.isNaN(none), true);
+    test.expectBool(none == none, false);
+    test.expectBool(math.isNaN(none + 1.0), true);
+    test.expectBool(math.isNaN(math.log(-1.0)), true);
+    float down = math.log(0.0);
+    test.expectBool(math.isInfinite(down), true);
+    test.expectBool(down < 0.0, true);
+    test.expectBool(math.isInfinite(math.pow(10.0, 400.0)), true);
+    test.expectBool(math.isNaN(1.0), false);
+    test.expectBool(math.isInfinite(1.0), false);
+    test.expectBool(math.isInfinite(none), false);
+});
+
+test.start("math: toInt truncates toward zero and toFloat is exact where a float can be", void () -> {
+    test.expectInt(math.toInt(2.9), 2);
+    test.expectInt(math.toInt(-2.9), -2);
+    test.expectInt(math.toInt(0.0), 0);
+    test.expectInt(math.toInt(math.floor(-0.5)), -1);
+    test.expectInt(math.toInt(math.round(2.5)), 3);
+    test.expectFloat(math.toFloat(3), 3.0);
+    test.expectFloat(math.toFloat(-3), -3.0);
+    // 2^53 + 1 has no float; the nearest one is even.
+    test.expectFloat(math.toFloat(9007199254740993), 9007199254740992.0);
+    uint five = 5;
+    test.expectFloat(math.toFloat(five), 5.0);
+    // The top of the unsigned range reads as unsigned: 2^64 - 1 rounds to 2^64.
+    int minus = -1;
+    uint top = minus as uint;
+    test.expectFloat(math.toFloat(top), 18446744073709551616.0);
+    int8 narrow = -7;
+    test.expectFloat(math.toFloat(narrow), -7.0);
+});
+
+test.start("math: abs, min, max and clamp over every family", void () -> {
+    int n = -3;
+    test.expectInt(math.abs(n), 3);
+    test.expectInt(math.abs(3), 3);
+    test.expectInt(math.min(n, 2), -3);
+    test.expectInt(math.max(n, 2), 2);
+    test.expectInt(math.clamp(15, 0, 10), 10);
+    test.expectInt(math.clamp(-5, 0, 10), 0);
+    test.expectInt(math.clamp(5, 0, 10), 5);
+
+    uint u = 5;
+    int allOnes = -1;
+    uint big = allOnes as uint;    // 18446744073709551615, above any literal (§1.6)
+    // Unsigned compares unsigned: the top value is the larger one.
+    test.expectBool(math.max(u, big) == big, true);
+    test.expectBool(math.min(u, big) == u, true);
+    test.expectBool(math.abs(u) == u, true);
+    test.expectBool(math.max(u, 0) == u, true);
+
+    float f = -2.5;
+    test.expectFloat(math.abs(f), 2.5);
+    test.expectFloat(math.min(f, 1.0), -2.5);
+    test.expectFloat(math.max(f, 1.0), 1.0);
+    test.expectFloat(math.clamp(f, -1.0, 1.0), -1.0);
+    // A NaN loses to a number, as IEEE 754's minNum and maxNum say.
+    float none = math.sqrt(-1.0);
+    test.expectFloat(math.min(none, 1.0), 1.0);
+    test.expectFloat(math.max(1.0, none), 1.0);
+
+    // Narrow types widen, as they do under an operator.
+    byte b = 200;
+    uint w = math.abs(b);
+    test.expectBool(w == 200, true);
+    int8 lowest = -128;
+    int widened = math.abs(lowest);
+    test.expectInt(widened, 128);
+    int8 s = -5;
+    int m = math.max(s, 3);
+    test.expectInt(m, 3);
+});
+
+test.start("math: the constants", void () -> {
+    test.expectFloat(math.PI, 3.141592653589793);
+    test.expectFloat(math.E, 2.718281828459045);
+    float tau = 2.0 * math.PI;
+    test.expectFloatNear(math.sin(tau), 0.0, CLOSE);
+});
+
+test.start("math: a float32 argument is accepted", void () -> {
+    float32 s = 2.25;
+    test.expectFloat(math.sqrt(s), 1.5);
+    // A float32 beside a float literal widens to float, as it does under `+`.
+    float m = math.max(s, 1.0);
+    test.expectFloat(m, 2.25);
+});

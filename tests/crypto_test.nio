@@ -1,0 +1,891 @@
+// The crypto module (§6.17), against the answers its RFCs publish: SHA-256/384
+// to FIPS 180-4, HMAC to RFC 4231, HKDF to RFC 5869, base64 to RFC 4648 §10,
+// the AEAD to RFC 8439, X25519 to RFC 7748. HKDF-SHA-384 has no published
+// vectors, so OpenSSL is its oracle.
+//
+// The rejection tables are necessary: an AEAD that accepts a forged tag and
+// an X25519 that accepts a small-order point pass every positive test.
+import 'test';
+import 'crypto';
+import 'string';
+import 'array';
+import 'x509';
+import './bytes' as bytes;
+import './repo' as repo;
+
+// Decodes through the suite's own hex reader and not crypto.hexDecode. A
+// corpus must not be read through the function it checks.
+byte[] unhexB(String h) {
+    return string.toByteArray(bytes.unhex(h));
+}
+
+byte[] toB(String s) {
+    return string.toByteArray(s);
+}
+
+// crypto.hexEncode is under test too, and has vectors of its own below.
+String hex(byte[] b) {
+    return crypto.hexEncode(b);
+}
+
+byte[] repeatByte(byte b, int n) {
+    byte[] out = [];
+    int i = 0;
+    while (i < n) {
+        array.push(out, b);
+        i = i + 1;
+    }
+    return out;
+}
+
+// [from, to) as bytes, the way RFC 5869 spells its long inputs.
+byte[] rangeBytes(int from, int to) {
+    byte[] out = [];
+    int i = from;
+    while (i < to) {
+        array.push(out, i as byte);
+        i = i + 1;
+    }
+    return out;
+}
+
+test.start("crypto.sha256 matches FIPS 180-4", void () -> {
+    test.expectString(hex(crypto.sha256(toB(""))),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    test.expectString(hex(crypto.sha256(toB("abc"))),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    // Two blocks: the 56-byte message whose padding does not fit its block.
+    test.expectString(hex(crypto.sha256(toB("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))),
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    // One million 'a': the length field and every path through the buffer.
+    test.expectString(hex(crypto.sha256(repeatByte(97, 1000000))),
+        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+});
+
+test.start("crypto.sha384 matches FIPS 180-4", void () -> {
+    test.expectString(hex(crypto.sha384(toB(""))),
+        "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b");
+    test.expectString(hex(crypto.sha384(toB("abc"))),
+        "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7");
+    // Two blocks of the 1024-bit core this hash truncates.
+    test.expectString(hex(crypto.sha384(toB("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"))),
+        "09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712fcc7c71a557e2db966c3e9fa91746039");
+    test.expectString(hex(crypto.sha384(repeatByte(97, 1000000))),
+        "9d0e1809716474cb086e834e310a4a1ced149e9c00f248527972cec5704c2a5b07b8b3dc38ecc4ebae97ddd87f3d8985");
+});
+
+type HmacCase {
+    String name;
+    byte[] key;
+    byte[] data;
+    String want256;
+    String want384;
+}
+
+test.start("crypto.hmacSha256/384 match RFC 4231", void () -> {
+    HmacCase[] cases = [
+        {
+            name: "tc1",
+            key: repeatByte(11, 20),    // 20 bytes of 0x0b
+            data: toB("Hi There"),
+            want256: "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+            want384: "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6",
+        },
+        {
+            name: "tc2",
+            key: toB("Jefe"),
+            data: toB("what do ya want for nothing?"),
+            want256: "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+            want384: "af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e8e2240ca5e69e2c78b3239ecfab21649",
+        },
+        {
+            name: "tc3",
+            key: repeatByte(170, 20),     // 0xaa
+            data: repeatByte(221, 50),    // 0xdd
+            want256: "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe",
+            want384: "88062608d3e6ad8a0aa2ace014c8a86f0aa635d947ac9febe83ef4e55966144b2a5ab39dc13814b94e3ab6e101a34f27",
+        },
+        {
+            name: "tc4",
+            key: rangeBytes(1, 26),       // 0x01..0x19
+            data: repeatByte(205, 50),    // 0xcd
+            want256: "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b",
+            want384: "3e8a69b7783c25851933ab6290af6ca77a9981480850009cc5577c6e1f573b4e6801dd23c4a7d679ccf8a386c674cffb",
+        },
+        {
+
+            // A key longer than the block, which RFC 2104 hashes first.
+            name: "tc6",
+            key: repeatByte(170, 131),
+            data: toB("Test Using Larger Than Block-Size Key - Hash Key First"),
+            want256: "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+            want384: "4ece084485813e9088d2c63a041bc5b44f9ef1012a2b588f3cd11f05033ac4c60c2ef6ab4030fe8296248df163f44952",
+        },
+        {
+            name: "tc7",
+            key: repeatByte(170, 131),
+            data: toB("This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm."),
+            want256: "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2",
+            want384: "6617178e941f020d351e2f254e8fd32c602420feb0b8fb9adccebb82461e99c5a678cc31e799176d3860e6110c46523e",
+        },
+    ];
+    forEach(cases, c) {
+        test.assert(hex(crypto.hmacSha256(c.key, c.data)) == c.want256,
+            "hmacSha256 " + c.name + " disagrees with RFC 4231");
+        test.assert(hex(crypto.hmacSha384(c.key, c.data)) == c.want384,
+            "hmacSha384 " + c.name + " disagrees with RFC 4231");
+    }
+});
+
+test.start("crypto HKDF-SHA-256 matches RFC 5869", void () -> {
+    byte[] prk1 = crypto.hkdfExtractSha256(rangeBytes(0, 13), repeatByte(11, 22));
+    test.expectString(hex(prk1),
+        "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
+    test.expectString(hex(crypto.hkdfExpandSha256(prk1, unhexB("f0f1f2f3f4f5f6f7f8f9"), 42)),
+        "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
+
+    // Test Case 2: an expansion spanning three blocks.
+    byte[] prk2 = crypto.hkdfExtractSha256(rangeBytes(96, 176), rangeBytes(0, 80));
+    test.expectString(hex(prk2),
+        "06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244");
+    test.expectString(hex(crypto.hkdfExpandSha256(prk2, rangeBytes(176, 256), 82)),
+        "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87");
+
+    // Test Case 3: a zero-length salt gives the same HMAC as the RFC's
+    // "no salt means HashLen zeros" default.
+    byte[] prk3 = crypto.hkdfExtractSha256(toB(""), repeatByte(11, 22));
+    test.expectString(hex(prk3),
+        "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04");
+    test.expectString(hex(crypto.hkdfExpandSha256(prk3, toB(""), 42)),
+        "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8");
+});
+
+test.start("crypto HKDF-SHA-384 matches the OpenSSL oracle", void () -> {
+    // RFC 5869 publishes no SHA-384 vectors, so these are its Test Case 1
+    // inputs run through OpenSSL as an independent oracle.
+    byte[] prk = crypto.hkdfExtractSha384(rangeBytes(0, 13), repeatByte(11, 22));
+    test.expectString(hex(prk),
+        "704b39990779ce1dc548052c7dc39f303570dd13fb39f7acc564680bef80e8dec70ee9a7e1f3e293ef68eceb072a5ade");
+    test.expectString(hex(crypto.hkdfExpandSha384(prk, unhexB("f0f1f2f3f4f5f6f7f8f9"), 42)),
+        "9b5097a86038b805309076a44b3a9f38063e25b516dcbf369f394cfab43685f748b6457763e4f0204fc5");
+});
+
+test.start("crypto.base64Encode matches RFC 4648 §10", void () -> {
+    test.expectString(crypto.base64Encode(toB("")), "");
+    test.expectString(crypto.base64Encode(toB("f")), "Zg==");
+    test.expectString(crypto.base64Encode(toB("fo")), "Zm8=");
+    test.expectString(crypto.base64Encode(toB("foo")), "Zm9v");
+    test.expectString(crypto.base64Encode(toB("foob")), "Zm9vYg==");
+    test.expectString(crypto.base64Encode(toB("fooba")), "Zm9vYmE=");
+    test.expectString(crypto.base64Encode(toB("foobar")), "Zm9vYmFy");
+});
+
+test.start("crypto.base64Decode round-trips every byte value", void () -> {
+    byte[] all = rangeBytes(0, 256);
+    byte[] back = crypto.base64Decode(crypto.base64Encode(all));
+    test.expectInt(back.length, 256);
+    int i = 0;
+    while (i < 256) {
+        test.assert(back[i] == all[i], "byte " + string.from(i) + " changed in the round trip");
+        i = i + 1;
+    }
+});
+
+test.start("crypto.base64Decode is strict", void () -> {
+    // Each acceptance lets two different texts name one value. In "Zh=="
+    // the 'h' carries bits below the padding, so accepting it makes "Zg=="
+    // and "Zh==" the same byte.
+    String[] rejects = ["Zg=", "Zg", "Z===", "====", "Zm9v\n", "Zm 9v", "Zh==", "Zm9=v", "=m9v", "Zm9v===="];
+    forEach(rejects, r) {
+        byte[] out = crypto.base64Decode(r) catch e {
+            test.assert(e.code == crypto.ErrorCode.INVALID,
+                "wrong error code for " + r + ": " + e.message);
+            continue;
+        };
+        test.assert(false, "base64Decode accepted " + r + " (" + string.from(out.length) + " bytes)");
+    }
+});
+
+test.start("crypto.hexEncode/hexDecode", void () -> {
+    test.expectString(crypto.hexEncode(toB("")), "");
+    test.expectString(crypto.hexEncode(unhexB("00ff10ab")), "00ff10ab");
+    // Decode takes either case, and encode answers in lower case.
+    test.expectString(crypto.hexEncode(crypto.hexDecode("00FF10Ab")), "00ff10ab");
+    byte[] all = rangeBytes(0, 256);
+    byte[] back = crypto.hexDecode(crypto.hexEncode(all));
+    test.expectInt(back.length, 256);
+    int i = 0;
+    while (i < 256) {
+        test.assert(back[i] == all[i], "byte " + string.from(i) + " changed in the round trip");
+        i = i + 1;
+    }
+    String[] rejects = ["0", "0g", "g0", "0x10", " 00"];
+    forEach(rejects, r) {
+        byte[] out = crypto.hexDecode(r) catch e {
+            test.assert(e.code == crypto.ErrorCode.INVALID,
+                "wrong error code for " + r + ": " + e.message);
+            continue;
+        };
+        test.assert(false, "hexDecode accepted " + r + " (" + string.from(out.length) + " bytes)");
+    }
+});
+
+test.start("crypto.randomBytes answers the asked-for length, freshly", void () -> {
+    test.expectInt(crypto.randomBytes(0).length, 0);
+    test.expectInt(crypto.randomBytes(16).length, 16);
+    // getentropy caps a single request at 256 bytes, so this runs the fill loop.
+    byte[] big = crypto.randomBytes(1000);
+    test.expectInt(big.length, 1000);
+    // The two failure modes of a miswired syscall: an untouched buffer, and a
+    // repeated one.
+    bool anySet = false;
+    forEach(big, b) {
+        if (b != 0) {
+            anySet = true;
+        }
+    }
+    test.assert(anySet, "1000 random bytes came back all zero");
+    byte[] a = crypto.randomBytes(32);
+    byte[] b = crypto.randomBytes(32);
+    test.assert(!string.bytesEqualConstantTime(a, b), "two 32-byte draws were identical");
+});
+
+// ---- ChaCha20-Poly1305 (RFC 8439) ----
+
+// RFC 8439 §2.8.2's worked example: a whole seal, inputs and exact output.
+String const aeadKey = "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f";
+String const aeadNonce = "070000004041424344454647";
+String const aeadAad = "50515253c0c1c2c3c4c5c6c7";
+String const aeadPlain = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+
+test.start("crypto.chacha20Poly1305Seal matches RFC 8439 §2.8.2", void () -> {
+    byte[] sealed = crypto.chacha20Poly1305Seal(unhexB(aeadKey), unhexB(aeadNonce),
+        toB(aeadPlain), unhexB(aeadAad));
+    // The only wire form of this function: ciphertext, then the 16-byte tag.
+    test.expectString(hex(sealed),
+        "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6"
+        + "3dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b36"
+        + "92ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc"
+        + "3ff4def08e4b7a9de576d26586cec64b6116"
+        + "1ae10b594f09e26a7e902ecbd0600691");
+});
+
+test.start("crypto.chacha20Poly1305Open reverses it", void () -> {
+    byte[] sealed = crypto.chacha20Poly1305Seal(unhexB(aeadKey), unhexB(aeadNonce),
+        toB(aeadPlain), unhexB(aeadAad));
+    byte[] opened = crypto.chacha20Poly1305Open(unhexB(aeadKey), unhexB(aeadNonce),
+        sealed, unhexB(aeadAad));
+    test.expectString(string.fromByteArray(opened), aeadPlain);
+
+    // The two pad16 edges: the MAC input is nothing but the length block.
+    byte[] none = toB("");
+    byte[] sealedEmpty = crypto.chacha20Poly1305Seal(unhexB(aeadKey), unhexB(aeadNonce), none, none);
+    test.expectInt(sealedEmpty.length, 16);
+    byte[] openedEmpty = crypto.chacha20Poly1305Open(unhexB(aeadKey), unhexB(aeadNonce),
+        sealedEmpty, none);
+    test.expectInt(openedEmpty.length, 0);
+
+    // A plaintext spanning several ChaCha blocks, so the counter increments.
+    byte[] long = repeatByte(65, 200);
+    byte[] sealedLong = crypto.chacha20Poly1305Seal(unhexB(aeadKey), unhexB(aeadNonce), long, none);
+    test.expectInt(sealedLong.length, 216);
+    byte[] openedLong = crypto.chacha20Poly1305Open(unhexB(aeadKey), unhexB(aeadNonce),
+        sealedLong, none);
+    test.expectString(hex(openedLong), hex(long));
+});
+
+test.start("crypto.chacha20Poly1305Open matches RFC 8439 A.5", void () -> {
+    // A nonce with a non-zero first word, and a ciphertext spanning blocks.
+    byte[] plain = crypto.chacha20Poly1305Open(
+        unhexB("1c9240a5eb55d38af333888604f6b5f0473917c1402b80099dca5cbc207075c0"),
+        unhexB("000000000102030405060708"),
+        unhexB(
+            "64a0861575861af460f062c79be643bd5e805cfd345cf389f108670ac76c8cb2"
+            + "4c6cfc18755d43eea09ee94e382d26b0bdb7b73c321b0100d4f03b7f355894cf"
+            + "332f830e710b97ce98c8a84abd0b948114ad176e008d33bd60f982b1ff37c855"
+            + "9797a06ef4f0ef61c186324e2b3506383606907b6a7c02b0f9f6157b53c867e4"
+            + "b9166c767b804d46a59b5216cde7a4e99040c5a40433225ee282a1b0a06c523e"
+            + "af4534d7f83fa1155b0047718cbc546a0d072b04b3564eea1b422273f548271a"
+            + "0bb2316053fa76991955ebd63159434ecebb4e466dae5a1073a6727627097a10"
+            + "49e617d91d361094fa68f0ff77987130305beaba2eda04df997b714d6c6f2c29"
+            + "a6ad5cb4022b02709b"
+            + "eead9d67890cbb22392336fea1851f38"),
+        unhexB("f33388860000000000004e91"));
+    String text = string.fromByteArray(plain);
+    test.assert(string.contains(text, "Internet-Drafts are draft documents"),
+        "RFC 8439 A.5 decrypted to something else: " + text);
+});
+
+test.start("crypto.chacha20Poly1305Open rejects every forgery", void () -> {
+    byte[] key = unhexB(aeadKey);
+    byte[] nonce = unhexB(aeadNonce);
+    byte[] aad = unhexB(aeadAad);
+    byte[] sealed = crypto.chacha20Poly1305Seal(key, nonce, toB(aeadPlain), aad);
+
+    // One bit flipped at every position of the ciphertext and the tag. A broken
+    // tag comparison passes every other test in this file.
+    int i = 0;
+    while (i < sealed.length) {
+        byte[] forged = array.copy(sealed);
+        forged[i] = (forged[i] ^ 1) as byte;
+        byte[] out = crypto.chacha20Poly1305Open(key, nonce, forged, aad) catch e {
+            test.assert(e.code == crypto.ErrorCode.AUTHENTICATION,
+                "wrong code for a forgery at byte " + string.from(i) + ": " + e.message);
+            i = i + 1;
+            continue;
+        };
+        test.assert(false, "a bit flip at byte " + string.from(i) + " was accepted");
+        i = i + 1;
+    }
+
+    // Changed aad, wrong nonce, short input: each fails like a flipped bit.
+    byte[] otherAad = array.copy(aad);
+    otherAad[0] = (otherAad[0] ^ 128) as byte;
+    byte[] r1 = crypto.chacha20Poly1305Open(key, nonce, sealed, otherAad) catch e {
+        test.expectInt(e.code, crypto.ErrorCode.AUTHENTICATION);
+        byte[] otherNonce = array.copy(nonce);
+        otherNonce[0] = (otherNonce[0] ^ 1) as byte;
+        byte[] r2 = crypto.chacha20Poly1305Open(key, otherNonce, sealed, aad) catch e2 {
+            test.expectInt(e2.code, crypto.ErrorCode.AUTHENTICATION);
+            // Input shorter than a tag reads as a failed authentication and
+            // not as a length error. An attacker must not learn how a forgery
+            // failed.
+            byte[] r3 = crypto.chacha20Poly1305Open(key, nonce, toB("abc"), aad) catch e3 {
+                test.expectInt(e3.code, crypto.ErrorCode.AUTHENTICATION);
+                return;
+            };
+            test.assert(false, "a ciphertext shorter than the tag was accepted");
+            return;
+        };
+        test.assert(false, "a wrong nonce was accepted");
+        return;
+    };
+    test.assert(false, "modified additional data was accepted");
+});
+
+// ---- X25519 (RFC 7748) ----
+
+test.start("crypto.x25519 matches RFC 7748 §5.2", void () -> {
+    test.expectString(hex(crypto.x25519SharedSecret(
+        unhexB("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"),
+        unhexB("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c"))),
+        "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552");
+    // The high bit of this u-coordinate is set, and §5 requires masking it.
+    // Unmasked, the value is outside what fiat's from_bytes is proven for.
+    test.expectString(hex(crypto.x25519SharedSecret(
+        unhexB("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d"),
+        unhexB("e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493"))),
+        "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957");
+});
+
+test.start("crypto.x25519 matches the RFC 7748 iterated vectors", void () -> {
+    // A thousand iterations catch a ladder wrong only in a rare carry: one
+    // wrong bit changes every answer after it.
+    byte[] k = unhexB("0900000000000000000000000000000000000000000000000000000000000000");
+    byte[] u = array.copy(k);
+    int i = 0;
+    while (i < 1000) {
+        byte[] next = crypto.x25519SharedSecret(k, u);
+        u = k;
+        k = next;
+        if (i == 0) {
+            test.expectString(hex(k),
+                "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
+        }
+        i = i + 1;
+    }
+    test.expectString(hex(k),
+        "684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51");
+});
+
+test.start("crypto.x25519 does a Diffie-Hellman (RFC 7748 §6.1)", void () -> {
+    byte[] alicePriv = unhexB("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+    byte[] bobPriv = unhexB("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+    byte[] alicePub = crypto.x25519PublicKey(alicePriv);
+    byte[] bobPub = crypto.x25519PublicKey(bobPriv);
+    test.expectString(hex(alicePub),
+        "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+    test.expectString(hex(bobPub),
+        "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+    String want = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742";
+    test.expectString(hex(crypto.x25519SharedSecret(alicePriv, bobPub)), want);
+    test.expectString(hex(crypto.x25519SharedSecret(bobPriv, alicePub)), want);
+
+    byte[] p1 = crypto.randomBytes(32);
+    byte[] p2 = crypto.randomBytes(32);
+    test.expectString(hex(crypto.x25519SharedSecret(p1, crypto.x25519PublicKey(p2))),
+        hex(crypto.x25519SharedSecret(p2, crypto.x25519PublicKey(p1))));
+});
+
+test.start("crypto.x25519SharedSecret rejects every small-order point", void () -> {
+    // The seven u-coordinates whose order divides 8. A peer sending one makes
+    // the shared secret a constant it chose, which both sides agree on without
+    // either private key. RFC 8446 §7.4.2 requires an abort. The function is
+    // fallible, so a caller cannot ignore the abort.
+    String[] small = [
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+        "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+        "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    ];
+    byte[] priv = unhexB("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+    forEach(small, u) {
+        byte[] out = crypto.x25519SharedSecret(priv, unhexB(u)) catch e {
+            test.assert(e.code == crypto.ErrorCode.INVALID,
+                "wrong code for the small-order point " + u + ": " + e.message);
+            continue;
+        };
+        test.assert(false, "the small-order point " + u + " was accepted");
+    }
+});
+
+// Runs a verification that must refuse its arguments with INVALID. An unusable
+// key and a signature that does not verify are different answers.
+void expectInvalid(String what, Function()<void!> call) {
+    call() catch e {
+        test.assert(e.code == crypto.ErrorCode.INVALID,
+            what + " gave code " + string.from(e.code) + ", not INVALID: " + e.message);
+        return;
+    };
+    test.assert(false, what + " was accepted");
+}
+
+// ---- RSA signature verification (RFC 8017) ----
+//
+// Wycheproof's corpus, frozen into tests/golden/rsa_wycheproof_cases.txt: 884
+// cases over seven public keys, 87 of which must verify. The rejects are the
+// known padding-forgery families. They include the Bleichenbacher '06
+// low-exponent forgery, so three keys have e = 3. Encode-then-compare refuses
+// all of them: the expected block is built from the digest and compared whole,
+// so no parser can accept a forged block. Wycheproof's only "acceptable"
+// verdict, a DigestInfo without the NULL parameters, is recorded as a reject.
+
+type RsaKey {
+    String scheme;
+    String hash;
+    int exponent;
+    byte[] modulus;
+}
+
+type RsaCase {
+    int key;
+    bool accept;
+    byte[] digest;
+    byte[] signature;
+    String comment;
+}
+
+test.start("crypto RSA verification agrees with Wycheproof", void () -> {
+    RsaKey[] keys = [];
+    RsaCase[] cases = [];
+    forEach(string.split(repo.readText("tests/golden/rsa_wycheproof_cases.txt"), "\n"), line) {
+        if (string.length(line) == 0 || line[0] == 35) {    // '#'
+            continue;
+        }
+        String[] f = string.split(line, " ");
+        if (f[0] == "K") {
+            if (f.length != 6) {
+                return Error("malformed golden key line: " + line);
+            }
+            RsaKey k = {
+                scheme: f[2],
+                hash: f[3],
+                exponent: string.toInt(f[4]),
+                modulus: unhexB(f[5]),
+            };
+            array.push(keys, k);
+            continue;
+        }
+        if (f.length < 5) {
+            return Error("malformed golden case line: " + line);
+        }
+        RsaCase c = {
+            key: string.toInt(f[1]),
+            accept: f[2] == "1",
+            digest: unhexB(f[3]),
+            signature: unhexB(f[4]),
+            comment: f[5],
+        };
+        array.push(cases, c);
+    }
+    test.assert(keys.length == 7,
+        "the corpus has " + string.from(keys.length) + " keys, not 7");
+    test.assert(cases.length > 800,
+        "the corpus has shrunk to " + string.from(cases.length) + " cases");
+
+    int accepted = 0;
+    forEach(cases, c) {
+        RsaKey k = keys[c.key];
+        bool ok = true;
+        if (k.scheme == "pss") {
+            crypto.rsaVerifyPss(k.modulus, k.exponent, k.hash, c.digest, c.signature)
+            catch e { ok = false; };
+        } else {
+            crypto.rsaVerifyPkcs1v15(k.modulus, k.exponent, k.hash, c.digest, c.signature)
+            catch e { ok = false; };
+        }
+        if (ok) {
+            accepted = accepted + 1;
+        }
+        if (ok != c.accept) {
+            String verb = "accepted";
+            if (c.accept) {
+                verb = "rejected";
+            }
+            return Error(k.scheme + "/" + k.hash + " key " + string.from(c.key)
+                + ": wrongly " + verb + " -- " + c.comment);
+        }
+    }
+    // A verifier stuck at "no" passes every rejection above, so the accepted
+    // count is asserted too.
+    test.expectInt(accepted, 87);
+});
+
+// The arguments a caller can get wrong. Each is INVALID rather than
+// AUTHENTICATION: X.509 code reports an unusable key as a broken certificate
+// and a failed signature as an untrusted one.
+test.start("crypto RSA verification rejects unusable keys and signatures", void () -> {
+    // A real 2048-bit key and one signature it made, from OpenSSL 3.6.3.
+    byte[] n = unhexB(
+        "ed58cd0ba3175b093170ecb84805ba63c5656f56a5e093f18b4a6f278d9273f3"
+        + "f33d46bdde8f6e62d55369ca316d0a6428c87f376355c3d7e9f7c1330e072a40"
+        + "bc82235aa70c7f213ba9e520b2577a6179692c1170d465d57d2211a0c167f77d"
+        + "26b93f3cd563e9b8f6badccbffe7acd4dd27139be8c3924f4f5f4a68482a9f148"
+        + "fc7e95bbff56a9ac7c71f77ba43e0f22589a4fc16c3dfd9f41f72845d4655fc8a"
+        + "5ac348571b42a48a7d641f38c6b277423ae28d85efd9ef09d0f474a2f95957054"
+        + "6bad42b606a39b72bd40aa986bc402da0f1771a4a66bdf29e1ceebdf6d326e11f"
+        + "09821a6acca22c03bb999103f79bcf5dcd62a2b7c3f40fdb293cfb1bff3d");
+    byte[] digest = unhexB(
+        "482f5182dc45f34cb6045e82a77eb2ba43076237d9d14c21797addca58ce2801");
+    byte[] sig = unhexB(
+        "87e48d8a6c76e44d312c13d874ddb32354198b99726622c5f5525c51c7e4d572"
+        + "8f9fb43df3824fc3496ecadc59f1560477be9312ce78906ab26f5337221fd1b7"
+        + "408bebf9b1d8a9afd530ffbd559e33cee57ceeb398fbc8c8dcf4328135742397"
+        + "166a4846375bed781992e388a5a4d73763599ec1f55410b617eae884d7a2f4b1"
+        + "bd455629fe396f2c1822ed48b841ad14df3c56be102e1a390481caf5f7835a0d"
+        + "20b588b1bd1de4b02c576c6327a6bd750a230bcf149b8d2f4db9fed238014acf"
+        + "212344d25145ea13f742db81e4525be173dd8c922d81c8e7ffa37ef7a0b2b0bf"
+        + "dc98cb9fc4267ad7c59921f127920319685d2fe631eeb0429536167c10ac596d");
+
+    // The control: it verifies as it stands, so each case below bends one thing.
+    crypto.rsaVerifyPkcs1v15(n, 65537, "sha256", digest, sig);
+
+    // An even modulus is not an RSA modulus. 512 bits was factorable in 1999.
+    byte[] even = array.copy(n);
+    even[even.length - 1] = 0;
+    expectInvalid("an even modulus", void () -> {
+        crypto.rsaVerifyPkcs1v15(even, 65537, "sha256", digest, sig);
+    });
+    expectInvalid("a 512-bit modulus", void () -> {
+        crypto.rsaVerifyPkcs1v15(array.slice(n, 0, 64), 65537, "sha256", digest,
+            array.slice(sig, 0, 64));
+    });
+    // An even exponent has no inverse mod lambda(n), so it is not an RSA
+    // exponent. 1 and 2 are the degenerate ones an attacker wants.
+    expectInvalid("exponent 1", void () -> {
+        crypto.rsaVerifyPkcs1v15(n, 1, "sha256", digest, sig);
+    });
+    expectInvalid("exponent 2", void () -> {
+        crypto.rsaVerifyPkcs1v15(n, 2, "sha256", digest, sig);
+    });
+    expectInvalid("exponent 4", void () -> {
+        crypto.rsaVerifyPkcs1v15(n, 4, "sha256", digest, sig);
+    });
+    // A hash name this module does not implement, sha1 and md5 included, is an
+    // error rather than a silent fallback.
+    expectInvalid("hash \"sha1\"", void () -> {
+        crypto.rsaVerifyPkcs1v15(n, 65537, "sha1", digest, sig);
+    });
+    expectInvalid("hash \"md5\"", void () -> {
+        crypto.rsaVerifyPkcs1v15(n, 65537, "md5", digest, sig);
+    });
+    expectInvalid("hash \"SHA256\"", void () -> {
+        crypto.rsaVerifyPkcs1v15(n, 65537, "SHA256", digest, sig);
+    });
+    // A digest of the wrong length for the named hash is a caller mistake, and
+    // a verifier reading past the end would turn it into a bug.
+    expectInvalid("a 31-byte digest", void () -> {
+        crypto.rsaVerifyPkcs1v15(n, 65537, "sha256", array.slice(digest, 0, 31), sig);
+    });
+    expectInvalid("a sha256 digest under sha384", void () -> {
+        crypto.rsaVerifyPkcs1v15(n, 65537, "sha384", digest, sig);
+    });
+    // A signature is an integer mod n written in as many bytes as n.
+    expectInvalid("a signature one byte short", void () -> {
+        crypto.rsaVerifyPkcs1v15(n, 65537, "sha256", digest, array.slice(sig, 0, 255));
+    });
+    expectInvalid("an empty signature", void () -> {
+        byte[] none = [];
+        crypto.rsaVerifyPkcs1v15(n, 65537, "sha256", digest, none);
+    });
+    // s >= n reduces to a second representative of the same class, which is a
+    // forgery for free.
+    expectInvalid("a signature equal to the modulus", void () -> {
+        crypto.rsaVerifyPkcs1v15(n, 65537, "sha256", digest, n);
+    });
+
+    // A bad signature is not a caller mistake, and reads as AUTHENTICATION.
+    byte[] flipped = array.copy(sig);
+    flipped[200] = (flipped[200] ^ 1) as byte;
+    crypto.rsaVerifyPkcs1v15(n, 65537, "sha256", digest, flipped) catch e {
+        test.assert(e.code == crypto.ErrorCode.AUTHENTICATION,
+            "a flipped signature bit gave code " + string.from(e.code));
+        return;
+    };
+    test.assert(false, "a flipped signature bit verified");
+});
+
+// ---------------------------------------------------------------------------
+// ECDSA verification (§6.17)
+// ---------------------------------------------------------------------------
+
+// Wycheproof's ECDSA vectors, frozen into
+// tests/golden/ecdsa_wycheproof_cases.txt: 988 cases over P-256/SHA-256 and
+// P-384/SHA-384, of which 368 must verify. The signatures are DER, so each case
+// runs the pipeline a certificate signature does, x509.parseEcdsaSignature then
+// crypto.ecdsaVerify, and either stage may refuse it. Wycheproof v1 has no
+// "acceptable" verdict, so agreement here is exact.
+test.start("crypto ECDSA verification agrees with Wycheproof", void () -> {
+    int cases = 0;
+    int accepted = 0;
+    forEach(string.split(repo.readText("tests/golden/ecdsa_wycheproof_cases.txt"), "\n"), line) {
+
+        if (string.length(line) == 0 || line[0] == 35) {    // '#'
+            continue;
+        }
+        String[] f = string.split(line, " ");
+        if (f.length != 6) {
+            return Error("malformed golden case line: " + line);
+        }
+        byte[] pub = unhexB(f[2]);
+        byte[] msg = [];
+        if (f[3] != "-") {
+            msg = unhexB(f[3]);
+        }
+        byte[] sig = [];
+        if (f[4] != "-") {
+            sig = unhexB(f[4]);
+        }
+        byte[] digest = crypto.sha256(msg);
+        if (f[1] == "sha384") {
+            digest = crypto.sha384(msg);
+        }
+
+        bool ok = false;
+        x509.EcdsaSignature? parsed = x509.parseEcdsaSignature(sig) catch null;
+        if (parsed != null) {
+            bool verified = true;
+            crypto.ecdsaVerify(f[0], pub, digest, parsed.r, parsed.s) catch e {
+                verified = false;
+            };
+            ok = verified;
+        }
+        cases = cases + 1;
+        if (ok) {
+            accepted = accepted + 1;
+        }
+        if (ok != (f[5] == "valid")) {
+            String verb = "accepted";
+            if (f[5] == "valid") {
+                verb = "rejected";
+            }
+            return Error(f[0] + " case " + string.from(cases) + " wrongly " + verb
+                + ": sig " + f[4]);
+        }
+    }
+    test.expectInt(cases, 988);
+    // A verifier stuck at "no" passes every rejection above, so the accepted
+    // count is asserted too.
+    test.expectInt(accepted, 368);
+});
+
+// The caller-mistake table for ECDSA. The key and signature are a frozen
+// known-good pair, so each case below bends one thing.
+test.start("crypto ECDSA verification rejects unusable keys and signatures", void () -> {
+    byte[] pub = unhexB(
+        "04885d49385cf60613cfcdf30d0bca75d32b5a77f5fc488585c7d7f82f431486"
+        + "c52e095fcebb13ec152e08080e1d994eba8a89e00b2053461e3c54e9cd700de8"
+        + "95");
+    byte[] digest = unhexB(
+        "343b425681a3331a59f01bb7f79495d39c0f1d32b3b884d9558dee78e1b7054e");
+    byte[] r = unhexB(
+        "64b33938d2053b7706ff03def9dbb1b606e76ef5027083694321a4be4a6172a4");
+    byte[] s = unhexB(
+        "a2d8f9a984be5e57f7120af1ccec9b443399c96b8e2aa026819a234d646b2e14");
+    byte[] order = unhexB(
+        "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551");
+
+    // The control: the pair verifies, so each case below bends one thing.
+    crypto.ecdsaVerify("p256", pub, digest, r, s) catch e {
+        return Error("the known-good signature failed: " + e.message);
+    };
+
+    expectInvalid("an unknown curve name", void () -> {
+        crypto.ecdsaVerify("p521", pub, digest, r, s);
+    });
+    expectInvalid("the wrong curve for the key", void () -> {
+        crypto.ecdsaVerify("p384", pub, digest, r, s);
+    });
+    // Only the uncompressed SEC 1 form is accepted. A compressed point is
+    // refused, not decompressed.
+    expectInvalid("a compressed point", void () -> {
+        byte[] compressed = array.slice(pub, 0, 33);
+        compressed[0] = 3;
+        crypto.ecdsaVerify("p256", compressed, digest, r, s);
+    });
+    expectInvalid("a point not on the curve", void () -> {
+        byte[] off = array.copy(pub);
+        off[64] = (off[64] ^ 1) as byte;
+        crypto.ecdsaVerify("p256", off, digest, r, s);
+    });
+    expectInvalid("r = 0", void () -> {
+        byte[] zero = [0];
+        crypto.ecdsaVerify("p256", pub, digest, zero, s);
+    });
+    expectInvalid("s = 0", void () -> {
+        byte[] zero = [0];
+        crypto.ecdsaVerify("p256", pub, digest, r, zero);
+    });
+    expectInvalid("r = n", void () -> {
+        crypto.ecdsaVerify("p256", pub, digest, order, s);
+    });
+    expectInvalid("an oversized r", void () -> {
+        crypto.ecdsaVerify("p256", pub, digest, pub, s);
+    });
+
+    // A wrong digest is not a caller mistake, and reads as AUTHENTICATION.
+    byte[] wrong = array.copy(digest);
+    wrong[0] = (wrong[0] ^ 1) as byte;
+    crypto.ecdsaVerify("p256", pub, wrong, r, s) catch e {
+        test.assert(e.code == crypto.ErrorCode.AUTHENTICATION,
+            "a wrong digest gave code " + string.from(e.code));
+        return;
+    };
+    test.assert(false, "a wrong digest verified");
+});
+
+// ---------------------------------------------------------------------------
+// AES-128-GCM (§6.17)
+// ---------------------------------------------------------------------------
+
+// This cipher exists only where the CPU can run it in constant time. Without
+// the AES instructions both functions fail and there is no software fallback:
+// table-based AES is indexed by key-derived bytes, which is a cache-timing
+// oracle. The vectors below run only where the hardware is.
+test.start("crypto AES-128-GCM matches its frozen vectors", void () -> {
+    if (!crypto.aesGcmAvailable()) {
+        // This branch also tests. Both halves must fail as INVALID and not as
+        // a forgery, so a caller can tell "cannot" from "did not verify".
+        byte[] k = unhexB("00000000000000000000000000000000");
+        byte[] iv = unhexB("000000000000000000000000");
+        byte[] empty = [];
+        expectInvalid("seal without AES instructions", void () -> {
+            crypto.aes128GcmSeal(k, iv, empty, empty);
+        });
+        expectInvalid("open without AES instructions", void () -> {
+            crypto.aes128GcmOpen(k, iv, empty, empty);
+        });
+        return;
+    }
+
+    int sealed = 0;
+    int refused = 0;
+    forEach(string.split(repo.readText("tests/golden/aes_gcm_cases.txt"), "\n"), line) {
+        if (string.length(line) == 0 || line[0] == 35) {    // '#'
+            continue;
+        }
+        String[] f = string.split(line, " ");
+        if (f.length != 8) {
+            return Error("malformed golden case line: " + line);
+        }
+        bool valid = f[1] == "valid";
+        byte[] key = unhexB(f[2]);
+        byte[] iv = unhexB(f[3]);
+        byte[] aad = [];
+        if (f[4] != "-") { aad = unhexB(f[4]); }
+        byte[] msg = [];
+        if (f[5] != "-") { msg = unhexB(f[5]); }
+        byte[] ct = [];
+        if (f[6] != "-") { ct = unhexB(f[6]); }
+        byte[] tag = unhexB(f[7]);
+
+        // The wire form this module uses: ciphertext, then the tag.
+        byte[] joined = array.copy(ct);
+        forEach(tag, b) { array.push(joined, b); }
+
+        byte[]? opened = crypto.aes128GcmOpen(key, iv, joined, aad) catch null;
+        if (valid != (opened != null)) {
+            String verb = "accepted";
+            if (valid) { verb = "rejected"; }
+            return Error(f[0] + " case wrongly " + verb + ": tag " + f[7]);
+        }
+        if (opened == null) {
+            refused = refused + 1;
+            continue;
+        }
+        if (crypto.hexEncode(opened) != crypto.hexEncode(msg)) {
+            return Error(f[0] + " case opened to the wrong plaintext");
+        }
+        // A valid case must seal back to those bytes too: open alone passes an
+        // implementation that agrees with itself and nothing else.
+        byte[] again = crypto.aes128GcmSeal(key, iv, msg, aad);
+        if (crypto.hexEncode(again) != crypto.hexEncode(joined)) {
+            return Error(f[0] + " case sealed to different bytes than the vector");
+        }
+        sealed = sealed + 1;
+    }
+    test.expectInt(sealed, 481);
+    test.expectInt(refused, 27);
+});
+
+test.start("crypto AES-128-GCM rejects what it must reject", void () -> {
+    if (!crypto.aesGcmAvailable()) {
+        return;
+    }
+    byte[] key = unhexB("feffe9928665731c6d6a8f9467308308");
+    byte[] iv = unhexB("cafebabefacedbaddecaf888");
+    byte[] pt = unhexB("d9313225f88406e5a55909c5aff5269a");
+    byte[] aad = unhexB("feedfacedeadbeef");
+    byte[] sealed = crypto.aes128GcmSeal(key, iv, pt, aad);
+
+    // Each is a forgery and must read as one. An attacker probing a decryption
+    // oracle learns from any difference between the failures.
+    forEach([0, 8, 15, 16, 24, 31], at) {
+        byte[] bent = array.copy(sealed);
+        bent[at] = (bent[at] ^ 1) as byte;
+        crypto.aes128GcmOpen(key, iv, bent, aad) catch e {
+            test.assert(e.code == crypto.ErrorCode.AUTHENTICATION,
+                "a flipped byte at " + string.from(at) + " gave code "
+                + string.from(e.code));
+            return;
+        };
+        return Error("a flipped byte at " + string.from(at) + " verified");
+    }
+
+    // The aad is authenticated but not encrypted, so changing it fails like
+    // changing the ciphertext.
+    byte[] otherAad = unhexB("feedfacedeadbeee");
+    crypto.aes128GcmOpen(key, iv, sealed, otherAad) catch e {
+        test.assert(e.code == crypto.ErrorCode.AUTHENTICATION,
+            "altered aad gave code " + string.from(e.code));
+    };
+    // The nonce does the same. This makes a replayed TLS record fail at the
+    // wrong sequence number.
+    byte[] otherIv = unhexB("cafebabefacedbaddecaf889");
+    crypto.aes128GcmOpen(key, otherIv, sealed, aad) catch e {
+        test.assert(e.code == crypto.ErrorCode.AUTHENTICATION,
+            "altered nonce gave code " + string.from(e.code));
+    };
+    // Input too short to hold a tag reads as a forgery and not as a length
+    // error, for the same oracle reason.
+    byte[] stub = array.slice(sealed, 0, 8);
+    crypto.aes128GcmOpen(key, iv, stub, aad) catch e {
+        test.assert(e.code == crypto.ErrorCode.AUTHENTICATION,
+            "a truncated message gave code " + string.from(e.code));
+        return;
+    };
+    test.assert(false, "a message too short to hold a tag was accepted");
+});

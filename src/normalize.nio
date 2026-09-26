@@ -1,0 +1,641 @@
+// Await normalization: the pre-pass that makes the state-machine transform
+// tractable. An async body suspends by returning out of its step function and
+// re-entering through a dispatch switch, so no SSA value can live across an
+// await. This pass rewrites each async function body so that every await sits
+// alone at statement level:
+//
+//	int x = g() + await f;   =>   int t0 = g();
+//	                              Future<int> t1 = f;   (operands hoisted
+//	                              int t2 = await t1;     in evaluation order)
+//	                              int x = t0 + t2;
+//
+// Everything evaluated before a suspension goes into a generated temporary
+// declaration, which codegen puts in the heap frame. The rewrite is
+// conservative: an expression holding an await anywhere hoists every
+// non-literal operand before it too, which keeps the left-to-right evaluation
+// order. A FuncLit body is left alone, because its awaits belong to that
+// (non-async) function.
+//
+// The pass mutates expression nodes in place, so the checker's per-node
+// annotations stay valid. It builds nodes, so it must stamp an id on everything
+// it makes.
+import 'ast';
+import 'checker';
+import 'types';
+import 'token';
+import 'module';
+import 'string';
+import 'lib/str';
+import 'array';
+
+// tempPrefix cannot equal a user identifier, because '.' is not an identifier
+// character in the language.
+String const tempPrefix = "await.";
+
+type Norm {
+    checker.Info info;
+    int n;
+
+    ast.Identifier ident(String name, types.Type t) {
+        ast.Identifier id = { id: ast.newID(), tok: blankTok(), name: name };
+        self.info.types[id.id] = t;
+        return id;
+    }
+
+    // Moves val into a new temporary declaration, appends it to pre, and
+    // returns a reference to the temporary. The declaration carries no written
+    // type, because codegen reads declTypes only.
+    ast.Expression tempDecl(ast.Expression val, ast.Statement[] pre) {
+        types.Type t = types.InvalidT;
+        types.Type? vt = self.info.types[val.id];
+        if (vt != null) {
+            t = vt;
+        }
+        String name = tempPrefix + string.from(self.n);
+        self.n++;
+        ast.VarDeclStatement decl = {
+            id: ast.newID(), tok: blankTok(), type: blankType(), name: name,
+            nameTok: blankTok(), value: val, exported: false, const: false,
+        };
+        self.info.declTypes[decl.id] = t;
+        array.push(pre, decl);
+        return self.ident(name, t);
+    }
+
+    // hoistVal normalizes e and puts its value in a temporary, unless e is a
+    // literal or already a temporary. The operands that run before an await
+    // must survive the suspension.
+    ast.Expression hoistVal(ast.Expression e, ast.Statement[] pre) {
+        ast.Expression v = self.expr(e, pre);
+        if (isLiteral(v)) {
+            return v;
+        }
+        ast.Identifier? id = v as ast.Identifier;
+        if (id != null && str.hasPrefix(id.name, tempPrefix)) {
+            return v;
+        }
+        return self.tempDecl(v, pre);
+    }
+
+    // moduleAliasObject tells whether e names a module: an import alias or a
+    // namespace in a built-in module, such as `time.date`. Such a name is not a
+    // value, so it cannot move into a temporary.
+    bool moduleAliasObject(ast.Expression e) {
+        if (self.info.builtinNamespace(e) != null) {
+            return true;
+        }
+        ast.Identifier? id = e as ast.Identifier;
+        if (id == null) {
+            return false;
+        }
+        return self.info.moduleAliases[id.name] != null;
+    }
+
+    // expr normalizes e and moves every await in it into pre. The result holds
+    // no await.
+    ast.Expression expr(ast.Expression e, ast.Statement[] pre) {
+        if (!containsAwait(e)) {
+            return e;
+        }
+        switch (e) {
+            case ast.AwaitExpr aw:
+                aw.value = self.expr(aw.value, pre);
+                return self.tempDecl(aw, pre);    // T tN = await f; is the only await form
+            case ast.PrefixExpression p:
+                p.right = self.expr(p.right, pre);
+                return p;
+            case ast.InfixExpression ie:
+                if (ie.operator == "&&" || ie.operator == "||") {
+                    return self.shortCircuit(ie, pre);
+                }
+                if (containsAwait(ie.right)) {
+                    ie.left = self.hoistVal(ie.left, pre);
+                } else {
+                    ie.left = self.expr(ie.left, pre);
+                }
+                ie.right = self.expr(ie.right, pre);
+                return ie;
+            case ast.IndexExpression ix:
+                if (containsAwait(ix.index)) {
+                    ix.left = self.hoistVal(ix.left, pre);
+                } else {
+                    ix.left = self.expr(ix.left, pre);
+                }
+                ix.index = self.expr(ix.index, pre);
+                return ix;
+            case ast.MemberExpression m:
+                m.object = self.expr(m.object, pre);
+                return m;
+            case ast.CallExpression call:
+                self.call(call, pre);
+                return call;
+            case ast.ArrayLiteral al:
+                forEach(al.elements, el, i) {
+                    if (awaitAfter(al.elements, i)) {
+                        al.elements[i] = self.hoistVal(el, pre);
+                    } else {
+                        al.elements[i] = self.expr(el, pre);
+                    }
+                }
+                return al;
+            case ast.RecordLiteral rl:
+                forEach(rl.fields, f, i2) {
+                    bool later = false;
+                    forEach(rl.fields, f2, j) {
+                        if (j > i2 && containsAwait(f2.value)) {
+                            later = true;
+                        }
+                    }
+                    if (later) {
+                        f.value = self.hoistVal(f.value, pre);
+                    } else {
+                        f.value = self.expr(f.value, pre);
+                    }
+                }
+                return rl;
+            case ast.MapLiteral ml:
+                forEach(ml.entries, en, i3) {
+                    bool later2 = false;
+                    forEach(ml.entries, en2, j2) {
+                        if (j2 > i3 && containsAwait(en2.value)) {
+                            later2 = true;
+                        }
+                    }
+                    if (later2) {
+                        en.value = self.hoistVal(en.value, pre);
+                    } else {
+                        en.value = self.expr(en.value, pre);
+                    }
+                }
+                return ml;
+            default:
+                return e;
+        }
+    }
+
+    // call normalizes a call in place. A bare name and a function of a module
+    // are not evaluated values and stay in place. Every other callee runs
+    // before the arguments, so it moves into a temporary when an argument
+    // suspends.
+    void call(ast.CallExpression ex, ast.Statement[] pre) {
+        bool argAwait = false;
+        forEach(ex.args, a) {
+            if (containsAwait(a)) {
+                argAwait = true;
+            }
+        }
+        ast.Identifier? nameCallee = ex.callee as ast.Identifier;
+        ast.MemberExpression? memCallee = ex.callee as ast.MemberExpression;
+        if (nameCallee != null) {
+            // A name. The call is direct, so nothing is evaluated early.
+            argAwait = argAwait;
+        } else if (memCallee != null) {
+            if (self.moduleAliasObject(memCallee.object)) {
+                // alias.fn names a function of a module and not a value.
+                argAwait = argAwait;
+            } else if (self.info.methodCalls[ex.id] != null) {
+                // A method call names a symbol and not a value. There is no
+                // method value to hold across a suspension, so the receiver
+                // hoists in place of the callee.
+                if (argAwait) {
+                    memCallee.object = self.hoistVal(memCallee.object, pre);
+                } else {
+                    memCallee.object = self.expr(memCallee.object, pre);
+                }
+            } else if (argAwait) {
+                ex.callee = self.hoistVal(memCallee, pre);    // the function value itself
+            } else {
+                memCallee.object = self.expr(memCallee.object, pre);
+            }
+        } else if (argAwait) {
+            ex.callee = self.hoistVal(ex.callee, pre);
+        } else {
+            ex.callee = self.expr(ex.callee, pre);
+        }
+        forEach(ex.args, a2, i) {
+            if (awaitAfter(ex.args, i)) {
+                ex.args[i] = self.hoistVal(a2, pre);
+            } else {
+                ex.args[i] = self.expr(a2, pre);
+            }
+        }
+    }
+
+    // shortCircuit rewrites `L && R` and `L || R` that hold an await in R into
+    // statements that keep the short circuit:
+    //
+    //	bool t = L;  if (t)  { t = R; }   // &&
+    //	bool t = L;  if (!t) { t = R; }   // ||
+    ast.Expression shortCircuit(ast.InfixExpression ex, ast.Statement[] pre) {
+        ast.Expression left = self.expr(ex.left, pre);
+        String name = tempPrefix + string.from(self.n);
+        self.n++;
+        ast.VarDeclStatement decl = {
+            id: ast.newID(), tok: blankTok(), type: blankType(), name: name,
+            nameTok: blankTok(), value: left, exported: false, const: false,
+        };
+        self.info.declTypes[decl.id] = types.BoolT;
+        array.push(pre, decl);
+
+        ast.Expression cond = self.ident(name, types.BoolT);
+        if (ex.operator == "||") {
+            ast.PrefixExpression not = {
+                id: ast.newID(), tok: blankTok(), operator: "!", right: cond,
+            };
+            self.info.types[not.id] = types.BoolT;
+            cond = not;
+        }
+        ast.Statement[] body = [];
+        ast.Expression right = self.expr(ex.right, body);
+        ast.AssignStatement asn = {
+            id: ast.newID(), tok: blankTok(),
+            target: self.ident(name, types.BoolT), value: right,
+        };
+        array.push(body, asn);
+        ast.BlockStatement then = { id: ast.newID(), tok: blankTok(), statements: body, endLine: 0 };
+        ast.IfStatement ifs = {
+            id: ast.newID(), tok: blankTok(), cond: cond, then: then, else: null,
+        };
+        array.push(pre, ifs);
+        return self.ident(name, types.BoolT);
+    }
+
+    ast.Statement[] stmts(ast.Statement[] list) {
+        ast.Statement[] out = [];
+        forEach(list, s) {
+            self.stmt(s, out);
+        }
+        return out;
+    }
+
+    // stmt normalizes one statement and appends it, with any hoisted
+    // temporaries, to out.
+    void stmt(ast.Statement s, ast.Statement[] out) {
+        switch (s) {
+            case ast.VarDeclStatement vd:
+                ast.Expression? v = vd.value;
+                if (v != null) {
+                    vd.value = self.expr(v, out);
+                }
+                array.push(out, vd);
+            case ast.AssignStatement asn:
+                self.assignTarget(asn.target, containsAwait(asn.value), out);
+                asn.value = self.expr(asn.value, out);
+                array.push(out, asn);
+            case ast.IncDecStatement inc:
+                self.assignTarget(inc.target, false, out);
+                array.push(out, inc);
+            case ast.ReturnStatement r:
+                ast.Expression? rv = r.value;
+                if (rv != null) {
+                    r.value = self.expr(rv, out);
+                }
+                array.push(out, r);
+            case ast.ExpressionStatement es:
+                // A bare `await f;` stays as the await-statement form. Only
+                // this form reads a Future<void>.
+                ast.AwaitExpr? aw = es.expression as ast.AwaitExpr;
+                if (aw != null) {
+                    aw.value = self.expr(aw.value, out);
+                } else {
+                    es.expression = self.expr(es.expression, out);
+                }
+                array.push(out, es);
+            case ast.IfStatement ifs:
+                ifs.cond = self.expr(ifs.cond, out);    // evaluated once, before the branch
+                ifs.then.statements = self.stmts(ifs.then.statements);
+                ast.BlockStatement? els = ifs.else;
+                if (els != null) {
+                    els.statements = self.stmts(els.statements);
+                }
+                array.push(out, ifs);
+            case ast.SwitchStatement sw:
+                // Only the subject can move anything out. A case label is a
+                // constant (§4.9), so no await is in one and the dispatch
+                // stays in place.
+                sw.subject = self.expr(sw.subject, out);
+                forEach(sw.cases, cl) {
+                    cl.body.statements = self.stmts(cl.body.statements);
+                }
+                array.push(out, sw);
+            case ast.WhileStatement w:
+                if (containsAwait(w.cond)) {
+                    array.push(out, self.rewriteLoop(w.cond, w.body.statements, []));
+                } else {
+                    w.body.statements = self.stmts(w.body.statements);
+                    array.push(out, w);
+                }
+            case ast.ForStatement fo:
+                self.forStmt(fo, out);
+            case ast.ForEachStatement fe:
+                fe.array = self.expr(fe.array, out);    // evaluated once, before the loop
+                fe.body.statements = self.stmts(fe.body.statements);
+                array.push(out, fe);
+            case ast.BlockStatement blk:
+                blk.statements = self.stmts(blk.statements);
+                array.push(out, blk);
+            default:
+                array.push(out, s);
+        }
+    }
+
+    // Moves the evaluated parts of an assignment, increment or decrement
+    // target into temporaries when an await follows them. The code finds the
+    // slot again from those values after the suspension, so no pointer into an
+    // object has to survive it.
+    void assignTarget(ast.Expression target, bool valueAwaits, ast.Statement[] out) {
+        ast.IndexExpression? ix = target as ast.IndexExpression;
+        if (ix != null) {
+            if (valueAwaits || containsAwait(ix.index)) {
+                ix.left = self.hoistVal(ix.left, out);
+            } else {
+                ix.left = self.expr(ix.left, out);
+            }
+            if (valueAwaits) {
+                ix.index = self.hoistVal(ix.index, out);
+            } else {
+                ix.index = self.expr(ix.index, out);
+            }
+            return;
+        }
+        ast.MemberExpression? m = target as ast.MemberExpression;
+        if (m != null) {
+            if (self.moduleAliasObject(m.object)) {
+                return;
+            }
+            if (valueAwaits) {
+                m.object = self.hoistVal(m.object, out);
+            } else {
+                m.object = self.expr(m.object, out);
+            }
+        }
+    }
+
+    // forStmt normalizes a for loop. An await in the condition or in the post
+    // clause needs the while(temp) rewrite. An await in the body or the init
+    // clause alone leaves the shape of the loop unchanged.
+    void forStmt(ast.ForStatement st, ast.Statement[] out) {
+        bool postAwaits = false;
+        ast.Statement? post = st.post;
+        if (post != null) {
+            postAwaits = stmtAwaits(post);
+        }
+        if (!containsAwait(st.cond) && !postAwaits) {
+            ast.Statement? init = st.init;
+            if (init != null) {
+                ast.Statement[] initOut = [];
+                self.stmt(init, initOut);
+                forEach(initOut, s, i) {
+                    if (i < initOut.length - 1) {
+                        array.push(out, s);
+                    }
+                }
+                st.init = initOut[initOut.length - 1];
+            }
+            st.body.statements = self.stmts(st.body.statements);
+            if (post != null) {
+                ast.Statement[] postOut = [];
+                self.stmt(post, postOut);
+                st.post = postOut[postOut.length - 1];    // stmtAwaits found no await in post
+            }
+            array.push(out, st);
+            return;
+        }
+        // The rewritten form, in a block so that the init variable keeps its
+        // scope:
+        //   { init; <cond hoists>; bool t = C;
+        //     while (t) { body } tail { post; <cond hoists>; t = C; } }
+        ast.BlockStatement blk = { id: ast.newID(), tok: blankTok(), statements: [], endLine: 0 };
+        ast.Statement? init2 = st.init;
+        if (init2 != null) {
+            self.stmt(init2, blk.statements);
+        }
+        ast.Statement[] extra = [];
+        if (post != null) {
+            array.push(extra, post);
+        }
+        array.push(blk.statements, self.rewriteLoop(st.cond, st.body.statements, extra));
+        array.push(out, blk);
+    }
+
+    // rewriteLoop builds the while(temp) form of a loop whose condition holds
+    // an await:
+    //
+    //	<cond hoists>; bool t = C;
+    //	while (t) { body' } tail { extra'; <cond hoists>; t = C; }
+    //
+    // The hoisted statements and C are the same nodes at both points, so the
+    // condition runs again on each iteration as it does in the source. In the
+    // loop they land in the scope of the tail, where they hide the outer
+    // temporaries, and the assignment updates the outer t.
+    //
+    // They go in the tail, so `continue` stays correct: it jumps to the tail,
+    // which runs the post clause and the condition again, as the end of the
+    // body does.
+    ast.BlockStatement rewriteLoop(ast.Expression cond, ast.Statement[] body, ast.Statement[] extra) {
+        ast.Statement[] condPre = [];
+        ast.Expression c = self.expr(cond, condPre);
+        String name = tempPrefix + string.from(self.n);
+        self.n++;
+        ast.VarDeclStatement decl = {
+            id: ast.newID(), tok: blankTok(), type: blankType(), name: name,
+            nameTok: blankTok(), value: c, exported: false, const: false,
+        };
+        self.info.declTypes[decl.id] = types.BoolT;
+
+        ast.Statement[] loopBody = self.stmts(body);
+        ast.Statement[] tail = self.stmts(extra);
+        forEach(condPre, s) {
+            array.push(tail, s);
+        }
+        ast.AssignStatement bump = {
+            id: ast.newID(), tok: blankTok(),
+            target: self.ident(name, types.BoolT), value: c,
+        };
+        array.push(tail, bump);
+
+        ast.BlockStatement blk = { id: ast.newID(), tok: blankTok(), statements: [], endLine: 0 };
+        forEach(condPre, s2) {
+            array.push(blk.statements, s2);
+        }
+        array.push(blk.statements, decl);
+        ast.BlockStatement inner = { id: ast.newID(), tok: blankTok(), statements: loopBody, endLine: 0 };
+        ast.WhileStatement w = {
+            id: ast.newID(), tok: blankTok(),
+            cond: self.ident(name, types.BoolT), body: inner, tail: tail,
+        };
+        array.push(blk.statements, w);
+        return blk;
+    }
+}
+
+// blankTok is the empty token that a generated node carries. Its line is 0.
+// Coverage does not count a statement on line 0, so an async body reports no
+// more lines than the synchronous form.
+token.Token blankTok() {
+    token.Token t = { type: "", literal: "", line: 0, col: 0, note: "", quote: "", endLine: 0, endCol: 0 };
+    return t;
+}
+
+// blankType is the written type that a generated declaration carries. The field
+// is required, and codegen reads declTypes only, so it holds a name that
+// nothing resolves and nothing reads.
+ast.TypeNode blankType() {
+    ast.NamedType t = { tok: blankTok(), module: "", name: "", member: "" };
+    return t;
+}
+
+// containsAwait tells whether e itself evaluates an await. A function value
+// runs at its own call time, so its body does not count.
+export bool containsAwait(ast.Expression e) {
+    switch (e) {
+        case ast.AwaitExpr aw:
+            return true;
+        case ast.PrefixExpression p:
+            return containsAwait(p.right);
+        case ast.InfixExpression ie:
+            return containsAwait(ie.left) || containsAwait(ie.right);
+        case ast.IndexExpression ix:
+            return containsAwait(ix.left) || containsAwait(ix.index);
+        case ast.MemberExpression m:
+            return containsAwait(m.object);
+        case ast.CallExpression call:
+            if (containsAwait(call.callee)) {
+                return true;
+            }
+            return array.some(call.args, bool (ast.Expression a) -> containsAwait(a));
+        case ast.ArrayLiteral al:
+            bool inArr = false;
+            forEach(al.elements, el) {
+                if (containsAwait(el)) {
+                    inArr = true;
+                }
+            }
+            return inArr;
+        case ast.RecordLiteral rl:
+            bool inRec = false;
+            forEach(rl.fields, f) {
+                if (containsAwait(f.value)) {
+                    inRec = true;
+                }
+            }
+            return inRec;
+        case ast.MapLiteral ml:
+            // A key is a constant and can hold no await.
+            bool inMap = false;
+            forEach(ml.entries, en) {
+                if (containsAwait(en.value)) {
+                    inMap = true;
+                }
+            }
+            return inMap;
+        default:
+            return false;
+    }
+}
+
+bool isLiteral(ast.Expression e) {
+    switch (e) {
+        case ast.IntLiteral i:
+            return true;
+        case ast.FloatLiteral f:
+            return true;
+        case ast.StringLiteral s:
+            return true;
+        case ast.BoolLiteral b:
+            return true;
+        case ast.NullLiteral n:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool awaitAfter(ast.Expression[] list, int i) {
+    bool found = false;
+    forEach(list, e, j) {
+        if (j > i && containsAwait(e)) {
+            found = true;
+        }
+    }
+    return found;
+}
+
+// stmtAwaits tells whether s holds an await, which is when normalizing it moves
+// something out.
+bool stmtAwaits(ast.Statement s) {
+    switch (s) {
+        case ast.AssignStatement asn:
+            return containsAwait(asn.value) || containsAwait(asn.target);
+        case ast.IncDecStatement inc:
+            return containsAwait(inc.target);
+        case ast.ExpressionStatement es:
+            return containsAwait(es.expression);
+        default:
+            return false;
+    }
+}
+
+// homeInfo returns the type information to read a method body through: that of
+// this module, unless the body came from another module, whose import aliases
+// its names use.
+checker.Info homeInfo(module.Module m, ast.FunctionDeclStatement md, Map<String, module.Module> homes) {
+    ast.Origin? from = md.from;
+    if (from == null || from.qual == m.qual) {
+        return m.info;
+    }
+    module.Module? home = homes[from.qual];
+    if (home == null) {
+        return m.info;
+    }
+    // The tables keyed by node come from this module. The four tables keyed
+    // by name come from the home module.
+    checker.Info merged = {
+        types: m.info.types, declTypes: m.info.declTypes,
+        records: home.info.records, enums: home.info.enums,
+        enumMembers: m.info.enumMembers,
+        funcs: home.info.funcs, externs: home.info.externs, moduleAliases: home.info.moduleAliases,
+        narrowed: m.info.narrowed, lambdas: m.info.lambdas,
+        boxedVars: m.info.boxedVars, boxedParams: m.info.boxedParams,
+        boxedElems: m.info.boxedElems, boxedIndexes: m.info.boxedIndexes,
+        boxedCaseBinds: m.info.boxedCaseBinds, caseTypes: m.info.caseTypes,
+        casePayloads: m.info.casePayloads, unionWraps: m.info.unionWraps,
+        unionCtors: m.info.unionCtors, asMembers: m.info.asMembers,
+        numericAs: m.info.numericAs,
+        boxedCatches: m.info.boxedCatches, raises: m.info.raises,
+        catches: m.info.catches, methodCalls: m.info.methodCalls,
+        top: m.info.top,
+    };
+    return merged;
+}
+
+// normalizeAsync rewrites every async function body of the module, and every
+// async method body, because the two compile to the same state machine.
+//
+// homes holds every module by qual. An inherited body (§2.4) writes a module
+// alias as the module that wrote it does, and the difference between `alias.fn`
+// and a value decides whether the callee can move into a temporary.
+export void normalizeAsync(module.Module m, Map<String, module.Module> homes) {
+    Norm nm = { info: m.info, n: 0 };
+    forEach(m.prog.statements, s) {
+        ast.FunctionDeclStatement? fd = s as ast.FunctionDeclStatement;
+        if (fd != null) {
+            if (fd.async) {
+                fd.body.statements = nm.stmts(fd.body.statements);
+            }
+            continue;
+        }
+        ast.TypeDeclStatement? td = s as ast.TypeDeclStatement;
+        if (td != null) {
+            forEach(td.allMethods(), md) {
+                if (!md.async) {
+                    continue;
+                }
+                checker.Info saved = nm.info;
+                nm.info = homeInfo(m, md, homes);
+                md.body.statements = nm.stmts(md.body.statements);
+                nm.info = saved;
+            }
+        }
+    }
+}

@@ -1,0 +1,136 @@
+// sqlite: an embedded SQL database, the vendored sqlite3 amalgamation behind
+// a four-call surface. An external library (§5.8, libraries/README.md),
+// reached with an ordinary path import.
+//
+//     import './libraries/sqlite/sqlite';
+//
+//     sqlite.Db db = sqlite.open("app.db") catch e { ... };
+//     sqlite.exec(db, "CREATE TABLE t (name TEXT, n INTEGER)", []) catch e { ... };
+//     sqlite.exec(db, "INSERT INTO t VALUES (?, ?)", ["it's", "42"]) catch e { ... };
+//     Json rows = sqlite.query(db, "SELECT * FROM t WHERE n > ?", ["1"]) catch e { ... };
+//     print(rows[0]["name"] as String);
+//     sqlite.close(db);
+//
+// Bind, never splice. Every `?` binds one element of `params`, and the count
+// must match exactly. A value binds as text, and sqlite's column affinity
+// converts it for INTEGER and REAL columns, so a number binds as
+// string.from(n). SQL built by joining user text is a SQL injection.
+//
+// query answers rows as a Json array of objects. An INTEGER column arrives
+// exact (§6.3), a REAL at full round-trip width, and a NULL as null. A BLOB
+// arrives as null too: this surface has no byte[] columns, so store a blob
+// encoded (crypto.hexEncode) or not at all.
+//
+// Every call blocks the program. The language is single-threaded and an extern
+// cannot suspend, so a slow query stalls everything, an event pump included.
+// The busy timeout is 250 ms, and the caller must answer a BUSY raise.
+//
+// exec runs each statement in its text in order, and binds params afresh to
+// every statement that declares placeholders. query takes one statement only.
+
+import 'json';
+
+native source './native/sqlite3.c';
+native source './native/sqlite3.h';
+native source './native/sqlite_shim.c';
+
+// The amalgamation, tuned to the language it serves: no mutexes, because the
+// program is single-threaded; no extension loading, because a database file
+// must never name code to run; and no double-quoted strings, so a wrong column
+// name raises instead of becoming a string. These are compile flags, so the
+// vendored files stay the upstream bytes.
+native flags '-DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_DQS=0';
+
+extern int nio_sqlite_open(String path);
+extern int nio_sqlite_exec(int handle, String sql, String[] params);
+extern int nio_sqlite_query(int handle, String sql, String[] params);
+extern String nio_sqlite_result(int handle);
+extern String nio_sqlite_errmsg();
+extern int nio_sqlite_close(int handle);
+
+// The `Error.code` values this library raises. They start at 500, so they
+// coexist with http's at 100, tls's at 200, x509's at 300 and webview's at
+// 400 (§2.9).
+export enum ErrorCode {
+    CANTOPEN: 500,    // the file cannot be opened or created
+    SQL: 501,         // the statement is wrong: syntax, a missing table, a constraint
+    BUSY: 502,        // another connection holds the file past the busy timeout
+    MISUSE: 503,      // a closed database, or a parameter count mismatch
+    FULL: 504,        // the disk, or the handle table
+    CORRUPT: 505      // the file is not a database, or is a damaged one
+}
+
+// A database, held open. The value is a handle. After `close`, every later
+// operation on it or on a copy of it raises MISUSE.
+export type Db {
+    int handle;
+}
+
+// Opens the database file and creates it when it does not exist. The path
+// ":memory:" is sqlite's own spelling for a database that never touches disk.
+export Db open(String path) {
+    int r = nio_sqlite_open(path);
+    if (r < 0) {
+        return Error("sqlite: " + nio_sqlite_errmsg(), codeFor(r));
+    }
+    Db db = { handle: r };
+    return db;
+}
+
+// Runs statements that answer nothing. It discards any rows they produce.
+export void exec(Db db, String sql, String[] params) {
+    int r = nio_sqlite_exec(db.handle, sql, params);
+    if (r != 0) {
+        return Error("sqlite: " + nio_sqlite_errmsg(), codeFor(r));
+    }
+}
+
+// Runs one SELECT and answers its rows in order, as a Json array of objects.
+export Json query(Db db, String sql, String[] params) {
+    int r = nio_sqlite_query(db.handle, sql, params);
+    if (r != 0) {
+        return Error("sqlite: " + nio_sqlite_errmsg(), codeFor(r));
+    }
+    String text = nio_sqlite_result(db.handle);
+    Json rows = json.parse(text) catch e {
+        return Error("sqlite: unreadable result: " + e.message, ErrorCode.SQL);
+    };
+    return rows;
+}
+
+// Releases the database. A second close does nothing.
+export void close(Db db) {
+    nio_sqlite_close(db.handle);
+}
+
+// Maps the shim's return convention onto the ErrorCode set. The shim answers
+// negative for its own findings and for an open failure, and positive for a
+// sqlite primary result code (sqlite3.h).
+int codeFor(int r) {
+    if (r == -1 || r == -3) {
+        return ErrorCode.MISUSE;
+    }
+    int c = r;
+    if (c < 0) {
+        c = -c;
+    }
+    if (c == 1000) {
+        return ErrorCode.FULL;    // the shim's handle table
+    }
+    if (c == 5 || c == 6) {
+        return ErrorCode.BUSY;    // SQLITE_BUSY, SQLITE_LOCKED
+    }
+    if (c == 11 || c == 26) {
+        return ErrorCode.CORRUPT;    // SQLITE_CORRUPT, SQLITE_NOTADB
+    }
+    if (c == 13) {
+        return ErrorCode.FULL;    // SQLITE_FULL
+    }
+    if (c == 14) {
+        return ErrorCode.CANTOPEN;
+    }
+    if (c == 21) {
+        return ErrorCode.MISUSE;
+    }
+    return ErrorCode.SQL;
+}

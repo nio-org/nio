@@ -1,0 +1,196 @@
+// Diagnostics as records, checked against the sentences they print as.
+//
+// For every layer, `errs[i] == format(diags[i])`, in the same order and at the
+// same length. If the two arrays disagree, a language server points at the
+// wrong line. The tests also check the positions, because a projection can
+// agree with itself and still carry wrong numbers.
+import 'test';
+import 'string';
+import 'array';
+import 'map';
+import '../src/diag' as diag;
+import '../src/token' as token;
+import '../src/checker' as checker;
+import '../src/parser' as parser;
+import '../src/lexer' as lexer;
+import '../src/ast' as ast;
+import '../src/loader' as loader;
+import '../src/codegen' as codegen;
+
+void parallel(String[] errs, diag.Diagnostic[] diags, String what) {
+    test.assert(errs.length == diags.length,
+        what + ": " + string.from(errs.length) + " sentence(s) but "
+        + string.from(diags.length) + " diagnostic(s)");
+    if (errs.length != diags.length) {
+        return;
+    }
+    for (int i = 0; i < errs.length; i++) {
+        test.expectString(diag.format(diags[i]), errs[i]);
+    }
+}
+
+test.start("diag: format is the sentence the compiler has always printed", void () -> {
+    diag.Diagnostic plain = diag.at(3, 14, "something went wrong");
+    test.expectString(diag.format(plain), "line 3:14: something went wrong");
+
+    // format writes the separator after the path, and the field does not hold
+    // it. A language server can then turn `file` back into a document.
+    diag.Diagnostic[] moved = diag.inFile("sub/mod.nio", [plain]);
+    test.expectString(moved[0].file, "sub/mod.nio");
+    test.expectString(diag.format(moved[0]), "sub/mod.nio: line 3:14: something went wrong");
+
+    // An empty file name is the entry file, and inFile does not change the
+    // diagnostics.
+    diag.Diagnostic[] same = diag.inFile("", [plain]);
+    test.expectString(diag.format(same[0]), "line 3:14: something went wrong");
+});
+
+// Every diagnostic carries the span of the source it names. The parser and the
+// checker both report at a token, and the token records where it ends. Without
+// a span, a renderer has nothing to underline and an editor guesses a word.
+void hasSpans(diag.Diagnostic[] diags, String what) {
+    forEach(diags, d) {
+        test.assert(d.endLine >= d.line,
+            what + ": a span that ends before it starts, at " + string.from(d.line)
+            + ":" + string.from(d.col));
+        test.assert(d.endCol > 0,
+            what + ": no span on the diagnostic at line " + string.from(d.line)
+            + ":" + string.from(d.col) + " (" + d.message + ")");
+    }
+}
+
+test.start("diag: a span is the source a token covers", void () -> {
+    // What the lexer records, and what atTok carries over.
+    lexer.Lexer l = lexer.newLexer(`int x = "hi";`);
+    l.nextToken();    // int
+    token.Token name = l.nextToken();
+    test.expectInt(name.line, 1);
+    test.expectInt(name.col, 5);
+    test.expectInt(name.endCol, 6);
+
+    diag.Diagnostic d = diag.atTok(name, "about x");
+    test.expectInt(d.line, 1);
+    test.expectInt(d.col, 5);
+    test.expectInt(d.endLine, 1);
+    test.expectInt(d.endCol, 6);
+    // The span does not change the sentence. The position in the sentence is
+    // where the span begins, as older readers expect.
+    test.expectString(diag.format(d), "line 1:5: about x");
+});
+
+test.start("diag: a second place and a fix travel with the diagnostic", void () -> {
+    diag.Diagnostic d = diag.at(2, 1, "cannot use String as int");
+    test.assert(d.related == null, "a diagnostic starts with no second place");
+    test.assert(d.fix == null, "a diagnostic starts with no fix");
+
+    diag.Span at = { file: "", line: 1, col: 1, endLine: 1, endCol: 4 };
+    d = diag.related(d, at, "expected because of this type");
+    diag.Label? rel = d.related;
+    test.assert(rel != null, "the second place was not kept");
+    if (rel != null) {
+        test.expectString(rel.message, "expected because of this type");
+        test.expectInt(rel.at.line, 1);
+    }
+
+    d = diag.suggests(d, at, "import 'path';\n", "add import 'path';");
+    diag.Fix? fix = d.fix;
+    test.assert(fix != null, "the fix was not kept");
+    if (fix != null) {
+        test.expectString(fix.title, "add import 'path';");
+        test.expectString(fix.text, "import 'path';\n");
+    }
+
+    // The one-line form does not change. The second place and the fix are for
+    // a renderer and an editor.
+    test.expectString(diag.format(d), "line 2:1: cannot use String as int");
+});
+
+test.start("diag: moving a diagnostic into a file moves its second place too", void () -> {
+    // Only the loader knows which file the parser and the checker read. A
+    // related place with no file of its own is in that same module. If inFile
+    // did not set its file, an editor would open the wrong document.
+    diag.Diagnostic d = diag.at(5, 3, "cannot return String");
+    diag.Span at = { file: "", line: 1, col: 1, endLine: 1, endCol: 4 };
+    d = diag.related(d, at, "expected because of this return type");
+    diag.Diagnostic[] moved = diag.inFile("sub/mod.nio", [d]);
+    test.expectString(moved[0].file, "sub/mod.nio");
+    diag.Label? rel = moved[0].related;
+    test.assert(rel != null, "the second place was lost in the move");
+    if (rel != null) {
+        test.expectString(rel.at.file, "sub/mod.nio");
+    }
+});
+
+test.start("diag: the parser's sentences and diagnostics agree", void () -> {
+    // Several syntax errors on different lines, so order matters.
+    parser.Parser p = parser.newParser(lexer.newLexer(`int a = ;
+String b = "unterminated
+int c = (1 + ;
+`));
+    p.parseProgram();
+    test.assert(p.errs.length > 0, "expected the source not to parse");
+    parallel(p.errs, p.diags, "parser");
+    hasSpans(p.diags, "parser");
+
+    // Every position is a real one: a line the source has, at column 1 or more.
+    forEach(p.diags, d) {
+        test.assert(d.line >= 1 && d.line <= 3,
+            "parser diagnostic on line " + string.from(d.line) + ", outside the source");
+        test.assert(d.col >= 1, "parser diagnostic at column " + string.from(d.col));
+        test.expectString(d.file, "");
+    }
+});
+
+test.start("diag: the checker's sentences and diagnostics agree", void () -> {
+    parser.Parser p = parser.newParser(lexer.newLexer(`int a = "text";
+undefinedCall();
+String b = 3;
+`));
+    ast.Program prog = p.parseProgram();
+    test.assert(p.errs.length == 0, "the test source should parse");
+    checker.CheckResult res = checker.check(prog);
+    test.assert(res.errs.length > 0, "expected the source not to check");
+    parallel(res.errs, res.diags, "checker");
+    hasSpans(res.diags, "checker");
+    forEach(res.diags, d) {
+        test.assert(d.line >= 1 && d.line <= 3,
+            "checker diagnostic on line " + string.from(d.line) + ", outside the source");
+    }
+});
+
+// checker.mergeInherited reorders both arrays and does not only append to
+// them, so the inherited-body path has its own case.
+test.start("diag: an inherited body's diagnostics stay parallel", void () -> {
+    parser.Parser p = parser.newParser(lexer.newLexer(`type Base {
+    int n;
+    int wrong() { return "not an int"; }
+}
+type Derived extends Base {
+    int extra;
+}
+`));
+    ast.Program prog = p.parseProgram();
+    test.assert(p.errs.length == 0, "the test source should parse");
+    checker.CheckResult res = checker.check(prog);
+    test.assert(res.errs.length > 0, "expected the source not to check");
+    parallel(res.errs, res.diags, "checker (inherited)");
+    hasSpans(res.diags, "checker (inherited)");
+});
+
+// The whole pipeline, where the loader has added its own diagnostics and
+// prefixes to the ones the parser and checker made.
+test.start("diag: compileEntry's sentences and diagnostics agree", void () -> {
+    loader.CompileResult res = loader.compileEntry(`int a = "text";
+String b = 3;
+`, ".", "bad.nio", codegen.noOptions());
+    test.assert(res.errs.length > 0, "expected the program not to compile");
+    parallel(res.errs, res.diags, "compileEntry");
+    hasSpans(res.diags, "compileEntry");
+});
+
+test.start("diag: a program that compiles reports neither", void () -> {
+    loader.CompileResult res = loader.compileEntry(`print("ok");
+`, ".", "good.nio", codegen.noOptions());
+    test.expectInt(res.errs.length, 0);
+    test.expectInt(res.diags.length, 0);
+});

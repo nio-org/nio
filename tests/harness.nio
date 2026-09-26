@@ -1,0 +1,548 @@
+// The end-to-end harness: compile a program through src/driver.nio, run it,
+// and check what it did. Going through the driver lets `--coverage` measure
+// the compiler's own modules.
+//
+// Nothing here is async. An await outside an async function drives the
+// scheduler until the future completes (§3.5), so programs run one at a time.
+// With async bodies, the suite would start hundreds of clang processes at once.
+import '../src/driver' as driver;
+import '../src/loader' as loader;
+import '../src/codegen' as codegen;
+import '../src/lib/quote' as quote;
+import '../src/lib/str' as str;
+import '../src/embed/runtime' as rtsrc;
+import './repo' as repo;
+import 'fs';
+import 'path';
+import 'string';
+import 'array';
+import 'process';
+
+// A backtick: a multiline string cannot contain its own delimiter.
+export String const BT = string.fromByteArray([96]);
+
+// A carriage return.
+export String const CR = string.fromByteArray([13]);
+
+export type Run {
+    String out;
+    String err;
+    int code;
+    process.ChildUsage? usage;
+}
+
+// One temporary directory for the whole suite: a directory per program would
+// spend the suite's time in mkdir and rmdir.
+String? workspace = null;
+int seq = 0;
+
+String workdir() {
+    String? w = workspace;
+    if (w != null) {
+        return w;
+    }
+    String made = fs.createTempDir("nio-tests-");
+    workspace = made;
+    return made;
+}
+
+export void cleanup() {
+    String? w = workspace;
+    if (w != null) {
+        fs.delete(w, { recursive: true }) catch e { };
+        workspace = null;
+    }
+}
+
+// A fresh empty directory under the workspace.
+export String scratch() {
+    seq++;
+    String d = path.join(workdir(), "d" + string.from(seq));
+    fs.createDir(d);
+    return d;
+}
+
+// Writes text into dir under name, creating every missing directory above it,
+// and answers the full path.
+export String writeTo(String dir, String name, String text) {
+    String p = path.join(dir, path.localize(name));
+    createDirAll(loader.dirOf(p));
+    fs.writeFile(p, string.toByteArray(text));
+    return p;
+}
+
+// Creates a directory and every missing directory above it. fs.createDir makes
+// one level and needs its parent to exist. A new package tree
+// (`modules/host/owner/name@version/`) has no parents yet.
+export void createDirAll(String dir) {
+    if (dir == "" || fs.exists(dir)) {
+        return;
+    }
+    String parent = loader.dirOf(dir);
+    if (parent != dir) {
+        createDirAll(parent);
+    }
+    fs.createDir(dir);
+}
+
+// ---- compiling ----
+
+// Compiles src into a native binary and answers its path. The source gets a
+// file of its own, so diagnostics name a real path and relative imports
+// resolve beside it.
+export String buildSource(String src) {
+    String dir = scratch();
+    return buildEntry(writeTo(dir, "prog.nio", src), false);
+}
+
+// Compiles an existing file into a binary under the workspace, never beside
+// the source, because the entry can be a repository file. The answer is a full
+// path, because posix_spawnp searches PATH for a name with no separator.
+export String buildEntry(String entry, bool coverage) {
+    return buildEntryWith(entry, coverage, false);
+}
+
+// buildEntry with debug information. It proves that clang accepts the
+// metadata: a module that LLVM's verifier rejects fails here.
+export String buildEntryDebug(String entry) {
+    return buildEntryWith(entry, false, true);
+}
+
+String buildEntryWith(String entry, bool coverage, bool debug) {
+    byte[] data = fs.readFile(entry);
+    String bin = driver.exeName(path.join(scratch(), loader.stemOf(entry) + ".bin"));
+    codegen.Options opts = { coverage: coverage, debug: debug, release: false, targetAttrs: "" };
+    String? failure = await driver.buildFile(string.fromByteArray(data), entry, bin, opts);
+    if (failure != null) {
+        return Error(failure);
+    }
+    return bin;
+}
+
+// Answers the diagnostics the compiler gave for src, or raises when src
+// compiles. It stops before clang.
+export String[] compileFails(String src) {
+    String dir = scratch();
+    String entry = writeTo(dir, "prog.nio", src);
+    return compileFailsAt(entry);
+}
+
+// compileFails for a file already on disk.
+export String[] compileFailsAt(String entry) {
+    byte[] data = fs.readFile(entry);
+    loader.CompileResult res = await driver.compile(string.fromByteArray(data), entry, codegen.noOptions());
+    if (res.errs.length == 0) {
+        return Error("expected compile errors, but the program compiled");
+    }
+    return res.errs;
+}
+
+// Compiles src and answers the LLVM IR, with no target attribute group: the
+// assertions must not depend on the host.
+export String emitIR(String src) {
+    String dir = scratch();
+    String entry = writeTo(dir, "prog.nio", src);
+    return emitIRAt(entry);
+}
+
+export String emitIRAt(String entry) {
+    byte[] data = fs.readFile(entry);
+    loader.CompileResult res = await driver.compile(string.fromByteArray(data), entry, codegen.noOptions());
+    if (res.errs.length > 0) {
+        return Error("compile errors: " + string.join(res.errs, "; "));
+    }
+    return res.ir;
+}
+
+// ---- the compiler itself, as a program ----
+
+// The compiler binary, built on first use and shared. Building src/nio.nio is
+// the most expensive thing the suite does, so cli_test and lsp_e2e_test, which
+// both drive nio as a process, share one build.
+String? compilerBin = null;
+
+export String compiler() {
+    String? built = compilerBin;
+    if (built != null) {
+        return built;
+    }
+    String bin = buildEntry(repo.at("src/nio.nio"), false);
+    compilerBin = bin;
+    return bin;
+}
+
+export Run nio(String[] args) {
+    return runBinary(compiler(), args);
+}
+
+// ---- running ----
+
+export Run runBinary(String bin, String[] args) {
+    process.ChildRunResult r = await process.child.run(bin, args);
+    Run out = {
+        out: string.fromByteArray(r.stdout),
+        err: string.fromByteArray(r.stderr),
+        code: r.code,
+        usage: r.usage,
+    };
+    return out;
+}
+
+export Run runBinaryInput(String bin, String[] args, String input) {
+    process.ChildRunResult r = await process.child.run(bin, args,
+        { stdin: string.toByteArray(input) });
+    Run out = {
+        out: string.fromByteArray(r.stdout),
+        err: string.fromByteArray(r.stderr),
+        code: r.code,
+        usage: r.usage,
+    };
+    return out;
+}
+
+// Runs a program with a working directory and environment of its own: a
+// coverage report lands relative to the process's own directory.
+export Run runBinaryIn(String bin, String[] args, String cwd, Map<String, String> env) {
+    process.ChildRunResult r = await process.child.run(bin, args, { cwd: cwd, env: env });
+    Run out = {
+        out: string.fromByteArray(r.stdout),
+        err: string.fromByteArray(r.stderr),
+        code: r.code,
+        usage: r.usage,
+    };
+    return out;
+}
+
+export Run runProgram(String src) {
+    return runBinary(buildSource(src), []);
+}
+
+export Run runProgramArgs(String src, String[] args) {
+    return runBinary(buildSource(src), args);
+}
+
+// ---- asserting ----
+
+// Splits output into lines and drops the trailing newline a print leaves. An
+// empty output gives no lines.
+export String[] lines(String s) {
+    String t = s;
+    while (string.length(t) > 0 && t[string.length(t) - 1] == 10) {
+        t = string.substring(t, 0, string.length(t) - 1);
+    }
+    if (string.length(t) == 0) {
+        return [];
+    }
+    return string.split(t, "\n");
+}
+
+// Asserts that the program prints exactly want, one value per line, and exits
+// 0.
+export void expectOutput(String src, String[] want) {
+    Run r = runProgram(src);
+    checkOutput(r, want);
+}
+
+export void expectOutputArgs(String src, String[] args, String[] want) {
+    Run r = runProgramArgs(src, args);
+    checkOutput(r, want);
+}
+
+// The comparison itself, for a test that ran the program some other way.
+export void checkOutput(Run r, String[] want) {
+    if (r.code != 0) {
+        return Error("program exited with " + string.from(r.code) + ", stderr: " + r.err);
+    }
+    String[] got = lines(r.out);
+    if (got.length != want.length) {
+        return Error("got " + string.from(got.length) + " lines, want "
+            + string.from(want.length) + "\ngot:\n" + r.out);
+    }
+    for (int i = 0; i < want.length; i++) {
+        if (got[i] != want[i]) {
+            return Error("line " + string.from(i + 1) + ": got \"" + got[i]
+                + "\", want \"" + want[i] + "\"\nfull output:\n" + r.out);
+        }
+    }
+}
+
+export void expectRuntimeError(String src, String wantErr) {
+    Run r = runProgram(src);
+    if (r.code == 0) {
+        return Error("expected a runtime error, but the program exited 0");
+    }
+    if (!string.contains(r.err, wantErr)) {
+        return Error("stderr \"" + r.err + "\" does not contain \"" + wantErr + "\"");
+    }
+}
+
+// Matches by substring, since a diagnostic carries a line and column the test
+// does not spell.
+export void expectCompileError(String src, String want) {
+    String[] errs = compileFails(src);
+    if (!anyContains(errs, want)) {
+        return Error("no diagnostic contains \"" + want + "\"; got:\n  "
+            + string.join(errs, "\n  "));
+    }
+}
+
+export bool anyContains(String[] errs, String want) {
+    forEach(errs, e) {
+        if (string.contains(e, want)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+export void expectContains(String got, String want) {
+    if (!string.contains(got, want)) {
+        return Error("expected to find \"" + want + "\" in:\n" + got);
+    }
+}
+
+export void expectAbsent(String got, String want) {
+    if (string.contains(got, want)) {
+        return Error("expected not to find \"" + want + "\" in:\n" + got);
+    }
+}
+
+// Counts non-overlapping occurrences of sub in s.
+export int countOf(String s, String sub) {
+    if (string.length(sub) == 0) {
+        return 0;
+    }
+    int n = 0;
+    int at = 0;
+    while (at <= string.length(s) - string.length(sub)) {
+        int i = string.find(string.substring(s, at, string.length(s)), sub);
+        if (i < 0) {
+            return n;
+        }
+        n++;
+        at = at + i + string.length(sub);
+    }
+    return n;
+}
+
+export void expectCount(String s, String sub, int want) {
+    int got = countOf(s, sub);
+    if (got != want) {
+        return Error("\"" + sub + "\" occurs " + string.from(got) + " times, want "
+            + string.from(want));
+    }
+}
+
+// ---- multi-file programs ----
+
+// A source file of a multi-module program. The name is relative to the entry
+// directory and may hold a subdirectory.
+export type File {
+    String name;
+    String text;
+}
+
+export File file(String name, String text) {
+    File f = { name: name, text: text };
+    return f;
+}
+
+export String writeFiles(File[] files) {
+    String dir = scratch();
+    forEach(files, f) {
+        writeTo(dir, f.name, f.text);
+    }
+    return dir;
+}
+
+export void expectFilesOutput(File[] files, String entry, String[] want) {
+    String dir = writeFiles(files);
+    Run r = runBinary(buildEntry(path.join(dir, path.localize(entry)), false), []);
+    checkOutput(r, want);
+}
+
+export void expectFilesError(File[] files, String entry, String want) {
+    String dir = writeFiles(files);
+    String[] errs = compileFailsAt(path.join(dir, path.localize(entry)));
+    if (!anyContains(errs, want)) {
+        return Error("no diagnostic contains \"" + want + "\"; got:\n  "
+            + string.join(errs, "\n  "));
+    }
+}
+
+// ---- paths spliced into a program's source ----
+
+// A path, joined and then quoted, for splicing into the text of a program
+// under test. Quoting matters on Windows, where §1.6 reads a backslash in a
+// path as an escape.
+export String nioPath(String[] elems) {
+    if (elems.length == 0) {
+        return quote.quote("");
+    }
+    String p = elems[0];
+    for (int i = 1; i < elems.length; i++) {
+        p = path.join(p, elems[i]);
+    }
+    return quote.quote(p);
+}
+
+// ---- the collector under stress ----
+
+// One program run twice: with the collector at its normal rate, then at every
+// allocation.
+export type StressRun {
+    Run plain;
+    Run stressed;
+}
+
+// Builds src once and runs it both ways. NIO_GC_STRESS=1 collects at every
+// allocation, so a pointer codegen failed to root is swept while it is still
+// live. An ordinary run almost never hits that window.
+export StressRun runStressed(String src) {
+    String bin = buildSource(src);
+    Map<String, String> stress = { "NIO_GC_STRESS": "1" };
+    StressRun out = {
+        plain: runBinary(bin, []),
+        stressed: runBinaryIn(bin, [], path.getCwd(), stress),
+    };
+    return out;
+}
+
+// Requires the two runs to agree, and answers what they printed. A value the
+// collector swept while it was live makes them differ.
+export String sameUnderStress(String src) {
+    StressRun r = runStressed(src);
+    if (r.plain.out != r.stressed.out) {
+        return Error("stress changed the result:\n got  \"" + r.stressed.out
+            + "\"\nwant \"" + r.plain.out + "\"");
+    }
+    return r.plain.out;
+}
+
+export void expectSameUnderStress(String src, String want) {
+    String got = sameUnderStress(src);
+    if (got != want) {
+        return Error("got \"" + got + "\", want \"" + want + "\"");
+    }
+}
+
+// ---- C harnesses ----
+
+// Compiles a C file that drives the runtime directly, then runs it plain and
+// under collector stress. The runtime files come from src/embed/runtime.nio,
+// the bake the compiler links, so the harness never tests a stale copy.
+export void runCHarness(String harnessRel, String[] cfiles) {
+    String dir = scratch();
+    String[] names = ["runtime.h"];
+    forEach(cfiles, c) {
+        array.push(names, c);
+    }
+    String bin = driver.exeName(path.join(dir, "harness"));
+    String[] args = ["-O1", "-I", dir, "-o", bin];
+    // The undefined-behaviour sanitizer's runtime does not link on the MSVC
+    // target with the plain clang driver, so Windows runs the harness without
+    // it and the two Unix hosts keep it.
+    if (loader.hostOS() != "windows") {
+        array.push(args, "-fsanitize=undefined");
+        array.push(args, "-fno-sanitize-recover=all");
+    }
+    forEach(names, name) {
+        String? text = rtsrc.file(name);
+        if (text == null) {
+            return Error("missing embedded runtime file " + name);
+        }
+        String p = writeTo(dir, name, text);
+        if (str.hasSuffix(name, ".c")) {
+            array.push(args, p);
+        }
+    }
+    array.push(args, writeTo(dir, "harness.c", repo.readText(harnessRel)));
+
+    process.ChildRunResult build = await process.child.run("clang", args);
+    if (build.code != 0) {
+        return Error("compiling " + harnessRel + " failed:\n"
+            + string.fromByteArray(build.stdout) + string.fromByteArray(build.stderr));
+    }
+    Map<String, String> stress = { "NIO_GC_STRESS": "1" };
+    Run plain = runBinary(bin, []);
+    if (plain.code != 0) {
+        return Error(harnessRel + " failed:\n" + plain.out + plain.err);
+    }
+    Run stressed = runBinaryIn(bin, [], path.getCwd(), stress);
+    if (stressed.code != 0) {
+        return Error(harnessRel + " failed under stress:\n" + stressed.out + stressed.err);
+    }
+}
+
+// expectOutput that also asserts the exit status. A failing test suite exits 1
+// (§6.13).
+export void expectRun(String src, int wantCode, String[] want) {
+    Run r = runProgram(src);
+    String[] got = lines(r.out);
+    if (got.length != want.length) {
+        return Error("got " + string.from(got.length) + " lines, want "
+            + string.from(want.length) + "\ngot:\n" + r.out);
+    }
+    for (int i = 0; i < want.length; i++) {
+        if (got[i] != want[i]) {
+            return Error("line " + string.from(i + 1) + ": got \"" + got[i]
+                + "\", want \"" + want[i] + "\"\nfull output:\n" + r.out);
+        }
+    }
+    if (r.code != wantCode) {
+        return Error("exited with " + string.from(r.code) + ", want " + string.from(wantCode));
+    }
+}
+
+// ---- a command line and standard input ----
+
+export Run runProgramWith(String src, String[] args, String input) {
+    String bin = buildSource(src);
+    process.ChildRunResult r = await process.child.run(bin, args,
+        { stdin: string.toByteArray(input) });
+    Run out = {
+        out: string.fromByteArray(r.stdout),
+        err: string.fromByteArray(r.stderr),
+        code: r.code,
+        usage: r.usage,
+    };
+    return out;
+}
+
+export Run runProgramInput(String src, String input) {
+    return runProgramWith(src, [], input);
+}
+
+// ---- exact assertions ----
+//
+// These three compare bytes and not lines. They check a write with no newline,
+// a stream that must be empty, and an exact exit status.
+
+export void expectExact(Run r, String wantOut, String wantErr, int wantCode) {
+    if (r.code != wantCode) {
+        return Error("exit code: got " + string.from(r.code) + ", want "
+            + string.from(wantCode) + " (stderr: " + r.err + ")");
+    }
+    if (r.out != wantOut) {
+        return Error("stdout: got \"" + r.out + "\", want \"" + wantOut + "\"");
+    }
+    if (r.err != wantErr) {
+        return Error("stderr: got \"" + r.err + "\", want \"" + wantErr + "\"");
+    }
+}
+
+export void expectStdout(Run r, String wantOut) {
+    if (r.code != 0) {
+        return Error("program exited with " + string.from(r.code) + ", stderr: " + r.err);
+    }
+    if (r.out != wantOut) {
+        return Error("stdout: got \"" + r.out + "\", want \"" + wantOut + "\"");
+    }
+}
+
+export void expectCode(Run r, int wantCode) {
+    if (r.code != wantCode) {
+        return Error("exit code: got " + string.from(r.code) + ", want "
+            + string.from(wantCode) + " (stderr: " + r.err + ")");
+    }
+}

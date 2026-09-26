@@ -1,0 +1,125 @@
+// Column conversion. The compiler counts columns in bytes from 1. The Language
+// Server Protocol counts characters in UTF-16 code units from 0.
+import 'string';
+import 'array';
+
+// Splits a document into lines without terminators. Line n, counted from 1 as
+// the compiler counts, is element n-1. CRLF input reads the same as LF.
+export String[] lines(String text) {
+    String[] raw = string.split(text, "\n");
+    String[] out = [];
+    forEach(raw, l) {
+        int n = string.length(l);
+        if (n > 0 && l[n - 1] == 13) {
+            array.push(out, string.substring(l, 0, n - 1));
+        } else {
+            array.push(out, l);
+        }
+    }
+    return out;
+}
+
+// Returns line n, counted from 1, or "" if there is no such line. A diagnostic
+// can name the line after the end of a truncated file.
+export String lineAt(String[] ls, int n) {
+    if (n < 1 || n > ls.length) {
+        return "";
+    }
+    return ls[n - 1];
+}
+
+bool isContinuation(byte b) {
+    return b >= 128 && b <= 191;
+}
+
+// Returns the LSP character, counted from 0 in UTF-16 code units, for a byte
+// column counted from 1. UTF-16 writes a four-byte character as two units.
+export int utf16Col(String line, int byteCol) {
+    int n = string.length(line);
+    int upto = byteCol - 1;
+    if (upto < 0) {
+        upto = 0;
+    }
+    if (upto > n) {
+        upto = n;
+    }
+    int units = 0;
+    for (int i = 0; i < upto; i++) {
+        byte b = line[i];
+        if (isContinuation(b)) {
+            continue;
+        }
+        units++;
+        if (b >= 240) {
+            units++;
+        }
+    }
+    return units;
+}
+
+// The inverse of utf16Col. A character after the end of the line gives the
+// column after the last byte, where an editor puts the caret.
+export int byteCol(String line, int character) {
+    int n = string.length(line);
+    int units = 0;
+    int i = 0;
+    while (i < n && units < character) {
+        byte b = line[i];
+        int width = 1;
+        if (b >= 240) {
+            width = 4;
+            units++;    // the surrogate pair's second half
+        } else if (b >= 224) {
+            width = 3;
+        } else if (b >= 192) {
+            width = 2;
+        }
+        units++;
+        i = i + width;
+    }
+    return i + 1;
+}
+
+// The set includes every byte at 128 and above, although §1.4 permits none of
+// them in an identifier, so an extent never stops inside a character.
+bool isWordByte(byte b) {
+    return b == 95 || (b >= 97 && b <= 122) || (b >= 65 && b <= 90)
+        || (b >= 48 && b <= 57) || b >= 128;
+}
+
+// Returns the byte column, counted from 1, after the text a diagnostic at
+// byteCol must mark: the rest of a word, the rest of a string literal that
+// opens there, or one character. The scan stops at the end of the line.
+export int wordEnd(String line, int byteCol) {
+    int n = string.length(line);
+    int i = byteCol - 1;
+    if (i < 0) {
+        i = 0;
+    }
+    if (i >= n) {
+        return n + 1;
+    }
+    byte first = line[i];
+    if (isWordByte(first)) {
+        while (i < n && isWordByte(line[i])) {
+            i++;
+        }
+        return i + 1;
+    }
+    // 34 is `"`, 39 is `'`, 96 is a backtick: the three delimiters of §1.6.
+    if (first == 34 || first == 39 || first == 96) {
+        int j = i + 1;
+        while (j < n) {
+            if (line[j] == 92) {    // a backslash hides the next byte
+                j = j + 2;
+                continue;
+            }
+            if (line[j] == first) {
+                return j + 2;    // one past the closing delimiter
+            }
+            j++;
+        }
+        return n + 1;
+    }
+    return byteCol + 1;
+}

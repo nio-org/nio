@@ -1,0 +1,1239 @@
+// Modules and the loader, end to end.
+//
+// Every program here is spread over several files. The loader resolves
+// `import 'path'` against the importer's directory, rejects cycles, and checks
+// and generates in dependency order.
+import 'test';
+import 'string';
+import 'array';
+import 'map';
+import 'os';
+import 'path';
+import './harness' as h;
+import '../src/loader' as loader;
+import '../src/deps' as deps;
+import '../src/codegen' as codegen;
+import '../src/checker' as checker;
+import '../src/driver' as driver;
+import '../src/lib/quote' as quote;
+import '../src/lib/str' as str;
+
+test.start("modules: import function and variable", void () -> {
+    h.expectFilesOutput([
+        h.file("mathlib.nio", `
+export int calls = 0;
+export int add(int a, int b) {
+    calls = calls + 1;
+    return a + b;
+}
+int helper() { return 100; }
+export int viaHelper() { return helper(); }
+`),
+        h.file("main.nio", `
+import 'mathlib' as m;
+print(m.add(2, 3));
+print(m.add(10, 20));
+print(m.calls);
+m.calls = 0;
+print(m.calls);
+print(m.viaHelper());
+`),
+    ], "main.nio", ["5", "30", "2", "0", "100"]);
+});
+
+test.start("modules: exported const", void () -> {
+    h.expectFilesOutput([
+        h.file("config.nio", `
+export int const limit = 100;
+export int[] const sizes = [1, 2];
+`),
+        h.file("main.nio", `
+import 'config' as cfg;
+print(cfg.limit);
+cfg.sizes[0] = 9;      // const protects the binding, not the elements
+print(cfg.sizes[0]);
+`),
+    ], "main.nio", ["100", "9"]);
+    h.expectFilesError([
+        h.file("config.nio", `
+export int const limit = 100;
+export int[] const sizes = [1, 2];
+`),
+        h.file("main.nio", `
+import 'config' as cfg;
+cfg.limit = 5;
+`),
+    ], "main.nio", "cannot assign to cfg.limit: it is declared const");
+});
+
+// An exported optional narrows through its module path like any other name.
+test.start("modules: exported optional narrows", void () -> {
+    h.expectFilesOutput([
+        h.file("config.nio", `
+export String? user;
+user = "ada";
+`),
+        h.file("main.nio", `
+import 'config' as cfg;
+if (cfg.user != null) {
+    print(cfg.user + "!");
+}
+`),
+    ], "main.nio", ["ada!"]);
+});
+
+test.start("modules: default alias and subdirectory", void () -> {
+    h.expectFilesOutput([
+        h.file("lib/strutil.nio", `
+export String shout(String s) { return s + "!"; }
+`),
+        h.file("main.nio", `
+import 'lib/strutil';
+print(strutil.shout("hey"));
+`),
+    ], "main.nio", ["hey!"]);
+});
+
+test.start("modules: module scope isolation", void () -> {
+    h.expectFilesOutput([
+        h.file("a.nio", `
+export int x = 1;
+int hidden = 10;
+export int describe() { return x + hidden; }
+`),
+        h.file("main.nio", `
+import 'a';
+int x = 2;
+int hidden = 20;
+int describe() { return x + hidden; }
+print(a.x);
+print(x);
+print(a.describe());
+print(describe());
+`),
+    ], "main.nio", ["1", "2", "11", "22"]);
+});
+
+test.start("modules: module for loop and var inc dec", void () -> {
+    h.expectFilesOutput([
+        h.file("counter.nio", `
+export int hits = 0;
+for (int i = 0; i < 3; i++) {
+    hits++;
+}
+`),
+        h.file("main.nio", `
+import 'counter';
+print(counter.hits);
+counter.hits++;
+print(counter.hits);
+counter.hits--;
+counter.hits--;
+print(counter.hits);
+`),
+    ], "main.nio", ["3", "4", "2"]);
+});
+
+test.start("modules: exported record type", void () -> {
+    h.expectFilesOutput([
+        h.file("geo.nio", `
+import 'json';
+export type Point { int x; int y; String? label; }
+export Point origin() { return { x: 0, y: 0 }; }
+export String describe(Point p) { return json.toText(p); }
+`),
+        h.file("main.nio", `
+import 'json';
+import 'geo' as g;
+g.Point p = { x: 3, y: 4 }
+print(p.x + p.y);
+print(g.describe(p));
+g.Point o = g.origin();
+o.label = "start";
+print(json.toText(o));
+g.Point? maybe = null;
+print(maybe == null);
+g.Point[] route = [p, o];
+print(route.length);
+`),
+    ], "main.nio", ["7", "{\"x\":3,\"y\":4}", "{\"x\":0,\"y\":0,\"label\":\"start\"}", "true", "2"]);
+});
+
+test.start("modules: record type across module chain", void () -> {
+    h.expectFilesOutput([
+        h.file("c.nio", `
+export type Item { String name; int count; }
+export Item make(String n) { return { name: n, count: 1 }; }
+`),
+        h.file("b.nio", `
+import 'c';
+export c.Item bump(c.Item it) {
+    it.count = it.count + 1;
+    return it;
+}
+`),
+        h.file("main.nio", `
+import 'b';
+import 'c';
+c.Item it = c.make("widget");
+it = b.bump(it);
+it = b.bump(it);
+print(it.name);
+print(it.count);
+`),
+    ], "main.nio", ["widget", "3"]);
+});
+
+test.start("modules: module init order and diamond", void () -> {
+    h.expectFilesOutput([
+        h.file("base.nio", `
+print("init base");
+export int stamp = 1;
+`),
+        h.file("left.nio", `
+import 'base';
+print("init left");
+export int stamp = base.stamp + 1;
+`),
+        h.file("right.nio", `
+import 'base';
+print("init right");
+export int stamp = base.stamp + 10;
+`),
+        h.file("main.nio", `
+import 'left';
+import 'right';
+print("main");
+print(left.stamp);
+print(right.stamp);
+`),
+    ], "main.nio", ["init base", "init left", "init right", "main", "2", "11"]);
+});
+
+test.start("modules: imported function in for each", void () -> {
+    h.expectFilesOutput([
+        h.file("acc.nio", `
+export int total = 0;
+export void add(int e) { total = total + e; }
+`),
+        h.file("main.nio", `
+import 'acc';
+forEach([2, 5, 4], e) {
+    acc.add(e);
+}
+print(acc.total);
+`),
+    ], "main.nio", ["11"]);
+});
+
+test.start("modules: imported function must be called", void () -> {
+    h.expectFilesError([
+        h.file("acc.nio", "export void add(int e) {}"),
+        h.file("main.nio", "import 'acc'; acc.add;"),
+    ], "main.nio", "function acc.add must be called");
+});
+
+test.start("modules: anonymous field type across modules", void () -> {
+    h.expectFilesOutput([
+        h.file("fleet.nio", `
+export type Car {
+    String make;
+    { int amount; String? piece }[]? repairs;
+}
+`),
+        h.file("main.nio", `
+import 'json';
+import 'fleet';
+fleet.Car c = { make: "toyota" }
+c.repairs = [{ amount: 250 }];
+print(json.toText(c));
+`),
+    ], "main.nio", ["{\"make\":\"toyota\",\"repairs\":[{\"amount\":250}]}"]);
+});
+
+// getType names a type by its declaring module, not by the importer's alias.
+test.start("modules: get type across modules", void () -> {
+    h.expectFilesOutput([
+        h.file("shapes.nio", `
+export type Circle {
+    float r;
+}
+export enum Kind { ROUND: 1 }
+`),
+        h.file("main.nio", `
+import 'shapes' as sh;
+sh.Circle c = { r: 1.0 }
+sh.Kind k = sh.Kind.ROUND;
+print(getType(c));
+print(getType(k));
+print(getType([c]));
+`),
+    ], "main.nio", ["shapes.Circle", "shapes.Kind", "shapes.Circle[]"]);
+});
+
+test.start("modules: aliased builtin modules", void () -> {
+    h.expectFilesOutput([
+        h.file("main.nio", `
+import 'time' as when;
+import 'json' as encode;
+DateTime d = when.date.fromText('2026-07-25');
+print(when.date.year(d));
+print(encode.toText([1, 2]));
+`),
+    ], "main.nio", ["2026", "[1,2]"]);
+});
+
+test.start("modules: single quoted strings end to end", void () -> {
+    h.expectFilesOutput([
+        h.file("main.nio", `
+String s = 'it\\'s "fine"';
+print(s);
+`),
+    ], "main.nio", ["it's \"fine\""]);
+});
+
+// A local ./os.nio may declare its own Cpu. The loader never hands the qual
+// "os" to a user module: with both records qualified "os" and named "Cpu",
+// codegen would intern one descriptor for the two and trace the wrong shape.
+test.start("modules: local OS module does not collide with the builtin", void () -> {
+    h.expectFilesOutput([
+        h.file("os.nio", `
+export type Cpu { String label; String[] tags; }
+export Cpu describe() { return { label: "local", tags: ["a", "b"] }; }
+`),
+        h.file("main.nio", `
+import './os' as local;
+import 'os';
+import 'json';
+
+local.Cpu mine = local.describe();
+os.Cpu theirs = os.getCpus()[0];
+
+print(json.toText(mine));
+print(getType(mine), getType(theirs));
+print(theirs.model != null || theirs.model == null);
+`),
+    ], "main.nio", ["{\"label\":\"local\",\"tags\":[\"a\",\"b\"]}", "os_2.Cpu os.Cpu", "true"]);
+});
+
+// The same for process: a local ./process.nio becomes process_2, so the two
+// ChildRunResult descriptors stay distinct.
+test.start("modules: local process module does not collide with the builtin", void () -> {
+    h.expectFilesOutput([
+        h.file("process.nio", `
+export type ChildRunResult { String label; int code; }
+export ChildRunResult describe() { return { label: "local", code: 7 }; }
+`),
+        h.file("main.nio", `
+import './process' as local;
+import 'process';
+import 'json';
+
+local.ChildRunResult mine = local.describe();
+process.ChildRunResult? theirs = await process.child.run("true", []) catch null;
+
+print(json.toText(mine));
+print(getType(mine), getType(theirs));
+print(theirs != null && theirs.code == 0);
+`),
+    ], "main.nio", ["{\"label\":\"local\",\"code\":7}", "process_2.ChildRunResult process.ChildRunResult?", "true"]);
+});
+
+test.start("modules: time prints without time import", void () -> {
+    h.expectFilesOutput([
+        h.file("main.nio", `
+import 'json';
+DateTime d;
+print(d);
+print(json.toText(d));
+`),
+    ], "main.nio", ["1970-01-01T00:00:00Z", "\"1970-01-01T00:00:00Z\""]);
+});
+
+test.start("modules: import errors", void () -> {
+    h.expectFilesError([
+        h.file("main.nio", "import 'nowhere';"),
+    ], "main.nio", "cannot import 'nowhere'");
+    h.expectFilesError([
+        h.file("a.nio", "import 'b'; export int x = 1;"),
+        h.file("b.nio", "import 'a'; export int y = 2;"),
+        h.file("main.nio", "import 'a';"),
+    ], "main.nio", "import cycle");
+    h.expectFilesError([
+        h.file("a.nio", "import 'a'; export int x = 1;"),
+        h.file("main.nio", "import 'a';"),
+    ], "main.nio", "import cycle");
+    h.expectFilesError([
+        h.file("lib.nio", "int secret = 1; export int open = 2;"),
+        h.file("main.nio", "import 'lib'; print(lib.secret);"),
+    ], "main.nio", "\"secret\" is not exported by module lib");
+    // A diagnostic from an imported file names that file.
+    h.expectFilesError([
+        h.file("lib.nio", "export int x = \"not an int\";"),
+        h.file("main.nio", "import 'lib';"),
+    ], "main.nio", "lib.nio: line 1");
+    h.expectFilesError([
+        h.file("main.nio", `int x = 1;
+import 'time';`),
+    ], "main.nio", "imports must appear at the top of the file");
+});
+
+test.start("modules: exported enum", void () -> {
+    h.expectFilesOutput([
+        h.file("codes.nio", `
+export enum Status { OK: 200, NOT_FOUND: 404 }
+export Status defaultStatus = Status.OK;
+export Status classify(int code) {
+    if (code == 404) { return Status.NOT_FOUND; }
+    return Status.OK;
+}
+`),
+        h.file("main.nio", `
+import 'codes';
+codes.Status s = codes.Status.NOT_FOUND;
+print(s);
+print(codes.defaultStatus);
+print(codes.classify(404));
+print(s == codes.Status.NOT_FOUND);
+int code = s;
+print(code);
+codes.Status? maybe = codes.classify(200);
+print(maybe);
+`),
+    ], "main.nio", ["NOT_FOUND", "OK", "NOT_FOUND", "true", "404", "OK"]);
+});
+
+test.start("modules: enum nominal across modules", void () -> {
+    h.expectFilesError([
+        h.file("codes.nio", "export enum Status { OK: 200 }"),
+        h.file("main.nio", `
+import 'codes';
+enum Status { OK: 200 }
+Status s = codes.Status.OK;
+`),
+    ], "main.nio", "cannot use codes.Status as Status");
+});
+
+// A type may extend one from another module. A copied body resolves its names
+// in the module that wrote it, while `self` is the extending type, so the body
+// calls an override.
+test.start("modules: extends across modules", void () -> {
+    h.expectFilesOutput([
+        h.file("util.nio", `
+export String shout(String s) { return s + "!"; }
+`),
+        h.file("base.nio", `
+import 'json';
+import 'time';
+import './util.nio';
+
+enum Level { LOW: 1 }
+
+String prefix = "base>";            // private to this module
+String decorate(String s) {         // private to this module
+    return prefix + util.shout(s);
+}
+
+int async delayed(int n) { await time.sleep(1); return n; }
+
+type Note { String text; }          // not exported
+
+export type Item {
+    String name;
+    Note note;
+
+    String show() {
+        Note n = self.note;
+        return decorate(self.name) + " " + json.toText(n) + " " + json.toText(self.level());
+    }
+
+    // An await inside an argument list: normalizing this needs to know that
+    // json is a module alias here, and it is not one in the file that
+    // inherits the method.
+    String async slowly() {
+        return json.toText(await delayed(self.level()));
+    }
+
+    int level() { return Level.LOW; }
+}
+`),
+        h.file("mid.nio", `
+import './base.nio';
+
+export type Mid extends base.Item {
+    int size;
+    String describe() { return "mid"; }
+}
+`),
+        h.file("main.nio", `
+import './base.nio';
+import './mid.nio';
+
+// Two files away from where show() is written, and this file imports
+// neither json nor util.
+type Deep extends mid.Mid {
+    bool flag;
+    int override level() { return 42; }
+}
+
+base.Item plain = { name: "plain", note: { text: "t" } };
+print(plain.show());
+
+Deep d = { name: "deep", note: { text: "u" }, size: 3, flag: true };
+print(d.show());
+print(d.describe(), d.size, d.flag);
+print(await d.slowly(), await plain.slowly());
+`),
+    ], "main.nio", ["base>plain! {\"text\":\"t\"} 1", "base>deep! {\"text\":\"u\"} 42", "mid 3 true", "42 1"]);
+});
+
+// A body inherited from another file reports its errors at the `extends`
+// clause that asked for it, and names the file that holds the code.
+test.start("modules: extends foreign body diagnostic", void () -> {
+    h.expectFilesError([
+        h.file("lib.nio", `
+export type Item {
+    int n;
+    Item me() { return self; }
+}
+`),
+        h.file("main.nio", `
+import './lib.nio';
+type Sub extends lib.Item { int m; }
+`),
+    ], "main.nio", "Sub.me (inherited from lib.Item), at ");
+});
+
+// A dependency's top-level code finishes before an importer's begins (§5.4),
+// so an imported global is always initialized. For this reason §5.1's
+// initialization-order rule stops at the module boundary.
+test.start("modules: an imported global is initialized before the importer runs", void () -> {
+    h.expectFilesOutput([
+        h.file("store.nio", `
+export String[] rows = ["a", "b"];
+export int size() { return rows.length; }
+`),
+        h.file("main.nio", `
+import 'store';
+print(store.size());        // the very first statement of this file
+print(store.rows[1]);
+`),
+    ], "main.nio", ["2", "b"]);
+});
+
+// ---- which runtime C files a program needs ----
+
+// The loader hands clang only the C files the program's imports reach. The
+// list is per program, gathered over every module in dependency order, so a
+// transitive import counts and a repeated one counts once.
+test.start("modules: runtime C file selection", void () -> {
+    expectCFiles("print(1);", ".", "runtime.c,gc.c");
+
+    expectCFiles(`
+import 'time';
+import 'json';
+print(json.toText(time.date.year(time.now())));
+`, ".", "runtime.c,gc.c,lib/time.c,lib/json.c");
+
+    expectCFiles(`
+import 'array';
+int[] xs = [];
+array.push(xs, 1);
+print(xs.length);
+`, ".", "runtime.c,gc.c,lib/array.c");
+
+    // A transitive import of 'time' counts, and two of them count once.
+    String dir = h.writeFiles([
+        h.file("lib.nio", `import 'time'; export int y() { return time.date.year(time.now()); }`),
+        h.file("lib2.nio", `import 'time'; export int m() { return time.date.month(time.now()); }`),
+    ]);
+    expectCFiles(`
+import 'lib';
+import 'lib2';
+print(lib.y() + lib2.m());
+`, dir, "runtime.c,gc.c,lib/time.c");
+
+    expectCFiles("import 'os'; print(os.getPlatform());", ".", "runtime.c,gc.c,lib/os.c");
+
+    expectCFiles(`import 'os'; import 'path';
+print(os.getPlatform(), path.join("a", "b"));`, ".", "runtime.c,gc.c,lib/os.c,lib/path.c");
+});
+
+// The loader's tables select a C file or a Nio source; the checker's decide
+// what "import it first" is said about. The two must name the same set.
+test.start("modules: builtin module lists agree", void () -> {
+    String[] fromLoader = map.keys(loader.builtinCFiles);
+    String[] fromChecker = map.keys(checker.builtinModules);
+    array.sort(fromLoader);
+    array.sort(fromChecker);
+    if (string.join(fromLoader, ",") != string.join(fromChecker, ",")) {
+        return Error("the loader and the checker disagree about the built-in modules:\n"
+            + "  loader:  " + string.join(fromLoader, ",") + "\n"
+            + "  checker: " + string.join(fromChecker, ","));
+    }
+    String[] nioLoader = map.keys(loader.builtinNioModules);
+    String[] nioChecker = map.keys(checker.builtinNioModules);
+    array.sort(nioLoader);
+    array.sort(nioChecker);
+    if (string.join(nioLoader, ",") != string.join(nioChecker, ",")) {
+        return Error("the two lists of built-in modules written in Nio disagree:\n"
+            + "  loader:  " + string.join(nioLoader, ",") + "\n"
+            + "  checker: " + string.join(nioChecker, ","));
+    }
+    // Each name, imported, selects the file it is mapped to.
+    forEach(fromLoader, name) {
+        loader.CompileResult res = loader.compileEntry("import '" + name + "';\n",
+            ".", "", codegen.noOptions());
+        if (res.errs.length > 0) {
+            return Error("importing the built-in \"" + name + "\" failed: "
+                + string.join(res.errs, "; "));
+        }
+        String? want = loader.builtinCFiles[name];
+        if (want == null) {
+            return Error("no C file mapped for " + name);
+        }
+        if (array.indexOf(res.cfiles, want) < 0) {
+            return Error("importing \"" + name + "\" did not select \"" + want
+                + "\", got " + string.join(res.cfiles, ","));
+        }
+    }
+});
+
+// A built-in module's name is not reserved: each file claims it by importing
+// it. A local ./fs.nio and the built-in fs can sit in one file under different
+// aliases, and the quals keep them apart in codegen's TypeDesc table.
+test.start("modules: local FS module does not collide with the builtin", void () -> {
+    String dir = h.scratch();
+    h.expectFilesOutput([
+        h.file("fs.nio", `
+export type Stat { String label; int size; }
+export Stat describe() { return { label: "local", size: 7 }; }
+`),
+        h.file("main.nio", `
+import './fs' as local;
+import 'fs';
+import 'json';
+
+local.Stat mine = local.describe();
+// An optional target is what lets a top-level catch fall through: there is no
+// enclosing function to return from.
+fs.Stat? theirs = fs.stat(` + quote.quote(dir) + `) catch null;
+
+print(json.toText(mine));
+print(getType(mine), getType(theirs));
+print(theirs != null && theirs.isDirectory);
+`),
+    ], "main.nio", [`{"label":"local","size":7}`, "fs_2.Stat fs.Stat?", "true"]);
+});
+
+test.start("modules: extends across modules errors", void () -> {
+    h.File lib = h.file("lib.nio", `
+type Hidden { int n; }
+export type Shown { int n; }
+`);
+    h.expectFilesError([
+        lib, h.file("main.nio", `
+import './lib.nio';
+type A extends lib.Hidden { int x; }
+`),
+    ], "main.nio", "\"Hidden\" is not exported by module lib");
+
+    h.expectFilesError([
+        lib, h.file("main.nio", `
+import './lib.nio';
+type A extends lib.Missing { int x; }
+`),
+    ], "main.nio", "module lib has no exported type \"Missing\"");
+
+    h.expectFilesError([
+        lib, h.file("main.nio", `
+import 'os';
+type A extends os.Cpu { int x; }
+`),
+    ], "main.nio", "type os.Cpu is built in and cannot be extended");
+
+    h.expectFilesError([
+        lib, h.file("main.nio", `
+type A extends json.Thing { int x; }
+`),
+    ], "main.nio", "json is a built-in library; import it first");
+
+    h.expectFilesError([
+        lib, h.file("main.nio", `
+type A extends nowhere.Thing { int x; }
+`),
+    ], "main.nio", "unknown module \"nowhere\"");
+});
+
+// Compiles src and checks that the runtime files it selected equal want. The
+// list is comma-separated, so the order is checked too: the core first, then
+// the modules' dependency order.
+void expectCFiles(String src, String dir, String want) {
+    loader.CompileResult res = loader.compileEntry(src, dir, "", codegen.noOptions());
+    if (res.errs.length > 0) {
+        return Error("unexpected errors: " + string.join(res.errs, "; "));
+    }
+    String got = string.join(res.cfiles, ",");
+    if (got != want) {
+        return Error("got " + got + ", want " + want);
+    }
+}
+
+// A built-in module may need more from the linker than its own C file:
+// sockets on Windows are Winsock, so net names ws2_32 there. The driver and
+// the generated bootstrap script must agree about those flags.
+test.start("modules: link flags name real modules and follow the host", void () -> {
+    forEach(map.keys(loader.builtinLinkFlags), name) {
+        if (loader.builtinCFiles[name] == null) {
+            return Error("link flags are mapped for \"" + name
+                + "\", which is not a built-in module with a C file");
+        }
+        loader.LinkFlags? flags = loader.builtinLinkFlags[name];
+        if (flags == null || flags.windows.length + flags.unix.length == 0) {
+            return Error("\"" + name + "\" maps to an empty flag list; leave it out instead");
+        }
+    }
+    // Every flag here is a Windows flag, so on another host the program links
+    // nothing extra. The flags depend on the host as well as on the module.
+    loader.CompileResult res = loader.compileEntry("import 'net';\n", ".", "", codegen.noOptions());
+    if (res.errs.length > 0) {
+        return Error("importing net failed: " + string.join(res.errs, "; "));
+    }
+    if (array.indexOf(res.cfiles, "lib/net.c") < 0) {
+        return Error("importing net did not select lib/net.c, got " + string.join(res.cfiles, ","));
+    }
+    String want = "";
+    if (loader.hostOS() == "windows") {
+        want = "-lws2_32";
+    }
+    if (string.join(res.libs, " ") != want) {
+        return Error("net selected libs \"" + string.join(res.libs, " ") + "\", want \"" + want + "\"");
+    }
+    // math needs a flag on Unix: libm is -lm on every Unix except macOS, and
+    // nothing on Windows.
+    loader.CompileResult m = loader.compileEntry("import 'math';\n", ".", "", codegen.noOptions());
+    if (m.errs.length > 0) {
+        return Error("importing math failed: " + string.join(m.errs, "; "));
+    }
+    String wantM = "-lm";
+    if (loader.hostOS() == "windows") {
+        wantM = "";
+    }
+    if (string.join(m.libs, " ") != wantM) {
+        return Error("math selected libs \"" + string.join(m.libs, " ") + "\", want \"" + wantM + "\"");
+    }
+    // A program that imports nothing needing one names no library.
+    loader.CompileResult bare = loader.compileEntry("print(1);\n", ".", "", codegen.noOptions());
+    if (bare.libs.length != 0) {
+        return Error("a program importing nothing selected libs: " + string.join(bare.libs, " "));
+    }
+});
+
+test.start("modules: a binary is a .exe on Windows and the name given elsewhere", void () -> {
+    // Windows runs a program by its extension, so the driver adds .exe to an
+    // output name that lacks it, once. Every other host uses the name as given.
+    String[] names = ["nio", "out/prog", "prog.exe", "a.b"];
+    forEach(names, n) {
+        String got = driver.exeName(n);
+        String want = n;
+        if (loader.hostOS() == "windows" && !str.hasSuffix(n, ".exe")) {
+            want = n + ".exe";
+        }
+        if (got != want) {
+            return Error("exeName(\"" + n + "\") = \"" + got + "\", want \"" + want + "\"");
+        }
+        if (driver.exeName(got) != got) {
+            return Error("exeName is not idempotent on \"" + got + "\"");
+        }
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Re-export (§5.4)
+// ---------------------------------------------------------------------------
+
+test.start("modules: a re-export republishes a surface under this module's name", void () -> {
+    h.expectFilesOutput([
+        h.file("der.nio", `
+export type Tlv {
+    int tag;
+}
+
+export enum Code {
+    OK: 1,
+}
+
+export int const LIMIT = 42;
+
+export Tlv readTlv(int tag) { return { tag: tag }; }
+`),
+        h.file("lib.nio", `
+import './der' as der;
+
+export der show Tlv, readTlv, Code, LIMIT;
+`),
+        h.file("main.nio", `
+import 'lib' as lib;
+lib.Tlv t = lib.readTlv(7);
+print(t.tag);
+print(lib.LIMIT);
+print(lib.Code.OK);
+`),
+    ], "main.nio", ["7", "42", "OK"]);
+});
+
+// A re-export rebinds a name onto the same types.Record, so its id is the one
+// the declaration handed out (§2.10) and a value crosses between the two names.
+test.start("modules: a republished type is the type it was declared", void () -> {
+    h.expectFilesOutput([
+        h.file("der.nio", `
+export type Tlv {
+    int tag;
+}
+export Tlv make(int tag) { return { tag: tag }; }
+`),
+        h.file("lib.nio", `
+import './der' as der;
+
+export der;
+`),
+        h.file("main.nio", `
+import 'lib' as lib;
+import 'der' as der;
+lib.Tlv a = lib.make(3);
+der.Tlv b = a;
+print(b.tag);
+`),
+    ], "main.nio", ["3"]);
+});
+
+test.start("modules: a re-export carries through a chain", void () -> {
+    h.expectFilesOutput([
+        h.file("prim.nio", `
+export int const DEEP = 99;
+export int deepFn(int n) { return n + 1; }
+`),
+        h.file("mid.nio", `
+import './prim' as prim;
+
+export prim;
+`),
+        h.file("top.nio", `
+import './mid' as mid;
+
+export mid;
+`),
+        h.file("main.nio", `
+import 'top' as top;
+print(top.deepFn(10));
+print(top.DEEP);
+`),
+    ], "main.nio", ["11", "99"]);
+});
+
+test.start("modules: hide withholds what it names and all publishes it", void () -> {
+    h.expectFilesError([
+        h.file("der.nio", `
+export int helper(int n) { return n * 2; }
+export int other(int n) { return n; }
+`),
+        h.file("lib.nio", `
+import './der' as der;
+
+export der hide helper;
+`),
+        h.file("main.nio", `
+import 'lib' as lib;
+print(lib.helper(3));
+`),
+    ], "main.nio", "module lib has no exported name \"helper\"");
+    h.expectFilesOutput([
+        h.file("der.nio", `
+export int helper(int n) { return n * 2; }
+`),
+        h.file("lib.nio", `
+import './der' as der;
+
+export der;
+`),
+        h.file("main.nio", `
+import 'lib' as lib;
+print(lib.helper(3));
+`),
+    ], "main.nio", ["6"]);
+});
+
+test.start("modules: a re-export names a module this file imports", void () -> {
+    h.expectFilesError([
+        h.file("main.nio", `
+export nosuch;
+`),
+    ], "main.nio", "is not an imported module");
+    h.expectFilesError([
+        h.file("main.nio", `
+import 'string';
+export string;
+`),
+    ], "main.nio", "it is a built-in library");
+});
+
+test.start("modules: a re-export names what the module exports", void () -> {
+    h.expectFilesError([
+        h.file("der.nio", `
+export int shown() { return 1; }
+int private() { return 2; }
+`),
+        h.file("main.nio", `
+import './der' as der;
+export der show Nope;
+`),
+    ], "main.nio", "module der has no exported name \"Nope\"");
+    h.expectFilesError([
+        h.file("der.nio", `
+export int shown() { return 1; }
+int private() { return 2; }
+`),
+        h.file("main.nio", `
+import './der' as der;
+export der show private;
+`),
+    ], "main.nio", "\"private\" is not exported by module der");
+});
+
+// A surface is a property of the module, so the statement has no meaning in a
+// body. It is an error there.
+test.start("modules: a re-export is top-level only", void () -> {
+    h.expectFilesError([
+        h.file("der.nio", `
+export int shown() { return 1; }
+`),
+        h.file("main.nio", `
+import './der' as der;
+void f() {
+    export der;
+}
+print(1);
+`),
+    ], "main.nio", "only allowed at the top level");
+});
+
+test.start("modules: one name cannot be published twice", void () -> {
+    h.expectFilesError([
+        h.file("der.nio", `
+export int shared() { return 1; }
+`),
+        h.file("mid.nio", `
+import './der' as der;
+
+export der;
+`),
+        h.file("main.nio", `
+import './der' as der;
+import './mid' as mid;
+export der;
+export mid;
+`),
+    ], "main.nio", "is published by both");
+    h.expectFilesError([
+        h.file("der.nio", `
+export int const LIMIT = 1;
+`),
+        h.file("main.nio", `
+import './der' as der;
+export der;
+export int LIMIT = 9;
+`),
+    ], "main.nio", "this file declares \"LIMIT\" itself");
+    // Republishing one surface over itself reports once, not once per name.
+    h.expectFilesError([
+        h.file("der.nio", `
+export int a() { return 1; }
+export int b() { return 2; }
+export int c() { return 3; }
+`),
+        h.file("main.nio", `
+import './der' as der;
+export der;
+export der;
+`),
+    ], "main.nio", "der is republished twice");
+});
+
+// ---------------------------------------------------------------------------
+// Packages
+// ---------------------------------------------------------------------------
+
+// A manifest and a vendored closure. A project-local `modules/` takes priority
+// over the shared cache, so these cases run with no network and no state
+// outside the scratch directory.
+h.File[] packageTree(String projectManifest, String main) {
+    h.File[] files = [];
+    array.push(files, h.file("nio.deps", projectManifest));
+    array.push(files, h.file("main.nio", main));
+    array.push(files, h.file("modules/nio-log@v0.2.0/nio.deps", "package nio-log\n"));
+    array.push(files, h.file("modules/nio-log@v0.2.0/lib.nio", `
+export type Logger {
+    String name;
+}
+export Logger create(String n) { return { name: n }; }
+export String tag(Logger l) { return "[" + l.name + "] v0.2.0"; }
+`));
+    array.push(files, h.file("modules/nio-log@v0.2.5/nio.deps", "package nio-log\n"));
+    array.push(files, h.file("modules/nio-log@v0.2.5/lib.nio", `
+export type Logger {
+    String name;
+}
+export Logger create(String n) { return { name: n }; }
+export String tag(Logger l) { return "[" + l.name + "] v0.2.5"; }
+`));
+    array.push(files, h.file("modules/nio-log@v0.1.4/nio.deps", "package nio-log\n"));
+    array.push(files, h.file("modules/nio-log@v0.1.4/lib.nio", `
+export type Logger {
+    String name;
+}
+export String tag(String n) { return "[" + n + "] v0.1.4"; }
+export String label(Logger l) { return "old:" + l.name; }
+`));
+    array.push(files, h.file("modules/nio-old@v1.0.0/nio.deps", "package nio-old\n"
+        + "require 'nio-log' v0.1.4 as log;\n"));
+    array.push(files, h.file("modules/nio-old@v1.0.0/lib.nio", `
+import 'log' as log;
+export String who() { return "old using " + log.tag("o"); }
+export String describe(log.Logger l) { return log.label(l); }
+`));
+    array.push(files, h.file("modules/nio-db@v1.2.0/nio.deps", "package nio-db\n"
+        + "require 'nio-log' v0.2.5 as log;\n"
+        + "require 'nio-old' v1.0.0 as old;\n"));
+    array.push(files, h.file("modules/nio-db@v1.2.0/lib.nio", `
+import 'log' as log;
+import 'old' as old;
+export String who() {
+    return "db using " + log.tag(log.create("db")) + " and " + old.who();
+}
+`));
+    return files;
+}
+
+String const PROJECT = "package notes\n"
+    + "require 'nio-log' v0.2.0 as log;\n"
+    + "require 'nio-db' v1.2.0 as db;\n";
+
+// An import names a manifest-bound alias: no URL, no version, no path. The
+// alias resolves to the version that the whole build selected, which can be
+// newer than the one this manifest asked for. Semver makes the versions in one
+// band compatible, so the newest version requested satisfies all requirements.
+test.start("packages: an import names an alias, and MVS picks the version", void () -> {
+    // Nothing else asks for nio-log here, so the version asked for is the
+    // version selected.
+    h.expectFilesOutput(packageTree("package notes\n"
+        + "require 'nio-log' v0.2.0 as log;\n", `
+import 'log' as log;
+print(log.tag(log.create("notes")));
+`), "main.nio", ["[notes] v0.2.0"]);
+
+    // Adding nio-db to the manifest is enough to move it. Resolution works on
+    // the graph that the manifests describe, and not on what a file imports.
+    // nio-db asks for v0.2.5 in the same band, so the maximum wins. The
+    // project's own alias moves with it, although this manifest wrote v0.2.0.
+    h.expectFilesOutput(packageTree(PROJECT, `
+import 'log' as log;
+import 'db' as db;
+print(log.tag(log.create("notes")));
+print(db.who());
+`), "main.nio", [
+        "[notes] v0.2.5",
+        "db using [db] v0.2.5 and old using [o] v0.1.4",
+    ]);
+});
+
+// Two bands of one package are two packages, so both can be in one build.
+// nio-db reaches v0.2.5 and nio-old reaches v0.1.4, in one binary.
+test.start("packages: two bands of one package live in one build", void () -> {
+    h.expectFilesOutput(packageTree(PROJECT, `
+import 'db' as db;
+print(db.who());
+`), "main.nio", ["db using [db] v0.2.5 and old using [o] v0.1.4"]);
+});
+
+// §2.10's declaration identity keeps the two bands apart: they are two Logger
+// types, and no value crosses between them. A qual comes from a file name and
+// both files are lib.nio, so the diagnostic names each type by package and
+// version. It also says which package brought in each band and how to unify
+// them.
+String const TWO_BANDS = "package notes\n"
+    + "require 'nio-log' v0.2.5 as log;\n"
+    + "require 'nio-old' v1.0.0 as old;\n";
+
+String const CROSSING = `
+import 'log' as log;
+import 'old' as old;
+print(old.describe(log.create("notes")));
+`;
+
+test.start("packages: two bands' types are two types, named by version", void () -> {
+    h.File[] files = packageTree(TWO_BANDS, CROSSING);
+    h.expectFilesError(files, "main.nio", "cannot use log@v0.2.5.Logger as log@v0.1.4.Logger");
+    h.expectFilesError(files, "main.nio", "log@v0.2.5 is nio-log v0.2.5, required by notes");
+    h.expectFilesError(files, "main.nio", "log@v0.1.4 is nio-log v0.1.4, required by nio-old v1.0.0");
+    h.expectFilesError(files, "main.nio", "`unify 'nio-log' v0.2.5;`");
+});
+
+// With one band, the diagnostic writes the package name and not the version.
+test.start("packages: a type from one band is named by its package", void () -> {
+    h.File[] files = packageTree("package notes\nrequire 'nio-log' v0.2.5 as log;\n", `
+import 'log' as log;
+int x = log.create("notes");
+`);
+    h.expectFilesError(files, "main.nio", "cannot use log.Logger as int");
+    String[] errs = h.compileFailsAt(path.join(h.writeFiles(files), "main.nio"));
+    test.assert(!string.contains(string.join(errs, "\n"), "required by"), string.join(errs, "\n"));
+});
+
+// Two bands unified into one. nio-old was written against v0.1.4 and compiles
+// against the version that unify names, so values now cross between them.
+h.File[] unifyTree(String projectManifest) {
+    h.File[] files = [];
+    array.push(files, h.file("nio.deps", projectManifest));
+    array.push(files, h.file("main.nio", CROSSING));
+    array.push(files, h.file("modules/nio-log@v0.2.5/lib.nio", `
+export type Logger {
+    String name;
+}
+export Logger create(String n) { return { name: n }; }
+export String label(Logger l) { return "v0.2.5:" + l.name; }
+`));
+    array.push(files, h.file("modules/nio-log@v0.1.4/lib.nio", `
+export type Logger {
+    String name;
+}
+export String label(Logger l) { return "v0.1.4:" + l.name; }
+`));
+    array.push(files, h.file("modules/nio-old@v1.0.0/nio.deps", "package nio-old\n"
+        + "require 'nio-log' v0.1.4 as log;\n"));
+    array.push(files, h.file("modules/nio-old@v1.0.0/lib.nio", `
+import 'log' as log;
+export String describe(log.Logger l) { return log.label(l); }
+`));
+    array.push(files, h.file("forks/my-log/lib.nio", `
+export type Logger {
+    String name;
+}
+export Logger create(String n) { return { name: n }; }
+export String label(Logger l) { return "local:" + l.name; }
+`));
+    array.push(files, h.file("modules/me-log@v0.2.6/lib.nio", `
+export type Logger {
+    String name;
+}
+export Logger create(String n) { return { name: n }; }
+export String label(Logger l) { return "fork:" + l.name; }
+`));
+    return files;
+}
+
+test.start("packages: unify makes every band of a package one version", void () -> {
+    h.expectFilesOutput(unifyTree(TWO_BANDS + "unify 'nio-log' v0.2.5;\n"), "main.nio",
+        ["v0.2.5:notes"]);
+});
+
+// A replacement substitutes the source: a fork at a version of its own, or a
+// directory, which is the workflow for two packages written together.
+test.start("packages: replace substitutes a fork or a directory", void () -> {
+    h.expectFilesOutput(unifyTree(TWO_BANDS + "replace 'nio-log' with 'me-log' v0.2.6;\n"),
+        "main.nio", ["fork:notes"]);
+    h.expectFilesOutput(unifyTree(TWO_BANDS + "replace 'nio-log' with './forks/my-log';\n"),
+        "main.nio", ["local:notes"]);
+});
+
+// Only the entry manifest's directives count, so a dependency can never rewrite
+// the graph of the project that uses it.
+test.start("packages: a dependency's directives are ignored", void () -> {
+    h.File[] files = unifyTree(TWO_BANDS);
+    array.push(files, h.file("modules/nio-old@v1.0.0/nio.deps", "package nio-old\n"
+        + "require 'nio-log' v0.1.4 as log;\n"
+        + "unify 'nio-log' v0.1.4;\n"));
+    h.expectFilesError(files, "main.nio", "cannot use log@v0.2.5.Logger as log@v0.1.4.Logger");
+});
+
+// A problem with the packages is reported at its line in nio.deps, and not at
+// the imports it breaks. A reader and an editor see the cause.
+test.start("packages: a manifest problem is reported at its line", void () -> {
+    h.expectFilesError(unifyTree(TWO_BANDS + "unify 'nio-log' v1;\n"), "main.nio",
+        "nio.deps: line 4:1: not a version");
+    h.expectFilesError(unifyTree(TWO_BANDS + "replace 'nio-log' with './nowhere';\n"), "main.nio",
+        "is replaced by");
+    String[] errs = h.compileFailsAt(path.join(h.writeFiles(packageTree("package notes\n"
+        + "require 'nio-absent' v3.0.0 as gone;\n", "import 'gone' as gone;\nprint(1);\n")), "main.nio"));
+    h.expectContains(string.join(errs, "\n"), "nio.deps: line 2:1: package nio-absent v3.0.0 is not in");
+    test.assert(!string.contains(string.join(errs, "\n"), "cannot import"), string.join(errs, "\n"));
+});
+
+// Aliases are per-manifest and local: a dependency may bind the same package
+// under a name of its own, and that has no effect on the project's names.
+test.start("packages: an alias belongs to the manifest that bound it", void () -> {
+    h.expectFilesError(packageTree("package notes\n"
+        + "require 'nio-db' v1.2.0 as db;\n", `
+import 'old' as old;
+print(old.who());
+`), "main.nio", "cannot import 'old'");
+});
+
+test.start("packages: a package that is not there is named", void () -> {
+    h.expectFilesError(packageTree("package notes\n"
+        + "require 'nio-absent' v3.0.0 as gone;\n", `
+print(1);
+`), "main.nio", "is not in modules/ or in the cache");
+});
+
+// A program with no manifest resolves its imports with no package lookup.
+test.start("packages: a project with no manifest is untouched", void () -> {
+    h.expectFilesOutput([
+        h.file("helper.nio", "export int two() { return 2; }\n"),
+        h.file("main.nio", "import './helper' as helper;\nprint(helper.two());\n"),
+    ], "main.nio", ["2"]);
+});
+
+// The hash covers the extracted tree and never the archive. A host's generated
+// tarballs are not byte-stable. A content hash detects a force-moved tag.
+test.start("packages: a tree hashes by content, and a change shows", void () -> {
+    String dir = h.scratch();
+    h.writeTo(dir, "pkg/nio.deps", "package p\n");
+    h.writeTo(dir, "pkg/lib.nio", "export int v() { return 1; }\n");
+    h.writeTo(dir, "pkg/sub/more.nio", "export int w() { return 2; }\n");
+    String p = path.join(dir, "pkg");
+    String first = deps.treeHash(p);
+    test.assert(str.hasPrefix(first, "sha256:"), first);
+    // Stable: the same tree gives the same hash in any readDir order, because
+    // the listing is sorted before it is hashed.
+    test.expectString(deps.treeHash(p), first);
+    // A change anywhere below the root shows.
+    h.writeTo(dir, "pkg/sub/more.nio", "export int w() { return 3; }\n");
+    test.assert(deps.treeHash(p) != first, "a changed file must change the hash");
+});
+
+// Every build checks the trees against the hashes the manifest recorded. This
+// catches a cache that somebody edited, and it needs no network.
+test.start("packages: a tree that changed under its recorded hash is refused", void () -> {
+    h.File[] files = [];
+    array.push(files, h.file("modules/nio-log@v0.2.0/nio.deps", "package nio-log\n"));
+    array.push(files, h.file("modules/nio-log@v0.2.0/lib.nio", "export int v() { return 1; }\n"));
+    array.push(files, h.file("main.nio", "import 'log' as log;\nprint(log.v());\n"));
+    // A hash nothing on disk can match.
+    array.push(files, h.file("nio.deps", "package notes\n"
+        + "require 'nio-log' v0.2.0 as log;\n"
+        + "\n"
+        + "// resolved -- maintained by nio, do not edit\n"
+        + "resolved 'nio-log' v0.2.0 sha256:0000000000000000000000000000000000000000000000000000000000000000;\n"));
+    h.expectFilesError(files, "main.nio", "does not match the hash");
+
+    // With the hash the tree actually has, the same program builds.
+    String dir = h.writeFiles(files);
+    String real = deps.treeHash(path.join(dir, path.localize("modules/nio-log@v0.2.0")));
+    h.writeTo(dir, "nio.deps", "package notes\n"
+        + "require 'nio-log' v0.2.0 as log;\n"
+        + "\n"
+        + "// resolved -- maintained by nio, do not edit\n"
+        + "resolved 'nio-log' v0.2.0 " + real + ";\n");
+    h.Run r = h.runBinary(h.buildEntry(path.join(dir, "main.nio"), false), []);
+    h.checkOutput(r, ["1"]);
+});

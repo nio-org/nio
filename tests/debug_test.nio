@@ -1,0 +1,380 @@
+// Tests of debug information (§1.3-§1.5) on the IR text. Each fragment here is
+// a contract with LLVM. The verifier rejects, or DWARF output drops without an
+// error, a DISubprogram that names no unit, a call with no location, or a
+// module without the Debug Info Version flag.
+//
+// The first case checks that -g off emits no debug information.
+import 'test';
+import 'string';
+import 'array';
+import '../src/lexer' as lexer;
+import '../src/parser' as parser;
+import '../src/checker' as checker;
+import '../src/codegen' as codegen;
+import '../src/module' as module;
+import '../src/ast' as ast;
+import '../src/lib/str' as str;
+
+String generate(String src, bool debug) {
+    parser.Parser p = parser.newParser(lexer.newLexer(src));
+    ast.Program prog = p.parseProgram();
+    if (p.errs.length > 0) {
+        return Error("parse errors: " + string.join(p.errs, "\n"));
+    }
+    checker.CheckResult res = checker.check(prog);
+    if (res.errs.length > 0) {
+        return Error("check errors: " + string.join(res.errs, "\n"));
+    }
+    module.Module m = { prog: prog, info: res.info, qual: "", path: "prog.nio" };
+    codegen.Options opts = { coverage: false, debug: debug, release: false, targetAttrs: "" };
+    return codegen.generate([m], opts);
+}
+
+void wants(String ir, String[] fragments) {
+    forEach(fragments, want) {
+        if (!string.contains(ir, want)) {
+            return Error("IR missing \"" + want + "\"\n---\n" + ir);
+        }
+    }
+}
+
+String const sample = `int add(int a, int b) {
+    int s = a + b;
+    return s;
+}
+print(add(2, 3));
+`;
+
+// Off means that nothing is emitted. Coverage obeys the same rule and has the
+// same test. A flag must cost nothing when it is off.
+test.start("debug: -g off emits no metadata at all", void () -> {
+    String ir = generate(sample, false);
+    forEach(["!DI", "!dbg", "llvm.dbg.cu", "Debug Info Version"], never) {
+        if (string.contains(ir, never)) {
+            return Error("IR carries \"" + never + "\" with -g off\n---\n" + ir);
+        }
+    }
+    // Two compiles with -g off give identical IR.
+    String again = generate(sample, false);
+    test.expectString(again, ir);
+});
+
+test.start("debug: -g names the unit, the file and the flags", void () -> {
+    String ir = generate(sample, true);
+    wants(ir, [
+        "!llvm.dbg.cu = !{",
+        "!llvm.module.flags = !{",
+        "!{i32 2, !\"Debug Info Version\", i32 3}",
+        "!{i32 7, !\"Dwarf Version\", i32 4}",
+        "distinct !DICompileUnit(language: DW_LANG_C99",
+        "producer: \"nio\"",
+        "!DIFile(filename: \"prog.nio\"",
+    ]);
+});
+
+// A DISubprogram has the name that a panic prints. Thus the debugger and the
+// panic call chain show the same function names.
+test.start("debug: every function gets a DISubprogram, named as it was written", void () -> {
+    String ir = generate(`type Car {
+    int n;
+    int drive(int d) {
+        return d;
+    }
+}
+int apply(Function(int)<int> f) {
+    return f(1);
+}
+int outer() {
+    return apply(int (int n) -> n + 1);
+}
+Car c = { n: 1 };
+print(c.drive(2) + outer());
+`, true);
+    wants(ir, [
+        "!DISubprogram(name: \"Car.drive\"",
+        "!DISubprogram(name: \"apply\"",
+        "!DISubprogram(name: \"outer\"",
+        "!DISubprogram(name: \"<function literal in outer>\"",
+        "!DISubprogram(name: \"main\"",
+    ]);
+});
+
+// A definition with debug information must name its subprogram. LLVM drops a
+// definition that does not. A subprogram that defines a function must name the
+// unit, or the verifier rejects it.
+test.start("debug: every define names its subprogram, every subprogram its unit", void () -> {
+    String ir = generate(sample, true);
+    forEach(string.split(ir, "\n"), line) {
+        if (!str.hasPrefix(line, "define ")) {
+            continue;
+        }
+        if (!string.contains(line, "!dbg !")) {
+            return Error("a definition carries no subprogram: " + line);
+        }
+    }
+    forEach(string.split(ir, "\n"), line) {
+        if (!string.contains(line, "!DISubprogram(")) {
+            continue;
+        }
+        if (!string.contains(line, "spFlags: DISPFlagDefinition") || !string.contains(line, ", unit: !")) {
+            return Error("a subprogram defines nothing or names no unit: " + line);
+        }
+    }
+});
+
+// The instructions of a statement carry the line of that statement. A
+// breakpoint resolves through this line.
+test.start("debug: a statement's line reaches its instructions", void () -> {
+    String ir = generate(`int f(int n) {
+    int a = n + 1;
+    int b = a + 2;
+    return b;
+}
+print(f(1));
+`, true);
+    // Three statements on lines 2, 3 and 4, each with a location of its own.
+    wants(ir, [
+        "!DILocation(line: 2, column: 5",
+        "!DILocation(line: 3, column: 5",
+        "!DILocation(line: 4, column: 5",
+    ]);
+    // The instruction that adds 2 has the line of the addition.
+    String[] lines = string.split(ir, "\n");
+    String want = locOf(ir, 3, 5);
+    if (want == "") {
+        return Error("no DILocation for line 3\n---\n" + ir);
+    }
+    bool found = false;
+    forEach(lines, l) {
+        if (string.contains(l, "add i64") && string.contains(l, "!dbg " + want)) {
+            found = true;
+        }
+    }
+    if (!found) {
+        return Error("no add carries " + want + "\n---\n" + ir);
+    }
+});
+
+// Returns the "!n" of the DILocation for a position, or "" when there is none.
+String locOf(String ir, int line, int col) {
+    String want = "!DILocation(line: " + string.from(line) + ", column: " + string.from(col) + ",";
+    forEach(string.split(ir, "\n"), l) {
+        if (!string.contains(l, want)) {
+            continue;
+        }
+        int eq = string.find(l, " = ");
+        if (eq > 0) {
+            return string.substring(l, 0, eq);
+        }
+    }
+    return "";
+}
+
+// A local and a parameter each have a name, a type and a location, so a
+// debugger can read them.
+test.start("debug: locals and parameters are described", void () -> {
+    String ir = generate(`int f(int n) {
+    int total = n + 1;
+    String label = "x";
+    return total;
+}
+print(f(1));
+`, true);
+    wants(ir, [
+        "!DILocalVariable(name: \"n\", arg: 1,",
+        "!DILocalVariable(name: \"total\",",
+        "!DILocalVariable(name: \"label\",",
+        "!DIBasicType(name: \"int\", size: 64, encoding: DW_ATE_signed)",
+        "!DIDerivedType(tag: DW_TAG_typedef, name: \"String\"",
+        "call void @llvm.dbg.declare(",
+        "declare void @llvm.dbg.declare(metadata, metadata, metadata)",
+    ]);
+});
+
+// A String, a record or an array is in a shadow-stack slot, with no alloca of
+// its own. The slot address is a getelementptr, and LLVM attaches no variable
+// to it. The variable is described as "%gcslots plus N bytes", and so reaches
+// DWARF. A declaration at the getelementptr is dropped at -O0 and at -O2.
+test.start("debug: a rooted local is placed in the shadow stack", void () -> {
+    String ir = generate(`int f(String s) {
+    String label = s + "!";
+    return 1;
+}
+print(f("x"));
+`, true);
+    wants(ir, [
+        "!DILocalVariable(name: \"s\", arg: 1,",
+        "!DILocalVariable(name: \"label\",",
+        "metadata ptr %gcslots, metadata !",
+        "!DIExpression(DW_OP_plus_uconst, 0)",
+    ]);
+    forEach(string.split(ir, "\n"), line) {
+        if (string.contains(line, "@llvm.dbg.declare(metadata ptr %r")) {
+            return Error("a variable is declared at a slot's getelementptr: " + line);
+        }
+    }
+});
+
+// The debug information must tell the two integer families apart. This is the
+// distinction of §2.1: the bits are the same, but they are read differently.
+test.start("debug: an unsigned local is described as unsigned", void () -> {
+    String ir = generate(`void show() {
+    uint8 b = 200;
+    print(b);
+}
+show();
+`, true);
+    wants(ir, ["encoding: DW_ATE_unsigned"]);
+});
+
+// The locals of an async body are in the heap frame that the scheduler owns.
+// Thus they are described as an offset from the frame pointer. The optimizer
+// drops a variable described by a plain address, so this test checks the
+// expression as well as the name.
+test.start("debug: an async local is placed in the frame", void () -> {
+    String ir = generate(`import 'time';
+int async work(int n) {
+    int before = n * 2;
+    await time.sleep(1);
+    return before;
+}
+print(await work(5));
+`, true);
+    wants(ir, [
+        "!DILocalVariable(name: \"before\",",
+        "metadata ptr %frame, metadata !",
+        "!DIExpression(DW_OP_plus_uconst, ",
+    ]);
+    // The step function must name its subprogram. A variable whose scope is in
+    // no function is dropped from DWARF with no error.
+    forEach(string.split(ir, "\n"), line) {
+        if (str.hasPrefix(line, "define internal i64 ") && string.contains(line, ".step(ptr %frame)")) {
+            if (!string.contains(line, "!dbg !")) {
+                return Error("the step function names no subprogram: " + line);
+            }
+        }
+    }
+});
+
+// A variable that a function value captures is in a heap box that the closures
+// share. Thus its slot holds the address of the value.
+test.start("debug: a captured variable is described through its box", void () -> {
+    String ir = generate(`int counter = 0;
+void bump() {
+    int seen = 0;
+    Function()<void> f = void () -> { seen = seen + 1; };
+    f();
+    print(seen);
+}
+bump();
+`, true);
+    wants(ir, ["DW_OP_deref"]);
+});
+
+// A debugger must show each name that a form binds: a type case, the element
+// and index of a forEach, a catch, and the captures of a closure. Each has its
+// own binding site in codegen, so this test checks each by name.
+test.start("debug: every binding form is described", void () -> {
+    String ir = generate(`import 'string';
+sealed type Shape { }
+type Dot extends Shape { int r; }
+int size(Shape s) {
+    switch (s) {
+        case Dot d:
+            return d.r;
+    }
+}
+int parse(String text) {
+    int n = string.toInt(text) catch e {
+        return e.code;
+    };
+    return n;
+}
+int make(int base) {
+    Function(int)<int> f = int (int x) -> x + base;
+    return f(2);
+}
+int total = 0;
+forEach([1, 2], v, i) {
+    total = total + v * i;
+}
+Dot dot = { r: 1 };
+print(size(dot) + parse("x") + make(1) + total);
+`, true);
+    wants(ir, [
+        "!DILocalVariable(name: \"d\",",
+        "!DILocalVariable(name: \"e\",",
+        "!DILocalVariable(name: \"v\",",
+        "!DILocalVariable(name: \"i\",",
+        "!DILocalVariable(name: \"base\", arg: 1,",
+        "!DILocalVariable(name: \"base\", scope:",
+    ]);
+});
+
+// A top-level variable is a global. A global is described where it is
+// defined. The unit must list it, and the definition must name it. Otherwise a
+// consumer finds only one half of the pair.
+test.start("debug: a global is described and listed by the unit", void () -> {
+    String ir = generate(`int counter = 41;
+String label = "x";
+print(counter);
+print(label);
+`, true);
+    wants(ir, [
+        "distinct !DIGlobalVariable(name: \"counter\"",
+        "distinct !DIGlobalVariable(name: \"label\"",
+        "!DIGlobalVariableExpression(var: ",
+        ", globals: !",
+    ]);
+    forEach(string.split(ir, "\n"), line) {
+        if (str.hasPrefix(line, "@gv.")) {
+            if (!string.contains(line, "!dbg !")) {
+                return Error("a global carries no description: " + line);
+            }
+        }
+    }
+});
+
+// Each call must have a location. LLVM's verifier refuses a call without one
+// in a function that has debug information. It then drops all debug
+// information in the program, with no error, and the build succeeds. A
+// fall-through panic is two instructions emitted together, and its location
+// must go on the call and not only after the unreachable. The program below
+// ends a function on an exhaustive type switch, which emits such a panic.
+test.start("debug: every call carries a location", void () -> {
+    String ir = generate(`sealed type Shape {
+    int n;
+}
+type Dot extends Shape {}
+type Line extends Shape {}
+int size(Shape s) {
+    switch (s) {
+        case Dot d:
+            return 1;
+        case Line l:
+            return 2;
+    }
+}
+Dot d = { n: 0 };
+print(size(d));
+`, true);
+    if (!string.contains(ir, "@rt_panic")) {
+        return Error("the program grew no fall-through panic, so this proves nothing");
+    }
+    forEach(string.split(ir, "\n"), line) {
+        String t = string.trim(line);
+        if (!str.hasPrefix(t, "call ") && !str.hasPrefix(t, "%")) {
+            continue;
+        }
+        if (!string.contains(t, "call ")) {
+            continue;
+        }
+        // Skip declarations and metadata nodes. They are not instructions.
+        if (str.hasPrefix(t, "declare ") || str.hasPrefix(t, "!")) {
+            continue;
+        }
+        if (!string.contains(t, "!dbg !")) {
+            return Error("a call carries no location: " + t);
+        }
+    }
+});

@@ -1,0 +1,249 @@
+// The command line of nio. Flags come before the file, because under `run`
+// every argument after the file goes to the program.
+import './driver' as driver;
+import './loader' as loader;
+import './codegen' as codegen;
+import './package' as pkg;
+import './fmtcmd' as fmtcmd;
+import './doccmd' as doccmd;
+import './testcmd' as testcmd;
+import './getcmd' as getcmd;
+import './version' as version;
+import './lsp/server' as lsp;
+import 'fs';
+import 'string';
+import 'lib/str' as str;
+import 'array';
+import 'os';
+import 'process';
+
+void writeOut(String s) {
+    process.stdout.write(s);
+}
+
+void writeErr(String s) {
+    process.stderr.write(s);
+}
+
+void usage() {
+    writeErr("usage: nio <command> [flags] <file.nio>\n");
+    writeErr("  build <file.nio> [-o output]   compile to a native executable\n");
+    writeErr("  run   <file.nio> [args...]     compile and run, forwarding args\n");
+    writeErr("  emit  <file.nio>               print the generated LLVM IR\n");
+    writeErr("  package <file.nio>             build an installable application\n");
+    writeErr("                                 (nio package --help for its flags)\n");
+    writeErr("  format <path>...               rewrite files in the one canonical\n");
+    writeErr("                                 style; a directory means every .nio\n");
+    writeErr("                                 file under it, and -l only lists the\n");
+    writeErr("                                 files that are not formatted yet\n");
+    writeErr("  test  [path]...                run every *_test.nio under a path\n");
+    writeErr("                                 (nio test --help for its flags)\n");
+    writeErr("  get   [<package> <version>]    fetch what nio.deps requires, or require\n");
+    writeErr("                                 a version of a package and fetch it\n");
+    writeErr("  update [package]...            move requirements to the newest\n");
+    writeErr("                                 version of their band\n");
+    writeErr("  vendor                         copy the resolved packages into ./modules\n");
+    writeErr("  doc   <module|file> [name]     print what a module declares, with\n");
+    writeErr("                                 the prose written above it\n");
+    writeErr("  lsp                            speak the Language Server Protocol\n");
+    writeErr("                                 on stdin/stdout, for an editor\n");
+    writeErr("  version                        print the version and the host\n");
+    writeErr("flags (before the file):\n");
+    writeErr("  --release                      optimize the whole program: clang at -O2\n");
+    writeErr("                                 with -flto, which is what makes generated\n");
+    writeErr("                                 code fast and what makes a large build\n");
+    writeErr("                                 slow. Without it a build is the edit\n");
+    writeErr("                                 loop's: -O0, no LTO, far quicker\n");
+    writeErr("  -g                             emit debug information for a debugger\n");
+    writeErr("  --coverage                     instrument for statement coverage;\n");
+    writeErr("                                 writes LCOV to $NIO_COVERAGE_FILE\n");
+    writeErr("                                 (default coverage.lcov) on exit\n");
+}
+
+// Returns the line `nio version` writes. It includes the host, so that a bug
+// report names it.
+String versionLine() {
+    return "nio " + version.VERSION + " " + os.getPlatform() + "/" + os.getArch();
+}
+
+// The result of parseFlags. A function has one result (§7), so the three
+// values are a record.
+type Flags {
+    String[] rest;
+    codegen.Options opts;
+    String? err;
+}
+
+// Returns the arguments from index `from` onward. §2.3 has no slice syntax.
+String[] tail(String[] args, int from) {
+    String[] out = [];
+    for (int i = from; i < args.length; i++) {
+        array.push(out, args[i]);
+    }
+    return out;
+}
+
+// Removes the flags of nio from the front of the arguments. It stops at the
+// first argument that is not a flag, which is the source file.
+Flags parseFlags(String[] args) {
+    Flags f = { rest: [], opts: codegen.noOptions(), err: null };
+    int i = 0;
+    // -g has the spelling other compilers use, so the loop accepts it with the
+    // long flags. It is the only short flag here. -o belongs to `build` and is
+    // read after the file.
+    while (i < args.length && (str.hasPrefix(args[i], "--") || args[i] == "-g")) {
+        if (args[i] == "--coverage") {
+            f.opts.coverage = true;
+        } else if (args[i] == "--release") {
+            f.opts.release = true;
+        } else if (args[i] == "-g") {
+            f.opts.debug = true;
+        } else {
+            f.err = "unknown flag " + args[i];
+            return f;
+        }
+        i++;
+    }
+    f.rest = tail(args, i);
+    return f;
+}
+
+// `nio format`. With -l it changes no file and lists the files that are not
+// formatted. The status is then 1 if it found any, for use as a CI check.
+int formatCmd(String[] args) {
+    bool listOnly = false;
+    String[] paths = [];
+    forEach(args, a) {
+        if (a == "-l") {
+            listOnly = true;
+            continue;
+        }
+        array.push(paths, a);
+    }
+    // A path is required. A command that rewrites files in place does not use
+    // the working directory as a default.
+    if (paths.length == 0) {
+        writeErr("usage: nio format [-l] <path>...   (a directory means every .nio file under it)\n");
+        return 2;
+    }
+    int bad = 0;
+    int changed = 0;
+    forEach(fmtcmd.formatPaths(paths, listOnly), r) {
+        String? failed = r.err;
+        if (failed != null) {
+            writeErr(r.path + ": " + failed + "\n");
+            bad++;
+            continue;
+        }
+        if (r.changed) {
+            changed++;
+            writeOut(r.path + "\n");
+        }
+    }
+    if (bad > 0) {
+        return 1;
+    }
+    if (listOnly && changed > 0) {
+        return 1;
+    }
+    return 0;
+}
+
+// Runs the whole command line and returns the exit status. It is async because
+// every function that starts clang is async (§6.12).
+export int async run(String[] args) {
+    if (args.length < 1) {
+        usage();
+        return 2;
+    }
+    // The version comes before anything that can fail, because a bug report
+    // starts with it.
+    if (args[0] == "version" || args[0] == "--version") {
+        writeOut(versionLine() + "\n");
+        return 0;
+    }
+    // lsp is the only command with no file. It runs until the editor closes
+    // the connection. It accepts and ignores `--stdio`.
+    if (args[0] == "lsp") {
+        return lsp.serve();
+    }
+    // `package` parses its own flags, and its --setup form takes no file.
+    if (args[0] == "package") {
+        return await pkg.packageCmd(tail(args, 1));
+    }
+    if (args[0] == "format") {
+        return formatCmd(tail(args, 1));
+    }
+    // Both parse their own flags. `doc` needs no clang, because it stops after
+    // the checker.
+    if (args[0] == "doc") {
+        return doccmd.docCmd(tail(args, 1));
+    }
+    if (args[0] == "test") {
+        return await testcmd.testCmd(tail(args, 1));
+    }
+    if (args[0] == "get") {
+        return await getcmd.getCmd(tail(args, 1));
+    }
+    if (args[0] == "update") {
+        return await getcmd.updateCmd(tail(args, 1));
+    }
+    if (args[0] == "vendor") {
+        return await getcmd.vendorCmd(tail(args, 1));
+    }
+    if (args.length < 2) {
+        usage();
+        return 2;
+    }
+    String cmd = args[0];
+    Flags f = parseFlags(tail(args, 1));
+    String? bad = f.err;
+    if (bad != null) {
+        writeErr(bad + "\n");
+        usage();
+        return 2;
+    }
+    if (f.rest.length == 0) {
+        usage();
+        return 2;
+    }
+    if (cmd != "build" && cmd != "run" && cmd != "emit") {
+        usage();
+        return 2;
+    }
+    String file = f.rest[0];
+    byte[] data = fs.readFile(file) catch e {
+        writeErr(e.message + "\n");
+        return 1;
+    };
+    String src = string.fromByteArray(data);
+
+    if (cmd == "build") {
+        String o = loader.stemOf(file);
+        if (f.rest.length >= 3 && f.rest[1] == "-o") {
+            o = f.rest[2];
+        }
+        String? failure = await driver.buildFile(src, file, o, f.opts);
+        if (failure != null) {
+            writeErr(failure + "\n");
+            return 1;
+        }
+        return 0;
+    }
+    if (cmd == "run") {
+        driver.RunResult r = await driver.runFile(src, file, tail(f.rest, 1), f.opts);
+        String? failure = r.err;
+        if (failure != null) {
+            writeErr(failure + "\n");
+        }
+        return r.code;
+    }
+    // The guard above leaves only `emit`.
+    loader.CompileResult res = await driver.compile(src, file, f.opts);
+    if (res.errs.length > 0) {
+        writeErr(driver.compileErrors(file, src, res) + "\n");
+        return 1;
+    }
+    writeOut(res.ir);
+    return 0;
+}

@@ -1,0 +1,261 @@
+// The `test` module (§6.13), end to end: run a program that uses it, then read
+// the report and the exit status. Both are part of its contract.
+import 'test';
+import 'string';
+import 'array';
+import 'map';
+import './harness' as h;
+import '../src/loader' as loader;
+import '../src/codegen' as codegen;
+
+test.start("test module: test module pass and fail", void () -> {
+    h.expectRun(`
+import 'test';
+
+int add(int a, int b) { return a + b; }
+
+test.start("adds", void () -> {
+    test.expectInt(add(2, 2), 4);
+});
+
+test.start("adds badly", void () -> {
+    test.expectInt(add(2, 2), 5);
+});
+
+test.run();
+`, 1, [
+        "ok   adds", "FAIL adds badly - expected 5, got 4", "1 passed, 1 failed",
+    ]);
+});
+
+// A run where everything passes exits 0 and returns, so the program goes on.
+test.start("test module: test module all passing", void () -> {
+    h.expectRun(`
+import 'test';
+
+test.start("first", void () -> { test.assert(true, "never"); });
+test.start("second", void () -> { test.expectString("nio", "nio"); });
+test.run();
+print("after the run");
+`, 0, [
+        "ok   first", "ok   second", "2 passed, 0 failed", "after the run",
+    ]);
+});
+
+// The Error a failed assertion raises leaves the body, so nothing after it in
+// that test runs. The tests after it are untouched.
+test.start("test module: test module stops at first failure", void () -> {
+    h.expectRun(`
+import 'test';
+
+test.start("stops early", void () -> {
+    print("before");
+    test.assert(false, "this one fails");
+    print("after");
+});
+test.start("still runs", void () -> { test.assert(true, "fine"); });
+test.run();
+`, 1, [
+        "before", "FAIL stops early - this one fails", "ok   still runs",
+        "1 passed, 1 failed",
+    ]);
+});
+
+// An error the body never expected is reported as a failure and does not stop
+// the program.
+test.start("test module: test module reports unexpected errors", void () -> {
+    h.expectRun(`
+import 'test';
+import 'string';
+
+test.start("parses a number", void () -> {
+    test.expectInt(string.toInt("nope"), 3);
+});
+test.run();
+`, 1, [
+        "FAIL parses a number - string.toInt \"nope\": not an integer",
+        "0 passed, 1 failed",
+    ]);
+});
+
+// A body that cannot fail is still accepted where a fallible one is expected.
+test.start("test module: test module infallible body", void () -> {
+    h.expectRun(`
+import 'test';
+
+test.start("does nothing in particular", void () -> { print("hello"); });
+test.run();
+`, 0, [
+        "hello", "ok   does nothing in particular", "1 passed, 0 failed",
+    ]);
+});
+
+test.start("test module: test module expectations", void () -> {
+    h.expectRun(`
+import 'test';
+
+enum Color { red: 0, green: 1 }
+
+test.start("ints", void () -> { test.expectInt(7, 8); });
+test.start("narrow ints widen", void () -> {
+    int8 small = 3;
+    test.expectInt(small, 3);
+});
+test.start("enums compare as numbers", void () -> { test.expectInt(Color.green, 1); });
+test.start("floats", void () -> { test.expectFloat(0.5, 0.25); });
+test.start("floats near", void () -> { test.expectFloatNear(0.1 + 0.2, 0.3, 0.0001); });
+test.start("floats not near enough", void () -> { test.expectFloatNear(1.0, 2.0, 0.5); });
+test.start("strings", void () -> { test.expectString("nio", "Nio"); });
+test.start("bools", void () -> { test.expectBool(1 > 2, true); });
+test.run();
+`, 1, [
+        "FAIL ints - expected 8, got 7", "ok   narrow ints widen",
+        "ok   enums compare as numbers", "FAIL floats - expected 0.25, got 0.5",
+        "ok   floats near",
+        "FAIL floats not near enough - expected 2 within 0.5, got 1",
+        "FAIL strings - expected \"Nio\", got \"nio\"",
+        "FAIL bools - expected true, got false", "3 passed, 5 failed",
+    ]);
+});
+
+// Async tests all start before run() awaits any of them, so every task reaches
+// its first await before any finishes. Results report in registration order.
+test.start("test module: test module async interleaves", void () -> {
+    h.expectRun(`
+import 'test';
+
+void async yield() {}
+
+void async job(String name) {
+    print(name + " starts");
+    await yield();
+    print(name + " finishes");
+    test.assert(name != "C", name + " was never going to pass");
+}
+
+test.startAsync("A", job("A"));
+test.startAsync("B", job("B"));
+test.startAsync("C", job("C"));
+test.run();
+`, 1, [
+        "A starts", "B starts", "C starts", "A finishes", "ok   A", "B finishes",
+        "ok   B", "C finishes", "FAIL C - C was never going to pass",
+        "2 passed, 1 failed",
+    ]);
+});
+
+// Sync and async tests share one tally, and a sync result reports before run()
+// awaits the first task.
+test.start("test module: test module mixes sync and async", void () -> {
+    h.expectRun(`
+import 'test';
+
+void async slow(int want) {
+    await ready();
+    test.expectInt(41 + 1, want);
+}
+void async ready() {}
+
+test.startAsync("late", slow(42));
+test.start("early", void () -> { test.expectInt(1, 1); });
+test.run();
+`, 0, [
+        "ok   early", "ok   late", "2 passed, 0 failed",
+    ]);
+});
+
+// run() clears the tasks it waited for and keeps counting, so a program can
+// report in stages.
+test.start("test module: test module run twice", void () -> {
+    h.expectRun(`
+import 'test';
+
+void async ok() { test.assert(true, "fine"); }
+
+test.startAsync("first batch", ok());
+test.run();
+test.startAsync("second batch", ok());
+test.run();
+`, 0, [
+        "ok   first batch", "1 passed, 0 failed", "ok   second batch",
+        "2 passed, 0 failed",
+    ]);
+});
+
+// The name is free when the file gives it a meaning of its own, like every
+// other built-in library name.
+test.start("test module: test name is free when not imported", void () -> {
+    h.expectOutput(`
+String test = "an ordinary variable";
+print(test);
+`, [
+        "an ordinary variable",
+    ]);
+});
+
+// A stdlib module written in Nio pulls in the C files its own imports need, so
+// importing `test` links array, string and process, and not json.
+test.start("test module: selects its imports' C files", void () -> {
+    loader.CompileResult res = loader.compileEntry(`
+import 'test';
+test.start("x", void () -> { test.assert(true, "fine"); });
+test.run();
+`, ".", "", codegen.noOptions());
+    if (res.errs.length > 0) {
+        return Error("unexpected errors: " + string.join(res.errs, "; "));
+    }
+    forEach(["lib/array.c", "lib/string.c", "lib/process.c"], want) {
+        if (array.indexOf(res.cfiles, want) < 0) {
+            return Error("importing 'test' did not select \"" + want + "\", got "
+                + string.join(res.cfiles, ","));
+        }
+    }
+    if (array.indexOf(res.cfiles, "lib/json.c") >= 0) {
+        return Error("importing 'test' should not select lib/json.c, got "
+            + string.join(res.cfiles, ","));
+    }
+});
+
+// A mistake in a built-in Nio module is an ordinary compile error, and reaches
+// only the programs that import it.
+test.start("test module: builtin nio modules compile", void () -> {
+    forEach(map.keys(loader.builtinNioModules), name) {
+        loader.CompileResult res = loader.compileEntry("import '" + name + "';\n",
+            ".", "", codegen.noOptions());
+        if (res.errs.length > 0) {
+            return Error("importing the built-in \"" + name + "\" failed: "
+                + string.join(res.errs, "; "));
+        }
+    }
+});
+
+// `test` claims its qual before any user module gets one, so a local ./test.nio
+// becomes test_2 and both live in one program.
+test.start("test module: local test module does not collide with the builtin", void () -> {
+    h.expectFilesOutput([
+        h.file("test.nio", `
+export type Result { String label; }
+export String describe() { return "local test.nio"; }
+`),
+        h.file("main.nio", `
+import './test' as local;
+import 'test';
+
+print(local.describe());
+local.Result r = { label: "mine" };
+print(getType(r));
+test.start("the built-in one", void () -> { test.expectInt(2, 2); });
+test.run();
+`),
+    ], "main.nio", [
+        "local test.nio", "test_2.Result", "ok   the built-in one",
+        "1 passed, 0 failed",
+    ]);
+});
+
+// `test` is a module, so it gets the same diagnostic as every other built-in
+// library.
+test.start("test module: must be imported", void () -> {
+    h.expectFilesError([h.file("main.nio", `test.start("x", void () -> { print("hi"); });`)],
+        "main.nio", "test is a built-in library; import it first");
+});

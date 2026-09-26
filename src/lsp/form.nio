@@ -1,0 +1,163 @@
+// Writes a declaration back as the source that declares it: a record with its
+// fields, a union with its members, an enum with its members.
+//
+// A hover shows one declaration, and `nio doc` (src/doccmd.nio) shows a whole
+// module. Both use these writers, so the two cannot describe one declaration
+// differently.
+//
+// A record and an enum have one writer for each source, as sig.nio has for a
+// function. A hover often holds only the checked type of a record from another
+// module's exports. `nio doc` always holds the declaration, with the file's own
+// spelling.
+//
+// A union (§2.11) is a sealed record with generated extenders. No program can
+// write either, so both appear as the `union` that produced them. A union has
+// one writer, because the parser generates its members and no file holds a
+// tree of them.
+import '../ast' as ast;
+import '../types' as types;
+import '../checker' as checker;
+import './sig' as sig;
+import 'string';
+import 'array';
+
+// A function value type in declaration form. It has no parameter names, so use
+// sig.fromDecl when the declaration is available.
+export String signature(types.FuncType f, String name) {
+    return sig.fromType(f, name, [], false);
+}
+
+// Writes a record type as its declaration, with its fields and its methods.
+export String recordDecl(types.Record r) {
+    if (checker.unionPayload(r) != null) {
+        return unionMemberDecl(r);
+    }
+    if (checker.isUnion(r)) {
+        return unionDecl(r);
+    }
+    String[] lines = [];
+    String head = "type " + r.name;
+    types.Record? base = r.base;
+    if (base != null) {
+        head = head + " extends " + base.name;
+    }
+    if (r.sealed) {
+        head = "sealed " + head;
+    }
+    array.push(lines, head + " {");
+    forEach(r.fields, f) {
+        array.push(lines, "    " + types.typeString(f.type) + " " + f.name + ";");
+    }
+    forEach(r.methods, m) {
+        array.push(lines, "    " + signature(m.sig, m.name) + ";");
+    }
+    array.push(lines, "}");
+    return string.join(lines, "\n");
+}
+
+// Writes a union back as its declaration: each member as its type and its tag,
+// in the order the source wrote them (§2.11).
+export String unionDecl(types.Record u) {
+    String[] members = [];
+    forEach(u.extenders, e) {
+        types.Type? pay = checker.unionPayload(e);
+        if (pay != null) {
+            array.push(members, memberLine(checker.unionTag(e), pay));
+        }
+    }
+    String[] lines = [];
+    array.push(lines, "union " + u.name + " {");
+    forEach(members, m, i) {
+        String end = ",";
+        if (i + 1 == members.length) {
+            end = "";
+        }
+        array.push(lines, "    " + m + end);
+    }
+    array.push(lines, "}");
+    return string.join(lines, "\n");
+}
+
+// Writes one member as its type and its tag. It omits a tag equal to the type
+// name, which is the default tag (§2.11).
+String memberLine(String tag, types.Type payload) {
+    String written = types.typeString(payload);
+    if (ownName(payload) == tag) {
+        return written;
+    }
+    return written + " " + tag;
+}
+
+// The name of a named type without the qualifier that a hover adds.
+// `geo.Point` is declared as `Point`, and that name is its default tag.
+String ownName(types.Type t) {
+    types.Record? rec = t as types.Record;
+    if (rec != null) {
+        return rec.name;
+    }
+    types.Enum? en = t as types.Enum;
+    if (en != null) {
+        return en.name;
+    }
+    return types.typeString(t);
+}
+
+// Writes one member as `Text.Bytes(byte[])`: the form that a program writes, a
+// `case` binds and an `as` returns. The record behind it does not appear,
+// because its generated names contain a character that §1.3 keeps out of
+// identifiers.
+export String unionMemberDecl(types.Record arm) {
+    types.Type? pay = checker.unionPayload(arm);
+    if (pay == null) {
+        return "";
+    }
+    return types.typeString(arm) + "(" + types.typeString(pay) + ")";
+}
+
+export String enumDecl(types.Enum e) {
+    String[] lines = [];
+    array.push(lines, "enum " + e.name + " {");
+    forEach(e.members, m) {
+        array.push(lines, "    " + m.name + ": " + string.from(m.value) + ",");
+    }
+    array.push(lines, "}");
+    return string.join(lines, "\n");
+}
+
+// Writes a record from the declaration in the file, so a reference reads as the
+// file does. It writes only the fields. A caller with the tree also has the
+// prose of each method, and prints the methods under the type.
+export String recordWritten(ast.TypeDeclStatement td) {
+    String[] lines = [];
+    String head = "type " + td.name;
+    ast.NamedType? base = td.extends;
+    if (base != null) {
+        head = head + " extends " + ast.typeNodeString(base);
+    }
+    if (td.sealed) {
+        head = "sealed " + head;
+    }
+    if (td.exported) {
+        head = "export " + head;
+    }
+    array.push(lines, head + " {");
+    forEach(td.fields, f) {
+        array.push(lines, "    " + ast.fieldDefString(f));
+    }
+    array.push(lines, "}");
+    return string.join(lines, "\n");
+}
+
+export String enumWritten(ast.EnumDeclStatement en) {
+    String[] lines = [];
+    String head = "enum " + en.name;
+    if (en.exported) {
+        head = "export " + head;
+    }
+    array.push(lines, head + " {");
+    forEach(en.members, m) {
+        array.push(lines, "    " + m.name + ": " + string.from(m.value) + ",");
+    }
+    array.push(lines, "}");
+    return string.join(lines, "\n");
+}

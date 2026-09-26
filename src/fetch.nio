@@ -1,0 +1,196 @@
+// Fetches a package: a tag tarball over HTTPS, into a cache that all projects
+// share.
+//
+// A package comes from a tag tarball. A Nio package is source, so a release
+// asset would only duplicate what the host generates from the tag, and every
+// author would have to upload it for every release.
+//
+// The transport is the standard `http`, `tls` and `x509` modules. No external
+// program runs: `src/inflate.nio` reads the gzip and `src/untar.nio` reads the
+// archive in it. Fetching a package needs only this compiler.
+//
+// Nothing in a package executes at fetch time. Fetching is download, verify
+// and extract. Install scripts are a main supply-chain attack vector.
+import 'http';
+import 'fs';
+import 'path';
+import 'string';
+import 'array';
+import './deps' as deps;
+import './inflate' as inflate;
+import './untar' as untar;
+import './lib/str' as str;
+import 'crypto';
+
+// The only host that packages are fetched from. Other hosts are reported as
+// errors, because the tarball path is a host convention and not a standard.
+export String const GITHUB = "github.com/";
+
+// Returns the directory of fetched packages, which all projects on the machine
+// share. Returns "" when the platform has no user data directory.
+export String cacheRoot() {
+    String base = path.userData("nio") catch e {
+        return "";
+    };
+    return path.join(base, "pkg");
+}
+
+// Returns the tarball URL for a tag, or "" for a host other than GitHub.
+// GitHub serves one tarball per tag with no API call and no authentication, so
+// packages need no registry.
+export String tarballURL(String pkg, String version) {
+    if (!str.hasPrefix(pkg, GITHUB)) {
+        return "";
+    }
+    String rest = string.substring(pkg, string.length(GITHUB), string.length(pkg));
+    return "https://codeload.github.com/" + rest + "/tar.gz/refs/tags/" + version;
+}
+
+export type Fetched {
+    String dir;
+    String hash;
+    String error;
+}
+
+// Downloads a package into the cache and returns its directory and tree hash.
+// A package that is already in the cache is not fetched again: every build
+// checks the cache against the manifest's hash.
+export Fetched async get(String pkg, String version) {
+    Fetched out = { dir: "", hash: "", error: "" };
+    String root = cacheRoot();
+    if (root == "") {
+        out.error = "no user data directory to cache packages in";
+        return out;
+    }
+    String dest = path.join(root, path.localize(pkg + "@" + version));
+    if (fs.exists(dest)) {
+        out.dir = dest;
+        out.hash = deps.treeHash(dest);
+        return out;
+    }
+    String url = tarballURL(pkg, version);
+    if (url == "") {
+        out.error = "only " + GITHUB + " packages can be fetched, and " + pkg + " is not one";
+        return out;
+    }
+    byte[] archive = await download(url) catch e {
+        out.error = "fetching " + url + ": " + e.message;
+        return out;
+    };
+    // Extract under a temporary name in the cache's own directory, then rename
+    // into place. The rename is on one file system, so it is atomic. No reader
+    // finds a half-extracted tree. When two `nio` processes fetch one package
+    // at once, the rename of the second fails and it keeps the first tree.
+    createDirAll(parentOf(dest));
+    String staging = dest + ".tmp" + crypto.hexEncode(crypto.randomBytes(4));
+    fs.createDir(staging) catch e {
+        out.error = e.message;
+        return out;
+    };
+    // The host wraps the tree in one directory named for the repository and the
+    // tag. That directory is not part of the package, so extraction removes it.
+    String? failed = extract(archive, staging);
+    if (failed != null) {
+        fs.delete(staging, { recursive: true }) catch e { };
+        out.error = failed;
+        return out;
+    }
+    fs.rename(staging, dest) catch e {
+        fs.delete(staging, { recursive: true }) catch e { };
+        if (!fs.exists(dest)) {
+            out.error = e.message;
+            return out;
+        }
+    };
+    out.dir = dest;
+    out.hash = deps.treeHash(dest);
+    return out;
+}
+
+// The largest ref advertisement that `versions` reads, in bytes. A host lists
+// every branch, and GitHub also lists every pull request. A busy repository
+// answers megabytes: nodejs/node answers 3.9 MB.
+int const MAX_REFS = 67108864;
+
+// Returns the versions that a package's repository has tagged. They come from
+// git's own endpoint, which every git host serves. GitHub's API allows 60
+// requests an hour without a login, and one update of a large graph can use
+// them all.
+export String[] async versions(String pkg) {
+    String url = "https://" + pkg + ".git/info/refs?service=git-upload-pack";
+    http.ClientOptions o = http.options();
+    o.followRedirects = true;
+    o.maxBody = MAX_REFS;
+    http.ClientResponse r = await http.request(http.Method.GET, url, o);
+    // A host answers 401 for a repository it does not show. The answer does not
+    // tell a missing repository from a private one.
+    if (r.status == 401 || r.status == 404) {
+        r.close();
+        return Error("no such repository, or it is private (" + string.from(r.status) + ")");
+    }
+    if (r.status != 200) {
+        r.close();
+        return Error("the host answered " + string.from(r.status) + " " + r.reason);
+    }
+    byte[] body = await r.bytes();
+    return deps.advertisedVersions(body);
+}
+
+byte[] async download(String url) {
+    http.ClientOptions o = http.options();
+    o.followRedirects = true;
+    http.ClientResponse r = await http.request(http.Method.GET, url, o);
+    if (r.status == 404) {
+        r.close();
+        return Error("no such tag (404)");
+    }
+    if (r.status != 200) {
+        r.close();
+        return Error("the host answered " + string.from(r.status) + " " + r.reason);
+    }
+    return await r.bytes();
+}
+
+// The largest tree an archive may inflate to, in bytes. A small archive can
+// inflate to a very large one, and a package is only source.
+int const MAX_TREE = 268435456;
+
+// Extracts the archive into a directory, without the top directory that the
+// host wraps the tree in. Returns an error message, or null on success.
+String? extract(byte[] archive, String into) {
+    byte[] tar = inflate.gunzip(archive, MAX_TREE) catch e {
+        return "cannot read the archive: " + e.message;
+    };
+    return untar.extract(tar, into, 1);
+}
+
+export void createDirAll(String dir) {
+    if (dir == "" || fs.exists(dir)) {
+        return;
+    }
+    String parent = parentOf(dir);
+    if (parent != dir) {
+        createDirAll(parent);
+    }
+    fs.createDir(dir) catch e { };
+}
+
+String parentOf(String p) {
+    int cut = -1;
+    int n = string.length(p);
+    for (int i = 0; i < n; i++) {
+        if (p[i] == 47 || p[i] == 92) {
+            cut = i;
+        }
+    }
+    if (cut < 0) {
+        return p;
+    }
+    if (cut == 0) {
+        if (n == 1) {
+            return p;
+        }
+        return string.substring(p, 0, 1);
+    }
+    return string.substring(p, 0, cut);
+}

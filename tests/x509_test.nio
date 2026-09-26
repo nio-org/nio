@@ -1,0 +1,987 @@
+// The x509 module (§6.19): certificate parsing, and the decision to trust one.
+//
+// Answers come from a frozen private PKI (tests/golden/x509_fixtures.txt) and
+// one real chain. The real chain's root comes from the host's own store, and
+// its CA certificates carry extensions that a generated PKI does not produce.
+//
+// Most cases are refusals, because a verifier that accepts everything passes
+// every table of good answers. Every prefix and every single-byte mutation is
+// also parsed. An out-of-range index is a runtime error (§5.5) and stops the
+// process, so in a parser of attacker bytes it is a denial of service. A
+// raise and a parse both pass. Only a stopped process fails.
+//
+// Every case that checks validity gives the instant it checks at, so no test
+// fails because of the calendar date.
+import 'test';
+import 'x509';
+import 'crypto';
+import 'string';
+import 'array';
+import 'time';
+import './repo' as repo;
+import './bytes' as bytes;
+
+// ---- the corpus ----
+
+Map<String, byte[]> loadFixtures(String path) {
+    Map<String, byte[]> out = {};
+    forEach(string.split(repo.readText(path), "\n"), line) {
+        if (string.length(line) == 0 || line[0] == 35) {    // '#'
+            continue;
+        }
+        String[] f = string.split(line, " ");
+        if (f.length != 2) {
+            return Error("malformed fixture line: " + string.substring(line, 0, 40));
+        }
+        out[f[0]] = string.toByteArray(bytes.unhex(f[1]));
+    }
+    return out;
+}
+
+Map<String, byte[]> fixtures() {
+    return loadFixtures("tests/golden/x509_fixtures.txt");
+}
+
+byte[] fixture(Map<String, byte[]> m, String name) {
+    byte[]? d = m[name];
+    if (d == null) {
+        return Error("no fixture named " + name);
+    }
+    return d;
+}
+
+x509.Certificate cert(Map<String, byte[]> m, String name) {
+    return x509.parseCertificate(fixture(m, name));
+}
+
+// An instant inside the validity window of every fixture (2026-08-02 to
+// 2046). A fixed instant makes the suite independent of the date.
+DateTime const NOW = time.date.fromText("2026-09-01T12:00:00Z");
+DateTime const LONG_AFTER = time.date.fromText("2050-01-01T00:00:00Z");
+DateTime const LONG_BEFORE = time.date.fromText("2000-01-01T00:00:00Z");
+
+// ---- parsing ----
+
+test.start("x509 parses a certificate field by field", void () -> {
+    Map<String, byte[]> m = fixtures();
+    x509.Certificate c = cert(m, "leaf");
+
+    test.expectString(c.subject, "C=NL,O=Nio Test,CN=leaf.example.com");
+    test.expectString(c.issuer, "C=NL,O=Nio Test,CN=Nio Test Intermediate CA");
+    test.expectInt(c.version, 3);
+    test.expectString(c.signatureAlgorithm, "1.2.840.113549.1.1.11");
+    test.expectString(c.publicKeyAlgorithm, "1.2.840.113549.1.1.1");
+    test.expectInt(c.rsaExponent, 65537);
+    test.expectInt(c.rsaModulus.length, 256);
+    test.expectBool(c.isCA, false);
+    test.expectBool(c.basicConstraintsPresent, true);
+    test.expectInt(c.maxPathLen, -1);
+
+    // digitalSignature (bit 0) and keyEncipherment (bit 2), not keyCertSign (5).
+    test.expectBool(c.keyUsagePresent, true);
+    test.expectBool(c.hasKeyUsage(0), true);
+    test.expectBool(c.hasKeyUsage(2), true);
+    test.expectBool(c.hasKeyUsage(5), false);
+
+    test.expectBool(c.extKeyUsagePresent, true);
+    test.expectString(string.join(c.extKeyUsage, ","), "1.3.6.1.5.5.7.3.1");
+
+    // A name is stored as written, which is the signed text. Matching
+    // converts to lowercase at the comparison.
+    test.expectString(string.join(c.dnsNames, ","),
+        "leaf.example.com,*.wild.example.com,UPPER.Example.COM");
+    test.expectString(string.join(c.ipAddresses, ","),
+        "127.0.0.1,0000:0000:0000:0000:0000:0000:0000:0001");
+    test.expectString(string.join(c.emailAddresses, ","), "hostmaster@example.com");
+    test.expectInt(c.unhandledCritical.length, 0);
+
+    // The TBS bytes are a slice of the certificate, not a re-encoding. The
+    // signature covers only those bytes.
+    test.expectBool(c.rawTbs.length > 0, true);
+    test.expectBool(c.rawTbs.length < c.raw.length, true);
+    test.expectString(crypto.hexEncode(array.slice(c.raw, 4, 4 + 8)),
+        crypto.hexEncode(array.slice(c.rawTbs, 0, 8)));
+
+    // pathlen is read as a number.
+    x509.Certificate ca = cert(m, "inter");
+    test.expectBool(ca.isCA, true);
+    test.expectInt(ca.maxPathLen, 0);
+    test.expectBool(ca.hasKeyUsage(5), true);
+    test.expectInt(cert(m, "interfree").maxPathLen, -1);
+
+    // A self-signed root is its own issuer. The names compare by DER.
+    x509.Certificate root = cert(m, "root");
+    test.expectBool(root.isSelfIssued(), true);
+    test.expectBool(c.isSelfIssued(), false);
+
+    test.expectInt(cert(m, "big").rsaModulus.length, 512);
+
+    test.expectString(cert(m, "pss").signatureAlgorithm, "1.2.840.113549.1.1.10");
+    test.expectString(cert(m, "sha384").signatureAlgorithm, "1.2.840.113549.1.1.12");
+    test.expectString(cert(m, "sha1").signatureAlgorithm, "1.2.840.113549.1.1.5");
+});
+
+test.start("x509 records an unknown critical extension and shrugs at a benign one", void () -> {
+    Map<String, byte[]> m = fixtures();
+    // Parsing succeeds in both cases. Verification does the refusal, so a
+    // tool can still read such a certificate.
+    x509.Certificate crit = cert(m, "critical");
+    test.expectInt(crit.unhandledCritical.length, 1);
+    test.expectString(crit.unhandledCritical[0], "1.3.6.1.4.1.99999.1");
+
+    x509.Certificate ok = cert(m, "noncrit");
+    test.expectInt(ok.unhandledCritical.length, 0);
+    // The certificate keeps the extension, so a caller can read what this
+    // module does not interpret.
+    bool found = false;
+    forEach(ok.extensions, e) {
+        if (e.oid == "1.3.6.1.4.1.99999.1") {
+            found = true;
+            test.expectBool(e.critical, false);
+        }
+    }
+    test.expectBool(found, true);
+});
+
+test.start("x509 parses real CA certificates", void () -> {
+    Map<String, byte[]> m = loadFixtures("tests/golden/x509_real_chain.txt");
+    x509.Certificate leaf = cert(m, "amazon_0");
+    x509.Certificate inter = cert(m, "amazon_1");
+    x509.Certificate root = cert(m, "amazon_root");
+
+    test.expectString(leaf.subject, "CN=www.amazon.com");
+    test.expectString(inter.subject, "C=US,O=Amazon,CN=Amazon RSA 2048 M04");
+    test.expectString(root.subject, "C=US,O=Amazon,CN=Amazon Root CA 1");
+    test.expectBool(root.isSelfIssued(), true);
+    test.expectBool(inter.isCA, true);
+    test.expectBool(leaf.isCA, false);
+    // Real certificates carry extensions this module does not interpret: AKI,
+    // SKI, CRL points, policies, OCSP. All are non-critical, so the chain
+    // verifies.
+    test.expectBool(leaf.extensions.length >= 6, true);
+    test.expectInt(leaf.unhandledCritical.length, 0);
+    test.expectInt(inter.unhandledCritical.length, 0);
+    test.expectInt(root.unhandledCritical.length, 0);
+    test.expectBool(array.indexOf(leaf.dnsNames, "www.amazon.com") >= 0, true);
+});
+
+// ---- the property that keeps a parser from being a denial of service ----
+
+test.start("x509 refuses every truncation of every certificate", void () -> {
+    Map<String, byte[]> m = fixtures();
+    forEach(["root", "inter", "leaf", "big", "pss", "critical"], name) {
+        byte[] full = fixture(m, name);
+        int n = 0;
+        while (n < full.length) {
+            byte[] prefix = array.slice(full, 0, n);
+            // Any answer is correct if the process does not stop. An
+            // out-of-range index stops it.
+            x509.Certificate c = x509.parseCertificate(prefix) catch e {
+                if (e.code < 300 || e.code > 307) {
+                    return Error(name + "[0.." + string.from(n) + "] failed with code "
+                        + string.from(e.code) + ", which is not one of x509's: " + e.message);
+                }
+                n = n + 1;
+                continue;
+            };
+            return Error(name + " truncated to " + string.from(n)
+                + " bytes parsed as a certificate");
+        }
+    }
+});
+
+test.start("x509 survives every single-byte mutation of a certificate", void () -> {
+    Map<String, byte[]> m = fixtures();
+    byte[] full = fixture(m, "leaf");
+    int parsed = 0;
+    int refused = 0;
+    int i = 0;
+    while (i < full.length) {
+        // A flipped low bit changes length and tag fields by one. A zero
+        // byte and a 0xff byte are frequent causes of parser errors.
+        forEach([1, 2, 3], which) {
+            byte[] bent = array.copy(full);
+            if (which == 1) {
+                bent[i] = (bent[i] ^ 1) as byte;
+            } else if (which == 2) {
+                bent[i] = 0;
+            } else {
+                bent[i] = 255;
+            }
+            x509.Certificate c = x509.parseCertificate(bent) catch e {
+                refused = refused + 1;
+                continue;
+            };
+            parsed = parsed + 1;
+        }
+        i = i + 1;
+    }
+    // Most mutations change the signature or the key, which the parser does
+    // not interpret, so most parse. The test checks that every mutation ran.
+    test.expectInt(parsed + refused, full.length * 3);
+    test.expectBool(refused > 0, true);
+});
+
+// ---- the DER encoding rules ----
+
+// Each case changes a real certificate into an encoding that BER permits and
+// DER forbids.
+test.start("x509 enforces DER's encoding rules", void () -> {
+    Map<String, byte[]> m = fixtures();
+    byte[] leaf = fixture(m, "leaf");
+
+    // A three-byte long form with a leading zero encodes the same length in
+    // more bytes. BER permits it, which gives one certificate two encodings.
+    byte[] padded = [];
+    array.push(padded, leaf[0]);
+    array.push(padded, 131);    // 0x83: three length bytes
+    array.push(padded, 0);
+    array.push(padded, leaf[2]);
+    array.push(padded, leaf[3]);
+    int i = 4;
+    while (i < leaf.length) {
+        array.push(padded, leaf[i]);
+        i = i + 1;
+    }
+    expectRefused("a non-minimal length", padded, x509.ErrorCode.BAD_CERTIFICATE);
+
+    // 0x80 is BER's indefinite length, which DER does not have.
+    byte[] indefinite = array.copy(leaf);
+    indefinite[1] = 128;
+    expectRefused("an indefinite length", indefinite, x509.ErrorCode.BAD_CERTIFICATE);
+
+    // DER has no padding. Bytes after the outer SEQUENCE are not signed.
+    byte[] trailing = array.copy(leaf);
+    array.push(trailing, 0);
+    expectRefused("a trailing byte", trailing, x509.ErrorCode.BAD_CERTIFICATE);
+
+    byte[] overlong = array.copy(leaf);
+    overlong[2] = 255;
+    overlong[3] = 255;
+    expectRefused("a length past the end", overlong, x509.ErrorCode.BAD_CERTIFICATE);
+
+    byte[] bigTag = array.copy(leaf);
+    bigTag[0] = 63;    // 0x3f: constructed, tag >= 31
+    expectRefused("a multi-byte tag", bigTag, x509.ErrorCode.BAD_CERTIFICATE);
+
+    byte[] empty = [];
+    expectRefused("an empty input", empty, x509.ErrorCode.BAD_CERTIFICATE);
+    byte[] huge = [];
+    int k = 0;
+    while (k < 70000) {
+        array.push(huge, 48);
+        k = k + 1;
+    }
+    expectRefused("a 70 KB input", huge, x509.ErrorCode.BAD_CERTIFICATE);
+});
+
+void expectRefused(String what, byte[] data, int code) {
+    x509.Certificate c = x509.parseCertificate(data) catch e {
+        test.assert(e.code == code, what + " gave code " + string.from(e.code)
+            + ", not " + string.from(code) + ": " + e.message);
+        return;
+    };
+    test.assert(false, what + " was accepted");
+}
+
+// ---- hostname verification ----
+
+test.start("x509 matches hostnames the way RFC 6125 says to", void () -> {
+    Map<String, byte[]> m = fixtures();
+    x509.Certificate leaf = cert(m, "leaf");
+
+    expectHost(leaf, "leaf.example.com", true);
+    expectHost(leaf, "LEAF.EXAMPLE.COM", true);
+    expectHost(leaf, "leaf.example.com.", true);
+    expectHost(leaf, "upper.example.com", true);    // the SAN is mixed case
+    // A wildcard covers one label, and only the leftmost label.
+    expectHost(leaf, "a.wild.example.com", true);
+    expectHost(leaf, "anything.wild.example.com", true);
+    expectHost(leaf, "a.b.wild.example.com", false);
+    expectHost(leaf, "wild.example.com", false);
+    expectHost(leaf, ".wild.example.com", false);
+    expectHost(leaf, "leaf.example.com.evil.com", false);
+    expectHost(leaf, "evil.com", false);
+    expectHost(leaf, "example.com", false);
+    expectHost(leaf, "xleaf.example.com", false);
+    expectHost(leaf, "", false);
+    // An address literal matches iPAddress entries only.
+    expectHost(leaf, "127.0.0.1", true);
+    expectHost(leaf, "127.0.0.2", false);
+    expectHost(leaf, "0000:0000:0000:0000:0000:0000:0000:0001", true);
+
+    // A certificate with no SAN matches no host. This module does not read
+    // the common name.
+    x509.Certificate nosan = cert(m, "nosan");
+    expectHost(nosan, "nosan.example.com", false);
+
+    // Refused wildcards: `*.com` and `*` are too broad, and a wildcard that
+    // is part of a label is not a wildcard.
+    x509.Certificate broad = cert(m, "broad");
+    expectHost(broad, "anything.com", false);
+    expectHost(broad, "example.com", false);
+    expectHost(broad, "anything", false);
+    expectHost(broad, "xy.example.com", false);
+});
+
+void expectHost(x509.Certificate c, String host, bool want) {
+    bool got = true;
+    x509.matchHostname(c, host) catch e {
+        got = false;
+        test.assert(e.code == x509.ErrorCode.HOSTNAME_MISMATCH,
+            "\"" + host + "\" failed with code " + string.from(e.code));
+    };
+    if (got != want) {
+        String verb = "accepted";
+        if (want) {
+            verb = "rejected";
+        }
+        test.assert(false, "\"" + host + "\" was wrongly " + verb);
+    }
+}
+
+// ---- chain building ----
+
+test.start("x509 builds and verifies a chain", void () -> {
+    Map<String, byte[]> m = fixtures();
+    x509.Certificate[] roots = [cert(m, "root")];
+
+    x509.Certificate[] built = x509.verify(
+        [cert(m, "leaf"), cert(m, "inter")],
+        { dnsName: "leaf.example.com", roots: roots, at: NOW });
+    test.expectInt(built.length, 3);
+    test.expectString(built[0].subject, "C=NL,O=Nio Test,CN=leaf.example.com");
+    test.expectString(built[1].subject, "C=NL,O=Nio Test,CN=Nio Test Intermediate CA");
+    test.expectString(built[2].subject, "C=NL,O=Nio Test,CN=Nio Test Root CA");
+
+    // A four-deep chain, through a CA with no path length constraint.
+    x509.Certificate[] deep = x509.verify(
+        [cert(m, "deep"), cert(m, "subca"), cert(m, "interfree")],
+        { dnsName: "deep.example.com", roots: roots, at: NOW });
+    test.expectInt(deep.length, 4);
+
+    // Intermediates arrive in the order the peer chose. The returned chain
+    // is in the order this module builds.
+    x509.Certificate[] shuffled = x509.verify(
+        [cert(m, "deep"), cert(m, "interfree"), cert(m, "subca")],
+        { dnsName: "deep.example.com", roots: roots, at: NOW });
+    test.expectInt(shuffled.length, 4);
+
+    // Certificates that the chain does not need are ignored.
+    x509.Certificate[] noisy = x509.verify(
+        [
+            cert(m, "leaf"), cert(m, "rogue"), cert(m, "inter"), cert(m, "subca"),
+            cert(m, "rogueleaf"),
+        ],
+        { dnsName: "leaf.example.com", roots: roots, at: NOW });
+    test.expectInt(noisy.length, 3);
+
+    // A peer can also send the root. That is redundant and correct.
+    x509.Certificate[] withRoot = x509.verify(
+        [cert(m, "leaf"), cert(m, "inter"), cert(m, "root")],
+        { dnsName: "leaf.example.com", roots: roots, at: NOW });
+    test.expectInt(withRoot.length, 3);
+
+    // A trusted intermediate ends the chain. This pins an internal CA.
+    x509.Certificate[] pinned = x509.verify(
+        [cert(m, "leaf")],
+        { dnsName: "leaf.example.com", roots: [cert(m, "inter")], at: NOW });
+    test.expectInt(pinned.length, 2);
+
+    x509.Certificate[] pss = x509.verify(
+        [cert(m, "pss"), cert(m, "inter")],
+        { dnsName: "leaf.example.com", roots: roots, at: NOW });
+    test.expectInt(pss.length, 3);
+    x509.Certificate[] sha384 = x509.verify(
+        [cert(m, "sha384"), cert(m, "inter")],
+        { dnsName: "leaf.example.com", roots: roots, at: NOW });
+    test.expectInt(sha384.length, 3);
+
+    // A 4096-bit leaf runs a different modulus size through the bignum path.
+    x509.Certificate[] big = x509.verify(
+        [cert(m, "big"), cert(m, "inter")],
+        { dnsName: "big.example.com", roots: roots, at: NOW });
+    test.expectInt(big.length, 3);
+});
+
+// ---- pinning ----
+
+test.start("x509 pins a key the way openssl computes one", void () -> {
+    Map<String, byte[]> m = fixtures();
+
+    // The answers come from openssl, the tool an operator uses to compute a
+    // pin:
+    //   openssl x509 -in leaf.der -inform DER -pubkey -noout
+    //     | openssl pkey -pubin -outform DER | openssl dgst -sha256
+    test.expectString(crypto.hexEncode(x509.spkiPin(cert(m, "leaf"))),
+        "caa88619e7bcf1feec9c9c3b624d82c65acf4abd7d89ca598614c177a493bf56");
+    test.expectString(crypto.hexEncode(x509.spkiPin(cert(m, "inter"))),
+        "acfc85e03c107c268a95adb94658b8d6dafd2a75e9535a6d599009d77a952800");
+
+    test.expectInt(x509.spkiPin(cert(m, "leaf")).length, 32);
+
+    // A pin covers the key, not the certificate. The `pss` fixture has the
+    // leaf's key in a certificate signed another way, and has the leaf's pin.
+    // Thus a reissued certificate keeps its pin. A different key has a
+    // different pin.
+    test.expectString(crypto.hexEncode(x509.spkiPin(cert(m, "pss"))),
+        crypto.hexEncode(x509.spkiPin(cert(m, "leaf"))));
+    test.expectBool(crypto.hexEncode(x509.spkiPin(cert(m, "rogue")))
+        == crypto.hexEncode(x509.spkiPin(cert(m, "leaf"))), false);
+});
+
+test.start("x509 answers whether a verified chain carries a pinned key", void () -> {
+    Map<String, byte[]> m = fixtures();
+    x509.Certificate[] roots = [cert(m, "root")];
+    x509.Certificate[] chain = x509.verify(
+        [cert(m, "leaf"), cert(m, "inter")],
+        { dnsName: "leaf.example.com", roots: roots, at: NOW });
+
+    byte[] leafPin = x509.spkiPin(cert(m, "leaf"));
+    byte[] interPin = x509.spkiPin(cert(m, "inter"));
+    byte[] rootPin = x509.spkiPin(cert(m, "root"));
+    byte[] otherPin = x509.spkiPin(cert(m, "rogue"));
+
+    // Any position in the chain counts. A caller can pin an intermediate and
+    // rotate the leaves under it.
+    test.expectBool(x509.pinned(chain, [leafPin]), true);
+    test.expectBool(x509.pinned(chain, [interPin]), true);
+    test.expectBool(x509.pinned(chain, [rootPin]), true);
+
+    // A set matches when any member matches. To prepare a key rotation, pin
+    // the current key and the next key.
+    test.expectBool(x509.pinned(chain, [otherPin, leafPin]), true);
+
+    // A key that is not in the chain does not match. An empty set does not
+    // match.
+    test.expectBool(x509.pinned(chain, [otherPin]), false);
+    test.expectBool(x509.pinned(chain, []), false);
+
+    // A pin of the correct length with incorrect bytes is a mismatch, not an
+    // error. A stale pin and an attack look the same, and both are refused.
+    byte[] bent = x509.spkiPin(cert(m, "leaf"));
+    bent[0] = (bent[0] ^ 1) as byte;
+    test.expectBool(x509.pinned(chain, [bent]), false);
+});
+
+test.start("x509 verifies a real chain against the root its host trusts", void () -> {
+    Map<String, byte[]> m = loadFixtures("tests/golden/x509_real_chain.txt");
+    // A fixed instant inside the leaf's validity window, so the test does not
+    // fail when the certificate expires.
+    DateTime at = time.date.fromText("2026-08-02T12:00:00Z");
+    x509.Certificate[] built = x509.verify(
+        [cert(m, "amazon_0"), cert(m, "amazon_1")],
+        { dnsName: "www.amazon.com", roots: [cert(m, "amazon_root")], at: at });
+    test.expectInt(built.length, 3);
+    test.expectString(built[2].subject, "C=US,O=Amazon,CN=Amazon Root CA 1");
+
+    expectChainRefused("the real chain in 2050",
+        [cert(m, "amazon_0"), cert(m, "amazon_1")], "www.amazon.com",
+        [cert(m, "amazon_root")], LONG_AFTER, x509.ErrorCode.EXPIRED);
+    expectChainRefused("the real chain for another name",
+        [cert(m, "amazon_0"), cert(m, "amazon_1")], "www.example.com",
+        [cert(m, "amazon_root")], at, x509.ErrorCode.HOSTNAME_MISMATCH);
+});
+
+// ---- the refusals ----
+
+test.start("x509 refuses what it must refuse", void () -> {
+    Map<String, byte[]> m = fixtures();
+    x509.Certificate[] roots = [cert(m, "root")];
+    x509.Certificate[] none = [];
+
+    expectChainRefused("a leaf with no intermediate",
+        [cert(m, "leaf")], "leaf.example.com", roots, NOW,
+        x509.ErrorCode.UNTRUSTED_ROOT);
+    expectChainRefused("an empty root store",
+        [cert(m, "leaf"), cert(m, "inter")], "leaf.example.com", none, NOW,
+        x509.ErrorCode.UNTRUSTED_ROOT);
+
+    // The rogue-CA attack: the name is correct and the chain is internally
+    // consistent, but the root is not trusted.
+    expectChainRefused("a rogue CA's certificate for the same name",
+        [cert(m, "rogueleaf"), cert(m, "rogue")], "leaf.example.com", roots, NOW,
+        x509.ErrorCode.UNTRUSTED_ROOT);
+
+    expectChainRefused("the wrong hostname",
+        [cert(m, "leaf"), cert(m, "inter")], "evil.example.com", roots, NOW,
+        x509.ErrorCode.HOSTNAME_MISMATCH);
+    expectChainRefused("a certificate not yet valid",
+        [cert(m, "leaf"), cert(m, "inter")], "leaf.example.com", roots, LONG_BEFORE,
+        x509.ErrorCode.NOT_YET_VALID);
+    expectChainRefused("an expired certificate",
+        [cert(m, "leaf"), cert(m, "inter")], "leaf.example.com", roots, LONG_AFTER,
+        x509.ErrorCode.EXPIRED);
+
+    // An unimplemented critical extension fails closed. Thus a constraint
+    // that this module does not read is not ignored.
+    expectChainRefused("an unknown critical extension",
+        [cert(m, "critical"), cert(m, "inter")], "critical.example.com", roots, NOW,
+        x509.ErrorCode.CONSTRAINT_VIOLATION);
+    // The same certificate with a non-critical extension passes. The refusal
+    // comes from the critical flag, not from the OID.
+    x509.Certificate[] ok = x509.verify(
+        [cert(m, "noncrit"), cert(m, "inter")],
+        { dnsName: "noncrit.example.com", roots: roots, at: NOW });
+    test.expectInt(ok.length, 3);
+
+    // An EKU that does not include serverAuth.
+    expectChainRefused("a client-authentication certificate",
+        [cert(m, "client"), cert(m, "inter")], "client.example.com", roots, NOW,
+        x509.ErrorCode.CONSTRAINT_VIOLATION);
+
+    // `inter` allows no intermediates below it, and this chain puts one there.
+    expectChainRefused("a violated path length",
+        [cert(m, "violleaf"), cert(m, "subunder"), cert(m, "inter")],
+        "viol.example.com", roots, NOW, x509.ErrorCode.UNTRUSTED_ROOT);
+
+    // SHA-1 is refused by its algorithm identifier.
+    expectChainRefused("a SHA-1 signature",
+        [cert(m, "sha1"), cert(m, "inter")], "leaf.example.com", roots, NOW,
+        x509.ErrorCode.UNTRUSTED_ROOT);
+
+    x509.Certificate[] nothing = [];
+    expectChainRefused("an empty chain", nothing, "leaf.example.com", roots, NOW,
+        x509.ErrorCode.BAD_CERTIFICATE);
+});
+
+// ---- name constraints ----
+
+test.start("x509 reads the name constraints a CA carries", void () -> {
+    Map<String, byte[]> m = fixtures();
+    x509.Certificate ca = cert(m, "ncinter");
+
+    test.assert(ca.nameConstraintsPresent, "the intermediate carries constraints");
+    test.expectInt(ca.permittedSubtrees.length, 3);
+    test.expectInt(ca.excludedSubtrees.length, 1);
+    test.expectInt(ca.unsupportedConstraints.length, 0);
+
+    test.expectInt(ca.permittedSubtrees[0].kind, x509.GN_DNS);
+    test.expectString(ca.permittedSubtrees[0].name, "example.com");
+    // An iPAddress subtree is an address and a mask, kept as bytes. The
+    // comparison uses the mask, which the text form does not show.
+    test.expectInt(ca.permittedSubtrees[1].kind, x509.GN_IP);
+    test.expectString(crypto.hexEncode(ca.permittedSubtrees[1].range), "0a000000ff000000");
+    test.expectInt(ca.permittedSubtrees[2].kind, x509.GN_EMAIL);
+    test.expectString(ca.permittedSubtrees[2].name, "example.com");
+
+    test.expectInt(ca.excludedSubtrees[0].kind, x509.GN_DNS);
+    test.expectString(ca.excludedSubtrees[0].name, "bad.example.com");
+
+    // A form this module cannot compare is recorded, not skipped.
+    x509.Certificate dir = cert(m, "ncdirinter");
+    test.expectInt(dir.permittedSubtrees.length, 0);
+    test.expectInt(dir.unsupportedConstraints.length, 1);
+    test.expectString(dir.unsupportedConstraints[0], "permittedSubtrees [4]");
+});
+
+test.start("x509 holds a chain to the constraints its issuer carries", void () -> {
+    Map<String, byte[]> m = fixtures();
+    x509.Certificate[] roots = [cert(m, "ncroot")];
+
+    // Every name in this leaf (two dNSNames, an address and a mailbox) is
+    // inside a permitted subtree, so the chain builds.
+    x509.Certificate[] built = x509.verify([cert(m, "ncok"), cert(m, "ncinter")],
+        { dnsName: "www.example.com", roots: roots, at: NOW });
+    test.expectInt(built.length, 3);
+
+    expectRefusedSaying("a name outside every permitted subtree",
+        [cert(m, "ncwrongdns"), cert(m, "ncinter")], "www.other.com", roots,
+        "does not permit");
+
+    // The comparison is label by label. A name that only ends in the
+    // subtree's text is outside the subtree.
+    expectRefusedSaying("a name sharing a suffix but not a label boundary",
+        [cert(m, "ncsuffix"), cert(m, "ncinter")], "notexample.com", roots,
+        "does not permit");
+
+    // Excluded wins: this leaf carries one permitted name and one excluded one.
+    expectRefusedSaying("a name that is permitted and excluded",
+        [cert(m, "ncexcluded"), cert(m, "ncinter")], "bad.example.com", roots,
+        "excludes");
+
+    expectRefusedSaying("an address outside the permitted range",
+        [cert(m, "ncwrongip"), cert(m, "ncinter")], "www.example.com", roots,
+        "does not permit");
+
+    // A bare rfc822Name subtree is that host only, not the names below it.
+    expectRefusedSaying("a mailbox below the permitted host",
+        [cert(m, "ncsubmail"), cert(m, "ncinter")], "www.example.com", roots,
+        "does not permit");
+
+    // A constraint in a form this module cannot compare stops that CA. No
+    // certificate under it can be shown to be within the constraint.
+    expectRefusedSaying("a constraint in a form nothing here compares",
+        [cert(m, "ncdirleaf"), cert(m, "ncdirinter")], "www.anything.com", roots,
+        "cannot compare");
+});
+
+// Like `expectChainRefused`, but also checks the reason. A constraint that
+// refuses for a different reason is not in effect.
+void expectRefusedSaying(String what, x509.Certificate[] chain, String host,
+    x509.Certificate[] roots, String saying) {
+    x509.Certificate[] built = x509.verify(chain,
+        { dnsName: host, roots: roots, at: NOW }) catch e {
+        test.assert(string.contains(e.message, saying),
+            what + " was refused for the wrong reason: " + e.message);
+        return;
+    };
+    test.assert(false, what + " was accepted");
+}
+
+test.start("x509 refuses a chain whose signature does not hold", void () -> {
+    Map<String, byte[]> m = fixtures();
+    x509.Certificate[] roots = [cert(m, "root")];
+
+    // Fifty single-bit flips across the signed body. Each must break the
+    // chain. A verifier that skips the signature check accepts all of them.
+    byte[] leaf = fixture(m, "leaf");
+    int step = leaf.length / 50;
+    int at = 0;
+    int broken = 0;
+    while (at < leaf.length) {
+        byte[] bent = array.copy(leaf);
+        bent[at] = (bent[at] ^ 1) as byte;
+        x509.Certificate c = x509.parseCertificate(bent) catch e {
+            // A flip in a length or a tag makes the parse fail. That is also
+            // a correct refusal.
+            broken = broken + 1;
+            at = at + step;
+            continue;
+        };
+        x509.Certificate[] built = x509.verify([c, cert(m, "inter")],
+            { dnsName: "leaf.example.com", roots: roots, at: NOW }) catch e {
+            broken = broken + 1;
+            at = at + step;
+            continue;
+        };
+        return Error("a certificate with bit 0 of byte " + string.from(at)
+            + " flipped still verified");
+    }
+    test.expectBool(broken >= 45, true);
+});
+
+void expectChainRefused(String what, x509.Certificate[] chain, String host,
+    x509.Certificate[] roots, DateTime at, int code) {
+    x509.Certificate[] built = x509.verify(chain,
+        { dnsName: host, roots: roots, at: at }) catch e {
+        test.assert(e.code == code, what + " gave code " + string.from(e.code)
+            + ", not " + string.from(code) + ": " + e.message);
+        return;
+    };
+    test.assert(false, what + " was accepted");
+}
+
+// ---- PEM ----
+
+test.start("x509 reads PEM the way a root bundle is written", void () -> {
+    Map<String, byte[]> m = fixtures();
+    String pem = pemOf(fixture(m, "root")) + pemOf(fixture(m, "inter"));
+    byte[][] ders = x509.parsePem(pem);
+    test.expectInt(ders.length, 2);
+    test.expectString(crypto.hexEncode(ders[0]), crypto.hexEncode(fixture(m, "root")));
+    test.expectString(crypto.hexEncode(ders[1]), crypto.hexEncode(fixture(m, "inter")));
+
+    // A bundle can have text between its blocks, and other block types.
+    // Both are skipped.
+    String noisy = "Nio Test Root CA\n=================\n" + pemOf(fixture(m, "root"))
+        + "\n-----BEGIN RSA PRIVATE KEY-----\nnot ours\n-----END RSA PRIVATE KEY-----\n"
+        + pemOf(fixture(m, "inter"));
+    test.expectInt(x509.parsePem(noisy).length, 2);
+
+    // An empty input is not an error. It gives no certificates.
+    test.expectInt(x509.parsePem("").length, 0);
+    test.expectInt(x509.parsePem("# just a comment\n").length, 0);
+
+    // An unterminated block and a body that is not base64 are errors. If
+    // they were skipped, a root store could silently lose roots.
+    x509.parsePem("-----BEGIN CERTIFICATE-----\nMIIB\n") catch e {
+        test.assert(e.code == x509.ErrorCode.BAD_CERTIFICATE, "unterminated: " + e.message);
+    };
+    x509.parsePem("-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n") catch e {
+        test.assert(e.code == x509.ErrorCode.BAD_CERTIFICATE, "not base64: " + e.message);
+        return;
+    };
+    test.assert(false, "a PEM block that is not base64 was accepted");
+});
+
+String pemOf(byte[] der) {
+    String b64 = crypto.base64Encode(der);
+    String body = "";
+    int i = 0;
+    while (i < string.length(b64)) {
+        int end = i + 64;
+        if (end > string.length(b64)) {
+            end = string.length(b64);
+        }
+        body = body + string.substring(b64, i, end) + "\n";
+        i = end;
+    }
+    return "-----BEGIN CERTIFICATE-----\n" + body + "-----END CERTIFICATE-----\n";
+}
+
+// ---- the host's own store ----
+
+test.start("x509 finds the host's root store", void () -> {
+    // This test depends on the host. A host with no bundle is valid, so a
+    // failure is accepted. An empty store must not load as a success.
+    x509.Certificate[] roots = x509.systemRoots() catch e {
+        test.assert(e.code == x509.ErrorCode.UNTRUSTED_ROOT,
+            "systemRoots failed with the wrong code: " + e.message);
+        return;
+    };
+    test.assert(roots.length > 10,
+        "the system store yielded only " + string.from(roots.length) + " certificates");
+    forEach(roots, r) {
+        test.assert(r.isCA, "\"" + r.subject + "\" is in the root store and is not a CA");
+    }
+});
+
+// ---- the differential corpus ----
+
+test.start("x509 agrees with the reference parser except where it decided not to", void () -> {
+    // tests/golden/x509_der_cases.txt holds a differential run against a
+    // reference parser: 17,118 mutated certificates through both parsers, with
+    // every disagreement kept. The file has both verdicts and cannot be
+    // regenerated. This test checks that no answer changed and that each
+    // divergence from the reference is still the recorded one. The file's header
+    // explains each set.
+    int agree = 0;
+    int stricter = 0;
+    int looser = 0;
+    forEach(string.split(repo.readText("tests/golden/x509_der_cases.txt"), "\n"), line) {
+        if (string.length(line) == 0 || line[0] == 35) {    // '#'
+            continue;
+        }
+        String[] f = string.split(line, " ");
+        if (f.length != 3) {
+            return Error("malformed corpus line: " + string.substring(line, 0, 40));
+        }
+        byte[] data = string.toByteArray(bytes.unhex(f[0]));
+        bool goOk = f[1] == "1";
+        bool want = f[2] == "1";
+        bool got = true;
+        x509.Certificate? c = x509.parseCertificate(data) catch e { got = false; };
+        if (got != want) {
+            String verb = "accepted";
+            if (want) {
+                verb = "refused";
+            }
+            return Error("case " + string.substring(f[0], 0, 32) + "... is now " + verb
+                + ", where the frozen answer says otherwise");
+        }
+        if (got == goOk) {
+            agree = agree + 1;
+        } else if (goOk) {
+            stricter = stricter + 1;
+        } else {
+            looser = looser + 1;
+        }
+    }
+    test.expectInt(agree, 1100);
+    test.expectInt(stricter, 73);
+    test.expectInt(looser, 54);
+});
+
+// ---- ECDSA ----
+//
+// A second frozen PKI (tests/golden/x509_ec_fixtures.txt): an all-EC chain with
+// a P-384 root and intermediate over a P-256 leaf, a mixed chain crossing
+// RSA-signs-EC and EC-signs-RSA, and a P-521 intermediate that this module
+// must refuse.
+
+Map<String, byte[]> ecFixtures() {
+    return loadFixtures("tests/golden/x509_ec_fixtures.txt");
+}
+
+test.start("x509 parses an ECDSA certificate field by field", void () -> {
+    Map<String, byte[]> m = ecFixtures();
+    x509.Certificate leaf = cert(m, "ecleaf");
+    test.expectString(leaf.publicKeyAlgorithm, "1.2.840.10045.2.1");
+    test.expectString(leaf.ecCurve, "p256");
+    test.expectInt(leaf.ecPoint.length, 65);
+    test.expectInt(leaf.ecPoint[0], 4);
+    test.expectString(leaf.signatureAlgorithm, "1.2.840.10045.4.3.2");
+    test.expectInt(leaf.rsaModulus.length, 0);
+    test.expectString(string.join(leaf.dnsNames, " "),
+        "ecleaf.example.com *.wild.ec.example.com");
+
+    x509.Certificate root = cert(m, "ecroot");
+    test.expectString(root.ecCurve, "p384");
+    test.expectInt(root.ecPoint.length, 97);
+    test.expectString(root.signatureAlgorithm, "1.2.840.10045.4.3.3");
+
+    // A certificate with an unimplemented curve parses. The field keeps the
+    // OID for diagnostics, and the point is not read.
+    x509.Certificate p521 = cert(m, "inter521");
+    test.expectString(p521.ecCurve, "1.3.132.0.35");
+    test.expectInt(p521.ecPoint.length, 0);
+
+    // Each key accessor gives its own key kind and refuses the other kind.
+    x509.EcdsaPublicKey key = x509.ecdsaPublicKey(leaf);
+    test.expectString(key.curve, "p256");
+    x509.RsaPublicKey? wrong = x509.rsaPublicKey(leaf) catch null;
+    test.expectBool(wrong == null, true);
+    x509.EcdsaPublicKey? none = x509.ecdsaPublicKey(p521) catch null;
+    test.expectBool(none == null, true);
+});
+
+test.start("x509 builds and verifies ECDSA and mixed chains", void () -> {
+    Map<String, byte[]> m = ecFixtures();
+
+    // P-384 signatures above, SHA-256 over P-256 at the leaf.
+    x509.Certificate[] built = x509.verify([cert(m, "ecleaf"), cert(m, "ecinter")],
+        { dnsName: "ecleaf.example.com", roots: [cert(m, "ecroot")], at: NOW });
+    test.expectInt(built.length, 3);
+    test.expectString(built[2].subject, "CN=Nio EC Test Root");
+
+    x509.Certificate[] wild = x509.verify([cert(m, "ecleaf"), cert(m, "ecinter")],
+        { dnsName: "a.wild.ec.example.com", roots: [cert(m, "ecroot")], at: NOW });
+    test.expectInt(wild.length, 3);
+
+    // An RSA root over an EC intermediate over an RSA leaf. One chain has
+    // both algorithm crossings.
+    x509.Certificate[] mixed = x509.verify([cert(m, "mixleaf"), cert(m, "mixinter")],
+        { dnsName: "mixleaf.example.com", roots: [cert(m, "mixroot")], at: NOW });
+    test.expectInt(mixed.length, 3);
+    test.expectString(mixed[1].subject, "CN=Nio Mixed Test Intermediate EC");
+});
+
+test.start("x509 refuses what ECDSA must refuse", void () -> {
+    Map<String, byte[]> m = ecFixtures();
+    x509.Certificate[] roots = [cert(m, "ecroot")];
+
+    // This module cannot check the leaf's signature by the P-521 key, so it
+    // fails closed. At the signature the code is UNSUPPORTED_ALGORITHM, and
+    // the message names the curve.
+    x509.Certificate? direct = null;
+    x509.checkSignature(cert(m, "leaf521"), cert(m, "inter521")) catch e {
+        test.assert(e.code == x509.ErrorCode.UNSUPPORTED_ALGORITHM,
+            "the P-521 signature check gave code " + string.from(e.code));
+        test.assert(string.contains(e.message, "1.3.132.0.35"),
+            "the refusal does not name the curve: " + e.message);
+        direct = cert(m, "leaf521") catch null;
+    };
+    test.assert(direct != null, "a P-521-signed certificate verified");
+    // The chain search reports it as the exhaustion error, as for SHA-1, with
+    // the reason in the message.
+    expectChainRefused("a chain through a P-521 intermediate",
+        [cert(m, "leaf521"), cert(m, "inter521")], "leaf521.example.com",
+        roots, NOW, x509.ErrorCode.UNTRUSTED_ROOT);
+
+    // The general policy checks apply to EC as to RSA.
+    expectChainRefused("the wrong hostname",
+        [cert(m, "ecleaf"), cert(m, "ecinter")], "evil.example.com",
+        roots, NOW, x509.ErrorCode.HOSTNAME_MISMATCH);
+    expectChainRefused("an expired chain",
+        [cert(m, "ecleaf"), cert(m, "ecinter")], "ecleaf.example.com",
+        roots, LONG_AFTER, x509.ErrorCode.EXPIRED);
+    expectChainRefused("an EC chain nobody vouches for",
+        [cert(m, "ecleaf"), cert(m, "ecinter")], "ecleaf.example.com",
+        [cert(m, "mixroot")], NOW, x509.ErrorCode.UNTRUSTED_ROOT);
+});
+
+test.start("x509 refuses an ECDSA chain whose signature does not hold", void () -> {
+    Map<String, byte[]> m = ecFixtures();
+    x509.Certificate[] roots = [cert(m, "ecroot")];
+
+    // Fifty flipped bits across the EC leaf, as in the RSA version of this
+    // test.
+    byte[] leaf = fixture(m, "ecleaf");
+    int step = leaf.length / 50;
+    int at = 0;
+    int broken = 0;
+    while (at < leaf.length) {
+        byte[] bent = array.copy(leaf);
+        bent[at] = (bent[at] ^ 1) as byte;
+        x509.Certificate c = x509.parseCertificate(bent) catch e {
+            broken = broken + 1;
+            at = at + step;
+            continue;
+        };
+        x509.Certificate[] built = x509.verify([c, cert(m, "ecinter")],
+            { dnsName: "ecleaf.example.com", roots: roots, at: NOW }) catch e {
+            broken = broken + 1;
+            at = at + step;
+            continue;
+        };
+        return Error("an EC certificate with bit 0 of byte " + string.from(at)
+            + " flipped still verified");
+    }
+    test.expectBool(broken >= 45, true);
+});
+
+test.start("x509 refuses every truncation of every ECDSA certificate", void () -> {
+    Map<String, byte[]> m = ecFixtures();
+    forEach(["ecroot", "ecinter", "ecleaf", "mixinter", "inter521"], name) {
+        byte[] full = fixture(m, name);
+        int n = 0;
+        while (n < full.length) {
+            byte[] prefix = array.slice(full, 0, n);
+            x509.Certificate c = x509.parseCertificate(prefix) catch e {
+                if (e.code < 300 || e.code > 307) {
+                    return Error(name + "[0.." + string.from(n) + "] failed with code "
+                        + string.from(e.code) + ", which is not one of x509's: " + e.message);
+                }
+                n = n + 1;
+                continue;
+            };
+            return Error(name + " truncated to " + string.from(n)
+                + " bytes parsed as a certificate");
+        }
+    }
+});
+
+test.start("x509 survives every single-byte mutation of an ECDSA certificate", void () -> {
+    Map<String, byte[]> m = ecFixtures();
+    byte[] full = fixture(m, "ecleaf");
+    int parsed = 0;
+    int refused = 0;
+    int i = 0;
+    while (i < full.length) {
+        forEach([1, 2, 3], which) {
+            byte[] bent = array.copy(full);
+            if (which == 1) {
+                bent[i] = (bent[i] ^ 1) as byte;
+            } else if (which == 2) {
+                bent[i] = 0;
+            } else {
+                bent[i] = 255;
+            }
+            x509.Certificate c = x509.parseCertificate(bent) catch e {
+                refused = refused + 1;
+                continue;
+            };
+            parsed = parsed + 1;
+        }
+        i = i + 1;
+    }
+    test.expectInt(parsed + refused, full.length * 3);
+    test.expectBool(refused > 0, true);
+});
+
+test.start("x509 verifies a real ECDSA chain against the root its host trusts", void () -> {
+    Map<String, byte[]> m = loadFixtures("tests/golden/x509_ec_real_chain.txt");
+    // A fixed instant inside the leaf's validity window, which ends
+    // 2026-10-04.
+    DateTime at = time.date.fromText("2026-08-02T12:00:00Z");
+
+    // One chain with every signature pairing this module implements: an RSA
+    // anchor, a sha256WithRSA cross-sign over an EC subject, then ECDSA over
+    // P-384 and P-256.
+    x509.Certificate[] built = x509.verify(
+        [cert(m, "leaf"), cert(m, "ye2"), cert(m, "rootye"), cert(m, "x2cross")],
+        { dnsName: "letsencrypt.org", roots: [cert(m, "isrgx1")], at: at });
+    test.expectInt(built.length, 5);
+    test.expectString(built[0].ecCurve, "p256");
+    test.expectString(built[1].ecCurve, "p384");
+    test.expectString(built[4].subject,
+        "C=US,O=Internet Security Research Group,CN=ISRG Root X1");
+
+    expectChainRefused("the real EC chain in 2050",
+        [cert(m, "leaf"), cert(m, "ye2"), cert(m, "rootye"), cert(m, "x2cross")],
+        "letsencrypt.org", [cert(m, "isrgx1")], LONG_AFTER, x509.ErrorCode.EXPIRED);
+    expectChainRefused("the real EC chain for another name",
+        [cert(m, "leaf"), cert(m, "ye2"), cert(m, "rootye"), cert(m, "x2cross")],
+        "www.example.com", [cert(m, "isrgx1")], at, x509.ErrorCode.HOSTNAME_MISMATCH);
+});

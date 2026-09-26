@@ -1,0 +1,593 @@
+// Tests the type system against §2.1 and §2.10.
+import 'test';
+import 'string';
+import 'array';
+import '../src/types' as types;
+
+// ---- helpers ----
+
+// Every construction site must stamp an id. By §2.4, the identity of a record
+// is its declaration.
+types.Record rec(String name, String qual, types.Field[] fields) {
+    types.Record r = {
+        id: types.newID(), name: name, qual: qual, shown: "", base: null, sealed: false,
+        extenders: [], fields: fields, methods: [],
+    };
+    return r;
+}
+
+types.Field fld(String name, types.Type t) {
+    types.Field f = { name: name, type: t, jsonName: "", jsonRest: false };
+    return f;
+}
+
+types.Enum enu(String name, types.EnumMember[] members) {
+    types.Enum e = { id: types.newID(), name: name, qual: "", shown: "", members: members };
+    return e;
+}
+
+types.EnumMember mem(String name, int value) {
+    types.EnumMember m = { name: name, value: value };
+    return m;
+}
+
+String orNil(types.Type? t) {
+    if (t == null) {
+        return "nil";
+    }
+    return types.typeString(t);
+}
+
+// ---- printed forms ----
+
+test.start("types: printed forms", void () -> {
+    types.Record car = rec("car", "", [fld("age", types.IntT)]);
+    types.Type[] got = [
+        types.Int8T, types.Uint8T, types.Uint16T, types.Uint32T, types.Uint64T,
+        types.UintT, types.Int16T, types.Int32T, types.Float32T, types.IntT,
+        types.Int64T, types.FloatT, types.Float64T, types.StringT, types.BoolT,
+        types.DateTimeT, types.DurationT, types.VoidT, types.NullT, types.InvalidT,
+        types.newArray(types.IntT),
+        types.newFixedArray(types.IntT, 5),
+        types.newArray(types.newFixedArray(types.IntT, 2)),
+        types.newOptional(types.StringT),
+        types.newArray(types.newOptional(types.IntT)),
+        car,
+        rec("point", "geo", []),
+        types.newFuncType([types.IntT, types.StringT], types.VoidT),
+    ];
+    String[] want = [
+        "int8", "uint8", "uint16", "uint32", "uint64", "uint", "int16", "int32",
+        "float32", "int", "int64", "float", "float64", "String", "bool",
+        "DateTime", "Duration", "void", "null", "invalid",
+        "int[]", "int[5]", "int[2][]", "String?", "int?[]",
+        "car", "geo.point", "Function(int, String)<void>",
+    ];
+    for (int i = 0; i < want.length; i++) {
+        test.expectString(types.typeString(got[i]), want[i]);
+    }
+});
+
+// ---- equal ----
+
+// One row of a two-type predicate: the pair and the answer wanted.
+type Pair {
+    types.Type a;
+    types.Type b;
+    bool want;
+}
+
+Pair pr(types.Type a, types.Type b, bool want) {
+    Pair p = { a: a, b: b, want: want };
+    return p;
+}
+
+test.start("types: equal", void () -> {
+    types.Record carA = rec("car", "", []);
+    types.Record carB = rec("car", "", []);    // same name, different declaration
+    types.Record truck = rec("truck", "", []);
+    Pair[] cases = [
+        pr(types.IntT, types.IntT, true),
+        pr(types.IntT, types.Int8T, false),
+        pr(types.IntT, types.FloatT, false),
+        pr(types.newArray(types.IntT), types.newArray(types.IntT), true),
+        pr(types.newArray(types.IntT), types.newArray(types.StringT), false),
+        pr(types.newArray(types.IntT), types.IntT, false),
+        pr(types.newFixedArray(types.IntT, 5), types.newFixedArray(types.IntT, 5), true),
+        pr(types.newFixedArray(types.IntT, 5), types.newFixedArray(types.IntT, 6), false),
+        // fixed and growable are distinct
+        pr(types.newFixedArray(types.IntT, 5), types.newArray(types.IntT), false),
+        pr(types.newOptional(types.IntT), types.newOptional(types.IntT), true),
+        pr(types.newOptional(types.IntT), types.newOptional(types.StringT), false),
+        pr(types.newOptional(types.IntT), types.IntT, false),
+        pr(carA, carA, true),
+        pr(carA, carB, false),    // records are nominal per declaration
+        pr(types.newArray(carA), types.newArray(carA), true),
+        pr(carA, truck, false),
+        pr(carA, types.IntT, false),
+        pr(types.newFuncType([types.IntT], types.VoidT),
+            types.newFuncType([types.IntT], types.VoidT), true),
+        pr(types.newFuncType([types.IntT], types.VoidT),
+            types.newFuncType([types.StringT], types.VoidT), false),
+        pr(types.newFuncType([types.IntT], types.VoidT),
+            types.newFuncType([types.IntT, types.IntT], types.VoidT), false),
+        pr(types.newFuncType([], types.IntT), types.newFuncType([], types.VoidT), false),
+    ];
+    forEach(cases, c) {
+        if (types.equal(c.a, c.b) != c.want) {
+            return Error("equal(" + types.typeString(c.a) + ", " + types.typeString(c.b)
+                + ") = " + string.from(!c.want) + ", want " + string.from(c.want));
+        }
+    }
+});
+
+// ---- assignable ----
+
+test.start("types: assignable", void () -> {
+    types.Record car = rec("car", "", []);
+    Pair[] cases = [
+        pr(types.IntT, types.IntT, true),
+        pr(types.IntT, types.Int8T, true),     // int8 widens to int64
+        pr(types.Int8T, types.IntT, false),    // but not the reverse
+        pr(types.FloatT, types.IntT, false),
+        // Every narrower integer assigns to a wider one, and never the reverse.
+        pr(types.Int16T, types.Int8T, true),
+        pr(types.Int32T, types.Int8T, true),
+        pr(types.Int32T, types.Int16T, true),
+        pr(types.IntT, types.Int16T, true),
+        pr(types.IntT, types.Int32T, true),
+        pr(types.Int8T, types.Int16T, false),
+        pr(types.Int16T, types.Int32T, false),
+        pr(types.Int32T, types.IntT, false),
+        pr(types.Int16T, types.Int16T, true),
+        // Floats widen the same way, and the two families never mix.
+        pr(types.FloatT, types.Float32T, true),
+        pr(types.Float32T, types.FloatT, false),
+        pr(types.Float32T, types.Float32T, true),
+        pr(types.Float32T, types.Int8T, false),
+        pr(types.Int32T, types.Float32T, false),
+        pr(types.FloatT, types.Int32T, false),
+        pr(types.newOptional(types.IntT), types.IntT, true),
+        pr(types.newOptional(types.IntT), types.NullT, true),
+        pr(types.newOptional(types.IntT), types.newOptional(types.IntT), true),
+        pr(types.newOptional(types.IntT), types.StringT, false),
+        pr(types.newOptional(types.IntT), types.newOptional(types.StringT), false),
+        pr(types.IntT, types.NullT, false),
+        pr(types.newOptional(car), car, true),
+        pr(types.newOptional(types.IntT), types.Int8T, true),    // widening into the optional
+        pr(types.VoidT, types.IntT, false),
+        pr(types.IntT, types.VoidT, false),
+        // Neither array kind converts to the other: a growable alias could grow
+        // a fixed array. array.copy converts.
+        pr(types.newArray(types.IntT), types.newFixedArray(types.IntT, 5), false),
+        pr(types.newFixedArray(types.IntT, 5), types.newArray(types.IntT), false),
+    ];
+    forEach(cases, c) {
+        if (types.assignable(c.a, c.b) != c.want) {
+            return Error("assignable(" + types.typeString(c.a) + ", "
+                + types.typeString(c.b) + ") = " + string.from(!c.want)
+                + ", want " + string.from(c.want));
+        }
+    }
+});
+
+// ---- the helper predicates ----
+
+test.start("types: family predicates", void () -> {
+    test.assert(types.isIntFamily(types.IntT) && types.isIntFamily(types.Int8T)
+        && types.isIntFamily(types.Int16T) && types.isIntFamily(types.Int32T)
+        && !types.isIntFamily(types.FloatT) && !types.isIntFamily(types.Float32T)
+        && !types.isIntFamily(types.newArray(types.IntT)),
+        "isIntFamily misclassified");
+    test.assert(types.isFloatFamily(types.FloatT) && types.isFloatFamily(types.Float32T)
+        && !types.isFloatFamily(types.IntT) && !types.isFloatFamily(types.newArray(types.FloatT)),
+        "isFloatFamily misclassified");
+});
+
+test.start("types: bits", void () -> {
+    types.Type[] in = [
+        types.Int8T, types.Int16T, types.Int32T, types.Int64T,
+        types.Float32T, types.Float64T, types.IntT, types.FloatT,
+        types.StringT, types.DateTimeT, types.DurationT, types.newArray(types.IntT),
+    ];
+    int[] want = [8, 16, 32, 64, 32, 64, types.naturalBits, types.naturalBits, 0, 0, 0, 0];
+    for (int i = 0; i < in.length; i++) {
+        if (types.bits(in[i]) != want[i]) {
+            return Error("bits(" + types.typeString(in[i]) + ") = "
+                + string.from(types.bits(in[i])) + ", want " + string.from(want[i]));
+        }
+    }
+});
+
+test.start("types: isNarrow", void () -> {
+    forEach([types.Int8T, types.Int16T, types.Int32T, types.Float32T], narrow) {
+        if (!types.isNarrow(narrow)) {
+            return Error("isNarrow(" + types.typeString(narrow) + ") = false");
+        }
+    }
+    types.Type[] wides = [types.IntT, types.FloatT, types.StringT, types.newArray(types.IntT)];
+    forEach(wides, wide) {
+        if (types.isNarrow(wide)) {
+            return Error("isNarrow(" + types.typeString(wide) + ") = true");
+        }
+    }
+});
+
+// Arithmetic on a narrow number produces the natural type of its family.
+test.start("types: widen", void () -> {
+    types.Type[] in = [
+        types.Int8T, types.Int16T, types.Int32T, types.IntT,
+        types.Int64T, types.Float32T, types.FloatT, types.Float64T, types.StringT,
+    ];
+    types.Type[] want = [
+        types.IntT, types.IntT, types.IntT, types.IntT,
+        types.Int64T, types.FloatT, types.FloatT, types.Float64T, types.StringT,
+    ];
+    for (int i = 0; i < in.length; i++) {
+        if (!types.equal(types.widen(in[i]), want[i])) {
+            return Error("widen(" + types.typeString(in[i]) + ") = "
+                + types.typeString(types.widen(in[i])) + ", want " + types.typeString(want[i]));
+        }
+    }
+});
+
+test.start("types: widenPair", void () -> {
+    types.Type[] a = [
+        types.Int8T, types.Int8T, types.IntT, types.Int64T, types.Int64T,
+        types.IntT, types.Float32T, types.Float64T, types.FloatT,
+    ];
+    types.Type[] b = [
+        types.Int16T, types.Int8T, types.Int32T, types.Int8T, types.Int64T,
+        types.Int64T, types.Float32T, types.Float32T, types.Float32T,
+    ];
+    // `int` is the default where the two are equally wide.
+    types.Type[] want = [
+        types.IntT, types.IntT, types.IntT, types.Int64T, types.Int64T,
+        types.IntT, types.FloatT, types.Float64T, types.FloatT,
+    ];
+    for (int i = 0; i < a.length; i++) {
+        types.Type? got = types.widenPair(a[i], b[i]);
+        if (got == null || !types.equal(got, want[i])) {
+            return Error("widenPair(" + types.typeString(a[i]) + ", "
+                + types.typeString(b[i]) + ") = " + orNil(got) + ", want "
+                + types.typeString(want[i]));
+        }
+    }
+});
+
+test.start("types: intRange", void () -> {
+    types.Type[] in = [types.Int8T, types.Int16T, types.Int32T];
+    int[] lo = [-128, -32768, -2147483648];
+    int[] hi = [127, 32767, 2147483647];
+    for (int i = 0; i < in.length; i++) {
+        types.IntBounds? b = types.intRange(in[i]);
+        if (b == null) {
+            return Error("intRange(" + types.typeString(in[i]) + ") has no range");
+        }
+        test.expectInt(b.lo, lo[i]);
+        test.expectInt(b.hi, hi[i]);
+    }
+    // On a 64-bit host `int` is the widest signed type, so §1.6 cannot write a
+    // literal outside it.
+    types.Type[] noRange = [types.IntT, types.Float32T, types.newArray(types.Int8T)];
+    forEach(noRange, t) {
+        if (types.intRange(t) != null) {
+            return Error("intRange(" + types.typeString(t) + ") should have no range");
+        }
+    }
+});
+
+test.start("types: isInvalid and unwrap", void () -> {
+    test.assert(types.isInvalid(types.InvalidT) && !types.isInvalid(types.IntT)
+        && !types.isInvalid(types.newArray(types.IntT)), "isInvalid misclassified");
+    test.assert(types.equal(types.unwrap(types.newOptional(types.IntT)), types.IntT),
+        "unwrap should return the inner type of an optional");
+    test.assert(types.equal(types.unwrap(types.IntT), types.IntT),
+        "unwrap should return non-optionals unchanged");
+});
+
+// ---- fields ----
+
+test.start("types: fieldType", void () -> {
+    types.Record car = rec("car", "", [fld("make", types.StringT), fld("age", types.IntT)]);
+    types.FieldSlot? slot = car.fieldType("age");
+    if (slot == null) {
+        return Error("fieldType(age) was not found");
+    }
+    test.expectInt(slot.index, 1);
+    test.assert(types.equal(slot.type, types.IntT), "fieldType(age) is not int");
+    test.assert(car.fieldType("missing") == null, "fieldType(missing) should not be found");
+});
+
+// ---- maps ----
+
+test.start("types: map types", void () -> {
+    types.MapType si = types.newMapType(types.StringT, types.IntT);
+    test.expectString(types.typeString(si), "Map<String, int>");
+    test.expectString(types.typeString(types.newMapType(types.StringT, si)),
+        "Map<String, Map<String, int>>");
+
+    // Maps are structural: same key and value types, same type.
+    test.assert(types.equal(si, types.newMapType(types.StringT, types.IntT)),
+        "identical map types should be equal");
+    types.Type[] others = [
+        types.newMapType(types.StringT, types.Int64T),
+        types.newMapType(types.IntT, types.IntT), types.newArray(types.IntT), types.StringT,
+    ];
+    forEach(others, other) {
+        if (types.equal(si, other)) {
+            return Error("Map<String, int> should not equal " + types.typeString(other));
+        }
+    }
+
+    // Assignability is exact equality: no widening through a map.
+    test.assert(types.assignable(si, types.newMapType(types.StringT, types.IntT)),
+        "equal map types should be assignable");
+    test.assert(!types.assignable(types.newMapType(types.StringT, types.Int64T), si),
+        "Map<String, int> must not assign to Map<String, int64>");
+    test.assert(types.assignable(types.newOptional(si), si),
+        "a map should assign into its optional");
+});
+
+test.start("types: validMapKey", void () -> {
+    types.Enum en = enu("E", [mem("A", 1)]);
+    types.Type[] valid = [
+        types.Int8T, types.Int16T, types.Int32T, types.Int64T,
+        types.IntT, types.StringT, types.BoolT, types.DateTimeT, types.DurationT, en,
+    ];
+    forEach(valid, k) {
+        if (!types.validMapKey(k)) {
+            return Error(types.typeString(k) + " should be a valid map key");
+        }
+    }
+    types.Type[] invalid = [
+        types.Float32T, types.Float64T, types.FloatT, types.VoidT,
+        types.NullT, rec("R", "", []), types.newArray(types.IntT),
+        types.newOptional(types.IntT), types.newMapType(types.StringT, types.IntT),
+        types.newFuncType([], types.VoidT), types.newFutureType(types.IntT, false),
+    ];
+    forEach(invalid, k) {
+        if (types.validMapKey(k)) {
+            return Error(types.typeString(k) + " should not be a valid map key");
+        }
+    }
+});
+
+// A record or enum is identified by its id. A site that forgets to stamp one
+// leaves a type that compares equal to every other unstamped type.
+test.start("types: the built-in types have distinct ids", void () -> {
+    String[] recNames = [
+        "Error", "Cpu", "Stat", "DeleteOptions",
+        "ChildRunOptions", "ChildRunResult",
+    ];
+    types.Record[] recs = [
+        types.ErrorT, types.CpuT, types.StatT, types.DeleteOptionsT,
+        types.ChildRunOptionsT, types.ChildRunResultT,
+    ];
+    String[] enumNames = ["ErrorCode", "JsonType"];
+    types.Enum[] enums = [types.ErrorCodeT, types.JsonTypeT];
+
+    Map<int, String> seen = {};
+    for (int i = 0; i < recs.length; i++) {
+        if (recs[i].id == 0) {
+            return Error(recNames[i] + " has no id");
+        }
+        String? prev = seen[recs[i].id];
+        if (prev != null) {
+            return Error(prev + " and " + recNames[i] + " share id " + string.from(recs[i].id));
+        }
+        seen[recs[i].id] = recNames[i];
+    }
+    for (int i = 0; i < enums.length; i++) {
+        if (enums[i].id == 0) {
+            return Error(enumNames[i] + " has no id");
+        }
+        String? prev = seen[enums[i].id];
+        if (prev != null) {
+            return Error(prev + " and " + enumNames[i] + " share id " + string.from(enums[i].id));
+        }
+        seen[enums[i].id] = enumNames[i];
+    }
+
+    // The id alone is the identity. The name and the shape do not count.
+    types.Record a = rec("same", "", []);
+    types.Record b = rec("same", "", []);
+    test.assert(!types.equal(a, b), "two declarations with the same name must not be equal");
+    test.assert(types.equal(a, a), "a record must equal itself");
+});
+
+// ---- the host's own width ----
+
+// `int` and `float` are as wide as the machine, so these tests set both widths
+// through types.naturalBits. They collect failures and do not raise, because
+// the width must be restored for every later test.
+void wantBool(String[] bad, int host, String what, bool got, bool want) {
+    if (got != want) {
+        array.push(bad, string.from(host) + "-bit host: " + what + " = "
+            + string.from(got) + ", want " + string.from(want));
+    }
+}
+
+void wantInt(String[] bad, int host, String what, int got, int want) {
+    if (got != want) {
+        array.push(bad, string.from(host) + "-bit host: " + what + " = "
+            + string.from(got) + ", want " + string.from(want));
+    }
+}
+
+void wantType(String[] bad, int host, String what, types.Type? got, types.Type? want) {
+    bool same = false;
+    if (got == null && want == null) {
+        same = true;
+    }
+    types.Type? g = got;
+    types.Type? w = want;
+    if (g != null && w != null) {
+        same = types.equal(g, w);
+    }
+    if (!same) {
+        array.push(bad, string.from(host) + "-bit host: " + what + " = " + orNil(got)
+            + ", want " + orNil(want));
+    }
+}
+
+test.start("types: a 32-bit host and a 64-bit one", void () -> {
+    int saved = types.naturalBits;
+    String[] bad = [];
+    types.Enum sample = enu("Sample", [mem("A", 1)]);
+
+    forEach([32, 64], host) {
+        types.naturalBits = host;
+        bool is64 = host == 64;
+
+        types.Type concreteInt = types.Int32T;
+        types.Type concreteFloat = types.Float32T;
+        types.Type concreteUint = types.Uint32T;
+        // Where `int` is 32 bits, int32 keeps its own type and int64 is the
+        // wider one. Where it is 64, the tie goes to `int`.
+        types.Type wider = types.Int64T;
+        types.Type widerFloat = types.Float64T;
+        types.Type selfOrNatural = types.Int32T;
+        types.Type widerU = types.Uint64T;
+        types.Type selfOrNaturalU = types.Uint32T;
+        if (is64) {
+            concreteInt = types.Int64T;
+            concreteFloat = types.Float64T;
+            concreteUint = types.Uint64T;
+            wider = types.IntT;
+            widerFloat = types.FloatT;
+            selfOrNatural = types.IntT;
+            widerU = types.UintT;
+            selfOrNaturalU = types.UintT;
+        }
+
+        wantInt(bad, host, "bits(int)", types.bits(types.IntT), host);
+        wantInt(bad, host, "bits(float)", types.bits(types.FloatT), host);
+        wantType(bad, host, "concrete(int)", types.concrete(types.IntT), concreteInt);
+        wantType(bad, host, "concrete(float)", types.concrete(types.FloatT), concreteFloat);
+        wantType(bad, host, "concrete(int16)", types.concrete(types.Int16T), types.Int16T);
+        // int32 is narrow only where something wider is natural.
+        wantBool(bad, host, "isNarrow(int32)", types.isNarrow(types.Int32T), is64);
+        wantBool(bad, host, "isNarrow(float32)", types.isNarrow(types.Float32T), is64);
+        wantBool(bad, host, "isNarrow(int16)", types.isNarrow(types.Int16T), true);
+        wantBool(bad, host, "isNarrow(int64)", types.isNarrow(types.Int64T), false);
+        wantBool(bad, host, "isNarrow(int)", types.isNarrow(types.IntT), false);
+        // Arithmetic keeps every bit it was given.
+        wantType(bad, host, "widen(int32)", types.widen(types.Int32T), selfOrNatural);
+        wantType(bad, host, "widen(int8)", types.widen(types.Int8T), types.IntT);
+        wantType(bad, host, "widenPair(int64, int)",
+            types.widenPair(types.Int64T, types.IntT), wider);
+        wantType(bad, host, "widenPair(int32, int8)",
+            types.widenPair(types.Int32T, types.Int8T), selfOrNatural);
+        wantType(bad, host, "widenPair(float64, float)",
+            types.widenPair(types.Float64T, types.FloatT), widerFloat);
+        // A 32-bit int assigns to an int64. At equal width, both directions do.
+        wantBool(bad, host, "int64 <- int", types.assignable(types.Int64T, types.IntT), true);
+        wantBool(bad, host, "int <- int64", types.assignable(types.IntT, types.Int64T), is64);
+        wantBool(bad, host, "int <- int32", types.assignable(types.IntT, types.Int32T), true);
+        wantBool(bad, host, "int32 <- int", types.assignable(types.Int32T, types.IntT), !is64);
+        wantBool(bad, host, "float64 <- float",
+            types.assignable(types.Float64T, types.FloatT), true);
+        wantBool(bad, host, "float <- float64",
+            types.assignable(types.FloatT, types.Float64T), is64);
+        wantBool(bad, host, "float32 <- float",
+            types.assignable(types.Float32T, types.FloatT), !is64);
+        // An unsigned value assigns to a signed type only where the signed type
+        // has a bit to spare for the sign.
+        wantInt(bad, host, "bits(uint)", types.bits(types.UintT), host);
+        wantType(bad, host, "concrete(uint)", types.concrete(types.UintT), concreteUint);
+        wantType(bad, host, "concrete(uint16)", types.concrete(types.Uint16T), types.Uint16T);
+        wantBool(bad, host, "isNarrow(uint32)", types.isNarrow(types.Uint32T), is64);
+        wantBool(bad, host, "isNarrow(uint64)", types.isNarrow(types.Uint64T), false);
+        wantBool(bad, host, "isNarrow(uint)", types.isNarrow(types.UintT), false);
+        wantType(bad, host, "natural(uint8)", types.natural(types.Uint8T), types.UintT);
+        wantType(bad, host, "widen(uint8)", types.widen(types.Uint8T), types.UintT);
+        wantType(bad, host, "widen(uint32)", types.widen(types.Uint32T), selfOrNaturalU);
+        wantType(bad, host, "widenPair(uint64, uint)",
+            types.widenPair(types.Uint64T, types.UintT), widerU);
+        wantType(bad, host, "widenPair(uint32, uint8)",
+            types.widenPair(types.Uint32T, types.Uint8T), selfOrNaturalU);
+        // The two integer families have no common type at equal width, so an
+        // operator over them is an error.
+        wantType(bad, host, "widenPair(uint64, int64)",
+            types.widenPair(types.Uint64T, types.Int64T), null);
+        wantType(bad, host, "widenPair(uint, int)",
+            types.widenPair(types.UintT, types.IntT), null);
+        wantType(bad, host, "widenPair(uint32, int32)",
+            types.widenPair(types.Uint32T, types.Int32T), null);
+        wantType(bad, host, "widenPair(uint8, int)",
+            types.widenPair(types.Uint8T, types.IntT), types.IntT);
+        wantType(bad, host, "widenPair(uint, float)",
+            types.widenPair(types.UintT, types.FloatT), null);
+        wantBool(bad, host, "uint64 <- uint",
+            types.assignable(types.Uint64T, types.UintT), true);
+        wantBool(bad, host, "uint <- uint64",
+            types.assignable(types.UintT, types.Uint64T), is64);
+        wantBool(bad, host, "uint <- uint8", types.assignable(types.UintT, types.Uint8T), true);
+        wantBool(bad, host, "uint8 <- uint", types.assignable(types.Uint8T, types.UintT), false);
+        wantBool(bad, host, "int16 <- uint8",
+            types.assignable(types.Int16T, types.Uint8T), true);
+        wantBool(bad, host, "int8 <- uint8", types.assignable(types.Int8T, types.Uint8T), false);
+        wantBool(bad, host, "int <- uint32", types.assignable(types.IntT, types.Uint32T), is64);
+        wantBool(bad, host, "int64 <- uint64",
+            types.assignable(types.Int64T, types.Uint64T), false);
+        wantBool(bad, host, "uint <- int", types.assignable(types.UintT, types.IntT), false);
+        wantBool(bad, host, "uint64 <- int8",
+            types.assignable(types.Uint64T, types.Int8T), false);
+        wantBool(bad, host, "float64 <- uint32",
+            types.assignable(types.Float64T, types.Uint32T), false);
+        // Enum members are signed, so an enum assigns only to signed integers.
+        wantBool(bad, host, "uint <- enum", types.assignable(types.UintT, sample), false);
+        wantBool(bad, host, "int64 <- enum", types.assignable(types.Int64T, sample), true);
+        wantBool(bad, host, "isIntFamily(uint16)", types.isIntFamily(types.Uint16T), true);
+        wantBool(bad, host, "isSignedFamily(uint16)",
+            types.isSignedFamily(types.Uint16T), false);
+        wantBool(bad, host, "isUnsignedFamily(uint16)",
+            types.isUnsignedFamily(types.Uint16T), true);
+        wantBool(bad, host, "isUnsignedFamily(int16)",
+            types.isUnsignedFamily(types.Int16T), false);
+        wantBool(bad, host, "validMapKey(uint8)", types.validMapKey(types.Uint8T), true);
+
+        // An `int` is range-checked like any other sized type once something
+        // wider exists to hold the overflow.
+        types.IntBounds? ir = types.intRange(types.IntT);
+        wantBool(bad, host, "intRange(int) answers", ir != null, !is64);
+        if (ir != null && !is64) {
+            wantInt(bad, host, "intRange(int).lo", ir.lo, -2147483648);
+            wantInt(bad, host, "intRange(int).hi", ir.hi, 2147483647);
+        }
+        wantBool(bad, host, "intRange(int64) answers", types.intRange(types.Int64T) != null, false);
+
+        // Every unsigned type answers, because `uint x = -1;` must be caught at
+        // any width. Above 63 bits the upper bound is the widest literal §1.6
+        // allows.
+        types.Type[] unsigned = [
+            types.Uint8T, types.Uint16T, types.Uint32T,
+            types.Uint64T, types.UintT,
+        ];
+        forEach(unsigned, u) {
+            int want = 9223372036854775807;
+            int w = types.bits(u);
+            if (w < 64) {
+                int limit = 1;
+                for (int i = 0; i < w; i++) {
+                    limit = limit * 2;
+                }
+                want = limit - 1;
+            }
+            types.IntBounds? b = types.intRange(u);
+            if (b == null) {
+                array.push(bad, string.from(host) + "-bit host: intRange("
+                    + types.typeString(u) + ") has no range");
+                continue;
+            }
+            wantInt(bad, host, "intRange(" + types.typeString(u) + ").lo", b.lo, 0);
+            wantInt(bad, host, "intRange(" + types.typeString(u) + ").hi", b.hi, want);
+        }
+    }
+
+    types.naturalBits = saved;
+    if (bad.length > 0) {
+        return Error(string.join(bad, "\n"));
+    }
+});

@@ -1,0 +1,408 @@
+// Decompression: RFC 1951 deflate inside the RFC 1952 gzip wrapper.
+//
+// `nio get` uses it to read a tag tarball without an external program.
+//
+// It is written in Nio because it needs nothing from C: the algorithm is
+// arithmetic over bytes. It is slower than C, but a package is only a few
+// megabytes of source.
+//
+// All input comes from a remote host, so the rules of `tls` and `x509` apply.
+// Every length and index is checked before use, and the output has a limit
+// that the caller gives. Without a limit, a small archive can inflate without
+// end, which is a denial of service.
+import 'array';
+import 'string';
+
+// The bits of the compressed stream, read from the least significant bit of
+// each byte upward, which is deflate's order.
+type Bits {
+    byte[] data;
+    int pos;    // the byte the next bit comes from
+    int bit;    // how many bits of that byte are spent, 0..7
+
+    // The next n bits as a number, low bit first.
+    int take(int n) {
+        int out = 0;
+        for (int i = 0; i < n; i++) {
+            if (self.pos >= self.data.length) {
+                return Error("the compressed data ends inside a code");
+            }
+            int cur = self.data[self.pos];
+            int b = (cur >> self.bit) & 1;
+            out = out | (b << i);
+            self.bit = self.bit + 1;
+            if (self.bit == 8) {
+                self.bit = 0;
+                self.pos = self.pos + 1;
+            }
+        }
+        return out;
+    }
+
+    // Skips the rest of the current byte. A stored block starts at the next
+    // byte.
+    void align() {
+        if (self.bit != 0) {
+            self.bit = 0;
+            self.pos = self.pos + 1;
+        }
+    }
+}
+
+// A canonical Huffman code: the number of codes of each length, and the
+// symbols in the order that the lengths give (RFC 1951 §3.2.2).
+type Huffman {
+    int[] count;
+    int[] symbol;
+}
+
+int const MAXBITS = 15;
+
+// Builds the code that a list of code lengths describes. A length of 0 means
+// that the symbol is not in the code.
+Huffman build(int[] lengths) {
+    int[] count = [];
+    for (int i = 0; i <= MAXBITS; i++) {
+        array.push(count, 0);
+    }
+    forEach(lengths, l) {
+        if (l < 0 || l > MAXBITS) {
+            return Error("a Huffman code length is out of range");
+        }
+        count[l] = count[l] + 1;
+    }
+    // A code with no symbols is legal and decodes nothing. An over-subscribed
+    // code is not a valid code.
+    int left = 1;
+    for (int len = 1; len <= MAXBITS; len++) {
+        left = left * 2 - count[len];
+        if (left < 0) {
+            return Error("the Huffman code is over-subscribed");
+        }
+    }
+    int[] offs = [];
+    for (int i = 0; i <= MAXBITS; i++) {
+        array.push(offs, 0);
+    }
+    for (int len = 1; len < MAXBITS; len++) {
+        offs[len + 1] = offs[len] + count[len];
+    }
+    int[] symbol = [];
+    forEach(lengths, l2) {
+        array.push(symbol, 0);
+    }
+    forEach(lengths, l3, sym) {
+        if (l3 != 0) {
+            symbol[offs[l3]] = sym;
+            offs[l3] = offs[l3] + 1;
+        }
+    }
+    Huffman h = { count: count, symbol: symbol };
+    return h;
+}
+
+// Reads one symbol bit by bit. At each length the code either falls inside
+// the codes of that length or is longer (the decoding loop, RFC 1951 §3.2.2).
+int decode(Bits b, Huffman h) {
+    int code = 0;
+    int first = 0;
+    int index = 0;
+    for (int len = 1; len <= MAXBITS; len++) {
+        code = code | b.take(1);
+        int count = h.count[len];
+        if (code - first < count) {
+            int at = index + (code - first);
+            if (at < 0 || at >= h.symbol.length) {
+                return Error("the compressed data names a symbol that is not in the code");
+            }
+            return h.symbol[at];
+        }
+        index = index + count;
+        first = (first + count) * 2;
+        code = code * 2;
+    }
+    return Error("the compressed data holds a code longer than 15 bits");
+}
+
+// The extra bits and bases of the length and distance codes (RFC 1951 §3.2.5).
+int[] const LEN_BASE = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59,
+    67, 83, 99, 115, 131, 163, 195, 227, 258,
+];
+int[] const LEN_EXTRA = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4,
+    5, 5, 5, 5, 0,
+];
+int[] const DIST_BASE = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513,
+    769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+];
+int[] const DIST_EXTRA = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10,
+    11, 11, 12, 12, 13, 13,
+];
+
+// The order in which the code lengths of the code-length code are written.
+int[] const LENGTH_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+// Reads deflate data. limit is the largest output allowed, in bytes. Without
+// it, a small archive can describe an output of any size.
+export byte[] inflate(byte[] data, int limit) {
+    Bits b = { data: data, pos: 0, bit: 0 };
+    byte[] out = [];
+    bool last = false;
+    while (!last) {
+        last = b.take(1) == 1;
+        int kind = b.take(2);
+        if (kind == 0) {
+            storedBlock(b, out, limit);
+        } else if (kind == 1) {
+            codedBlock(b, out, limit, fixedLit(), fixedDist());
+        } else if (kind == 2) {
+            Huffman[] codes = dynamicCodes(b);
+            codedBlock(b, out, limit, codes[0], codes[1]);
+        } else {
+            return Error("the compressed data holds a block of an unknown kind");
+        }
+    }
+    return out;
+}
+
+// Reads a stored (uncompressed) block. Its length is written twice.
+void storedBlock(Bits b, byte[] out, int limit) {
+    b.align();
+    int len = b.take(16);
+    int nlen = b.take(16);
+    if (len != (~nlen & 65535)) {
+        return Error("a stored block's length disagrees with its complement");
+    }
+    if (out.length + len > limit) {
+        return Error("the archive is larger than the limit of " + string.from(limit) + " bytes");
+    }
+    for (int i = 0; i < len; i++) {
+        if (b.pos >= b.data.length) {
+            return Error("the compressed data ends inside a stored block");
+        }
+        array.push(out, b.data[b.pos]);
+        b.pos = b.pos + 1;
+    }
+}
+
+// Reads a block of Huffman codes. A symbol is a byte, the end of the block, or
+// a length that copies bytes from a distance back in the output.
+void codedBlock(Bits b, byte[] out, int limit, Huffman lit, Huffman dist) {
+    while (true) {
+        int sym = decode(b, lit);
+        if (sym < 256) {
+            if (out.length >= limit) {
+                return Error("the archive is larger than the limit of " + string.from(limit) + " bytes");
+            }
+            array.push(out, sym as byte);
+            continue;
+        }
+        if (sym == 256) {
+            return;
+        }
+        int at = sym - 257;
+        if (at >= LEN_BASE.length) {
+            return Error("the compressed data holds a length symbol that has no meaning");
+        }
+        int len = LEN_BASE[at] + b.take(LEN_EXTRA[at]);
+        int dsym = decode(b, dist);
+        if (dsym >= DIST_BASE.length) {
+            return Error("the compressed data holds a distance symbol that has no meaning");
+        }
+        int back = DIST_BASE[dsym] + b.take(DIST_EXTRA[dsym]);
+        if (back > out.length) {
+            return Error("the compressed data copies from before the start of the output");
+        }
+        if (out.length + len > limit) {
+            return Error("the archive is larger than the limit of " + string.from(limit) + " bytes");
+        }
+        // The copy can overlap its own output. That is how deflate encodes a
+        // run of one byte, so the copy goes one byte at a time.
+        int from = out.length - back;
+        for (int i = 0; i < len; i++) {
+            array.push(out, out[from + i]);
+        }
+    }
+}
+
+Huffman fixedLit() {
+    int[] lengths = [];
+    for (int i = 0; i < 144; i++) {
+        array.push(lengths, 8);
+    }
+    for (int i = 144; i < 256; i++) {
+        array.push(lengths, 9);
+    }
+    for (int i = 256; i < 280; i++) {
+        array.push(lengths, 7);
+    }
+    for (int i = 280; i < 288; i++) {
+        array.push(lengths, 8);
+    }
+    return build(lengths);
+}
+
+Huffman fixedDist() {
+    int[] lengths = [];
+    for (int i = 0; i < 30; i++) {
+        array.push(lengths, 5);
+    }
+    return build(lengths);
+}
+
+// Reads the two codes at the start of a dynamic block. They are encoded with
+// a third code (RFC 1951 §3.2.7).
+Huffman[] dynamicCodes(Bits b) {
+    int nlen = b.take(5) + 257;
+    int ndist = b.take(5) + 1;
+    int ncode = b.take(4) + 4;
+    if (nlen > 286 || ndist > 30) {
+        return Error("the compressed data describes too many codes");
+    }
+    int[] order = [];
+    for (int i = 0; i < 19; i++) {
+        array.push(order, 0);
+    }
+    for (int i = 0; i < ncode; i++) {
+        order[LENGTH_ORDER[i]] = b.take(3);
+    }
+    Huffman lengthCode = build(order);
+    int[] lengths = [];
+    while (lengths.length < nlen + ndist) {
+        int sym = decode(b, lengthCode);
+        if (sym < 16) {
+            array.push(lengths, sym);
+            continue;
+        }
+        int repeat = 0;
+        int value = 0;
+        if (sym == 16) {
+            if (lengths.length == 0) {
+                return Error("the compressed data repeats a code length before there is one");
+            }
+            value = lengths[lengths.length - 1];
+            repeat = 3 + b.take(2);
+        } else if (sym == 17) {
+            repeat = 3 + b.take(3);
+        } else {
+            repeat = 11 + b.take(7);
+        }
+        if (lengths.length + repeat > nlen + ndist) {
+            return Error("the compressed data writes more code lengths than it declared");
+        }
+        for (int i = 0; i < repeat; i++) {
+            array.push(lengths, value);
+        }
+    }
+    int[] litLengths = array.slice(lengths, 0, nlen);
+    int[] distLengths = array.slice(lengths, nlen, lengths.length);
+    Huffman[] out = [build(litLengths), build(distLengths)];
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// The gzip wrapper (RFC 1952)
+// ---------------------------------------------------------------------------
+
+// Reads a gzip member: the header, the deflate data, and the CRC and length
+// after it. Both are checked, because the package bytes came over a network
+// and the tree hash is recorded only after extraction.
+export byte[] gunzip(byte[] data, int limit) {
+    if (data.length < 18) {
+        return Error("too short to be a gzip archive");
+    }
+    if (data[0] != 31 || data[1] != 139) {
+        return Error("not a gzip archive");
+    }
+    if (data[2] != 8) {
+        return Error("the gzip archive is not deflate");
+    }
+    int flags = data[3];
+    if ((flags & 224) != 0) {
+        return Error("the gzip archive sets a flag this reader does not know");
+    }
+    int at = 10;
+    if ((flags & 4) != 0) {
+        if (at + 2 > data.length) {
+            return Error("the gzip header ends inside its extra field");
+        }
+        int lo = data[at];
+        int hi = data[at + 1];
+        int extra = lo | (hi << 8);
+        at = at + 2 + extra;
+    }
+    if ((flags & 8) != 0) {
+        at = afterString(data, at);
+    }
+    if ((flags & 16) != 0) {
+        at = afterString(data, at);
+    }
+    if ((flags & 2) != 0) {
+        at = at + 2;
+    }
+    if (at + 8 > data.length) {
+        return Error("the gzip header runs past the end of the archive");
+    }
+    byte[] out = inflate(array.slice(data, at, data.length - 8), limit);
+    int wantCrc = readLE32(data, data.length - 8);
+    int wantSize = readLE32(data, data.length - 4);
+    if (crc32(out) != wantCrc) {
+        return Error("the archive does not match its checksum");
+    }
+    // The stored size is the low 32 bits of the real one.
+    if ((out.length & 4294967295) != wantSize) {
+        return Error("the archive does not match its recorded size");
+    }
+    return out;
+}
+
+// The offset after a NUL-ended header string.
+int afterString(byte[] data, int at) {
+    int i = at;
+    while (i < data.length && data[i] != 0) {
+        i = i + 1;
+    }
+    if (i >= data.length) {
+        return Error("the gzip header ends inside a name");
+    }
+    return i + 1;
+}
+
+int readLE32(byte[] data, int at) {
+    if (at < 0 || at + 4 > data.length) {
+        return 0;
+    }
+    int b0 = data[at];
+    int b1 = data[at + 1];
+    int b2 = data[at + 2];
+    int b3 = data[at + 3];
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+int[] crcTable = [];
+
+// CRC-32 as gzip defines it: the reflected polynomial 0xEDB88320.
+export int crc32(byte[] data) {
+    if (crcTable.length == 0) {
+        for (int i = 0; i < 256; i++) {
+            int c = i;
+            for (int k = 0; k < 8; k++) {
+                if ((c & 1) != 0) {
+                    c = 3988292384 ^ (c >> 1);
+                } else {
+                    c = c >> 1;
+                }
+            }
+            array.push(crcTable, c);
+        }
+    }
+    int crc = 4294967295;
+    forEach(data, b) {
+        int v = b;
+        crc = crcTable[(crc ^ v) & 255] ^ (crc >> 8);
+    }
+    return (crc ^ 4294967295) & 4294967295;
+}

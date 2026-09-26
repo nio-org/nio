@@ -1,0 +1,147 @@
+// The call chain that a panic prints (§5.5). It comes from the shadow stack of
+// the collector. Thus it names only the functions that pushed a frame, and a
+// function pushes a frame only when the collector needs one.
+//
+// This has three gaps, and the tests below assert them. A function that holds
+// no heap value is absent. The frame of a runtime helper has no name and is
+// skipped. An async step function has no shadow frame, so an await chain names
+// only the code that drove the scheduler.
+import 'test';
+import 'string';
+import './harness' as h;
+
+// The chain follows the calls, innermost first.
+test.start("trace: a panic names the call chain", void () -> {
+    h.expectRuntimeError(`
+int deepest(int[] a, int i) {
+    return a[i];
+}
+int middle(int[] a) {
+    return deepest(a, 99);
+}
+int top(int[] a) {
+    return middle(a);
+}
+int[] xs = [1, 2, 3];
+print(top(xs));
+`, "in:\n  deepest\n  middle\n  top\n  main");
+});
+
+// A function that does only arithmetic holds no pointer. It pushes no frame,
+// so the chain cannot name it. A frame in every function makes a recursive
+// scalar function 2x slower. If debug info closes this gap, this test changes.
+test.start("trace: a function holding no heap value is absent", void () -> {
+    h.Run r = h.runProgram(`
+int divide(int a, int b) {
+    return a / b;
+}
+int compute(int n) {
+    return divide(100, n);
+}
+print(compute(0));
+`);
+    if (r.code == 0) {
+        return Error("expected a runtime error");
+    }
+    if (!string.contains(r.err, "division by zero")) {
+        return Error("stderr lost the message: " + r.err);
+    }
+    if (string.contains(r.err, "divide")) {
+        return Error("a root-free function reached the chain: " + r.err);
+    }
+});
+
+// A method has its source name, and not its mangled symbol name.
+test.start("trace: a method is named Type.name", void () -> {
+    h.expectRuntimeError(`
+type Car {
+    String name;
+    int drive(int[] road, int at) {
+        return road[at];
+    }
+}
+Car c = { name: "x" };
+int[] r = [1];
+print(c.drive(r, 5));
+`, "in:\n  Car.drive\n  main");
+});
+
+// A function literal has no name, so the chain names its source position.
+test.start("trace: a function literal names its enclosing function", void () -> {
+    h.expectRuntimeError(`
+int apply(Function(int[])<int> f, int[] xs) {
+    return f(xs);
+}
+int outer(int[] xs) {
+    return apply(int (int[] a) -> a[9], xs);
+}
+int[] ns = [1];
+print(outer(ns));
+`, "in:\n  <function literal in outer>\n  apply\n  outer\n  main");
+});
+
+// An uncaught Error goes to the same printer, but the chain is different
+// (§2.9, errors are values). Propagation is a return, so both functions below
+// have popped their frames when the error is not caught. The chain names where
+// the program stopped. It does not name where the error was made.
+test.start("trace: an uncaught error names where the program stopped", void () -> {
+    h.Run r = h.runProgram(`
+int fails(String why) {
+    return Error(why);
+}
+int caller(String why) {
+    return fails(why);
+}
+String m = "no good";
+print(caller(m));
+`);
+    if (r.code == 0) {
+        return Error("expected a runtime error");
+    }
+    if (!string.contains(r.err, "no good")) {
+        return Error("stderr lost the message: " + r.err);
+    }
+    if (string.contains(r.err, "caller") || string.contains(r.err, "fails")) {
+        return Error("a returned frame reached the chain: " + r.err);
+    }
+});
+
+// The locals of a step function are in a heap frame that the scheduler owns,
+// so the function pushes no shadow frame. If this gap closes, this test
+// changes.
+test.start("trace: an async body does not appear yet", void () -> {
+    h.expectRuntimeError(`
+import 'async';
+int async fetch(int[] a, int i) {
+    return a[i];
+}
+void async run() {
+    int[] a = [1, 2];
+    print(await fetch(a, 7));
+}
+await run();
+`, "index 7 out of range");
+});
+
+// NIO_NO_TRACE=1 suppresses it, so a program comparing stderr exactly can.
+test.start("trace: NIO_NO_TRACE turns the chain off", void () -> {
+    String src = "int at(int[] a, int i) { return a[i]; }\nint[] xs = [1];\nprint(at(xs, 9));\n";
+    String dir = h.scratch();
+    String entry = h.writeTo(dir, "prog.nio", src);
+    String bin = h.buildEntry(entry, false);
+    h.Run plain = h.runBinaryIn(bin, [], dir, {});
+    if (!string.contains(plain.err, "in:\n  at\n")) {
+        return Error("the chain is missing without the variable: " + plain.err);
+    }
+    Map<String, String> env = { "NIO_NO_TRACE": "1" };
+    h.Run r = h.runBinaryIn(bin, [], dir, env);
+    if (r.code == 0) {
+        return Error("expected a runtime error");
+    }
+    if (string.contains(r.err, "in:")) {
+        return Error("stderr still carries a chain: " + r.err);
+    }
+    if (!string.contains(r.err, "out of range")) {
+        return Error("stderr lost the message: " + r.err);
+    }
+});

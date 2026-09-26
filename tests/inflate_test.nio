@@ -1,0 +1,187 @@
+// Tests for reading a gzip archive and the tar inside it. `nio get` does this
+// to a tag tarball, with no external program.
+//
+// The fixtures are archives that gzip and tar wrote. They are hex-encoded here,
+// beside the cases that use them. The tests cover the three deflate block
+// kinds: a stored block (level 0), fixed codes (a small input), and dynamic
+// codes (varied text, which uses BTYPE 2).
+import 'test';
+import 'string';
+import 'array';
+import 'fs';
+import 'path';
+import './harness' as h;
+import './bytes' as bytes;
+import '../src/inflate' as inflate;
+import '../src/untar' as untar;
+
+int const LIMIT = 1048576;
+
+byte[] gz(String hex) {
+    return string.toByteArray(bytes.unhex(hex));
+}
+
+String text(byte[] data) {
+    return string.fromByteArray(data);
+}
+
+String const STORED = "1f8b08000000000004ff012b00d4ff612073746f72656420626c6f636b206b65657073206974"
+    + "732062797465732061732074686579206172650aca518bba2b000000";
+
+String const FIXED = "1f8b08000000000002ff4b4c4a4e04232e008db3fd210a000000";
+
+String const DYNAMIC = "1f8b08000000000002ff7d565b8e83300cfcf729b85a44238a4aa10a74b57bfbede231cd0ce9"
+    + "fe344aea8cc7e34748a5a49f6eddca380fdd654cc3bcacdbd877693f4ff5bffd35f7b75cbaf1"
+    + "fe58cad6e5efbfc5aa3bb0f34b8f54d697715caaccfc62775f2ecf29bbb595bc3dcb2c7f9d59"
+    + "4d4bbabcc080fd48fd2d0d397cd894e761bbb27fdc081a38859ff7e90e647008f7011f2be2c6"
+    + "22772b96e604bed2f444782a1dfc60074e2e8105fbf0bdff576bc5f61d8276488321a2868933"
+    + "a964641ab00a1100d1485c80bb47ec98861f9ad06f2b18a71e15009c79a4925d491201531164"
+    + "253d6ca6e967e119f0e71051dbf000353f9485d33fb50e204089334e6dc54e4e7d1252443d93"
+    + "222c93e80a192ac4109033ce0d1d602cb6c55644c01d8a4bd0abc60810cf42ab7264e15e334e"
+    + "bcb43f50fd37ce28177c183b0e1b3b9e1350523a9f132722d2a0427372bfd3b412798f9c7b84"
+    + "e82ad19edb97d9c4e238e02f99a56c018ce937bb818a57a6bc8441d4a49b38362906f7c17936"
+    + "a939ea6879a2f81dd94d0c67f570e637024b13ca74dc73f73b1c4f5db134995e34d2ff19dbf0"
+    + "cf7d413920e7c768ab6332ec20413511ea9e39ca6be75713b3f3a0e4f8551d89d5afdb69b2b0"
+    + "717302905ac65582a8103f9dc9b3ef1f198d6f9a8f5f1a477dd32c15aafc56375f0b7d1db40c"
+    + "9a2393e6234d246b7f497c4a2c397111709144e32f8ae6987a43ff027cd38315320a0000";
+
+String const NAMED = "1f8b08080000000002ff706b672e74617200cb4bcc4d4d51c84dcd4d4a2de20200e7d2f4ed0d"
+    + "000000";
+
+String const TAR_GZ = "1f8b08000000000002ffedd6b14ec4201c0670669f82f11cda424bdbc198383afa06176a49af"
+    + "b102e1e859637c77d118a3d5e5cc51bddcf75b28e9c0f0853f9f95d3ba1b4c2387f546c95639"
+    + "72782ca884785b83f9fafd9bf3a22a09edc802c6ad972e1c4f4e93bdeb129eb29465f1ced83b"
+    + "7f56f332e45f22ff05f31ffa26d5bdf98bfc8b7a76ff992842fe0cf947a7266b9ca7bdf6d468"
+    + "b53aa74fd4293f3a4df9057d3e23702af77f3b3691de805fccff5a5498ff4b48b334bbba91d3"
+    + "75acf2f79eff0fb97f649e33319fff39e7844ec83f3a5ee4d44abfb9fc3a0876ca3d2683d15d"
+    + "d2f64edd7a13b65adeab43fe6895b2af8d038fccbf99ff7162dfbbff154c30f4bfa5fb9f7f30"
+    + "9ffb5f8efe070000000000000000000070a45e00ff27a33400280000";
+
+String const SYMLINK_GZ = "1f8b08000000000002ffedcd410ac2300044d11cc50bd82425789fa2222522c554bcbec1a5ae"
+    + "bb28bcb7f9b39ba5de8e7948438af7f951c32652772ae5dbeeb7ff3b8f39957018e3753dc765"
+    + "6aed7d095b79b5757af6fb00000000000000000000fbf1016cfdb97300280000";
+
+String const ESCAPE_GZ = "1f8b08000000000002ffedcd310ac2401404d0ad3d8517c8663709de2748101162300a1edf8f"
+    + "95588b20bed7cc30cd2ca7435373c9a5cdb99dd6fdb84c793e9ed32795b01b866786f70cdd4b"
+    + "8fbdd6beefd2b6a42fb8add7f112f7e93fdd37090000000000000000801ff400266428660028"
+    + "0000";
+
+String const STORED_TEXT = 'a stored block keeps its bytes as they are';
+
+// Each of the three kinds of deflate block gives back the compressed text.
+test.start("inflate: the three block kinds", void () -> {
+    test.expectString(text(inflate.gunzip(gz(STORED), LIMIT)),
+        "a stored block keeps its bytes as they are\n");
+    test.expectString(text(inflate.gunzip(gz(FIXED), LIMIT)), "abcabcabc\n");
+    byte[] dyn = inflate.gunzip(gz(DYNAMIC), LIMIT);
+    test.expectInt(dyn.length, 2610);
+    test.assert(string.contains(text(dyn), "array string diagnostic array"), text(dyn));
+    // The reader skips a header that has a name and its flag.
+    test.expectString(text(inflate.gunzip(gz(NAMED), LIMIT)), "named member\n");
+});
+
+test.start("inflate: crc32 is gzip's", void () -> {
+    test.expectInt(inflate.crc32(string.toByteArray("123456789")), 3421780262);
+    byte[] none = [];
+    test.expectInt(inflate.crc32(none), 0);
+});
+
+// The archive comes from a host, so the reader must refuse each damaged form
+// and never read past the end.
+test.start("inflate: a damaged archive is refused", void () -> {
+    test.expectString(refusal(string.toByteArray("not an archive at all")), "not a gzip archive");
+
+    // A changed byte in the middle fails the checksum of the archive.
+    byte[] bent = gz(DYNAMIC);
+    bent[200] = (bent[200] ^ 255) as byte;
+    test.assert(refusal(bent) != "", "a flipped byte should be refused");
+
+    // Truncation at many lengths gives an answer or a refusal. A read past the
+    // end is a runtime error, which stops the suite.
+    byte[] whole = gz(DYNAMIC);
+    for (int i = 0; i < whole.length; i = i + 7) {
+        refusal(array.slice(whole, 0, i));
+    }
+
+    // The output has a limit, because a small archive can expand to an
+    // unlimited size, and a caller cannot know this before it reads.
+    String small = refusal2(gz(DYNAMIC), 100);
+    test.assert(string.contains(small, "larger than the limit"), small);
+});
+
+String refusal(byte[] data) {
+    return refusal2(data, LIMIT);
+}
+
+String refusal2(byte[] data, int limit) {
+    byte[] got = inflate.gunzip(data, limit) catch e {
+        return e.message;
+    };
+    return "";
+}
+
+// A tarball as a host generates it: a pax global header first, directories,
+// files, and a path too long for the name field of the header.
+test.start("untar: a tarball is read as its entries", void () -> {
+    byte[] tar = inflate.gunzip(gz(TAR_GZ), LIMIT);
+    untar.Entry[] es = untar.read(tar);
+    String[] names = [];
+    forEach(es, e) {
+        array.push(names, e.name);
+    }
+    // The pax global header is a record of the archive, not an entry.
+    test.assert(!array.contains(names, "pax_global_header"), string.join(names, ", "));
+    test.assert(array.contains(names, "pkg-1.0.0/lib.nio"), string.join(names, ", "));
+    test.assert(array.contains(names, "pkg-1.0.0/sub/very-long-directory-name/"
+        + "very-long-directory-name/very-long-directory-name/very-long-directory-name/deep.nio"),
+        string.join(names, ", "));
+    forEach(es, e) {
+        if (e.name == "pkg-1.0.0/lib.nio") {
+            test.expectString(text(e.data), "export int one() { return 1; }\n");
+        }
+    }
+});
+
+// `nio get` writes the archive out, without the top directory that the host
+// puts around the tree.
+test.start("untar: an archive is written out, stripped of its top directory", void () -> {
+    String dir = h.scratch();
+    byte[] tar = inflate.gunzip(gz(TAR_GZ), LIMIT);
+    String? bad = untar.extract(tar, dir, 1);
+    test.assert(bad == null, "extract: " + orEmpty(bad));
+    test.expectString(readText(path.join(dir, "lib.nio")), "export int one() { return 1; }\n");
+    String deep = path.join(dir, path.localize("sub/very-long-directory-name/"
+        + "very-long-directory-name/very-long-directory-name/very-long-directory-name/deep.nio"));
+    test.expectString(readText(deep), "export int two() { return 2; }\n");
+    // strip removed the top directory, so no path has its name.
+    test.assert(!fs.exists(path.join(dir, "pkg-1.0.0")), "the top directory survived");
+});
+
+// An archive can hold two things that the reader must refuse. A link, which no
+// `fs` call can write, so it would become an empty file. A name that goes out
+// of the destination directory.
+test.start("untar: a link and an escaping path are refused", void () -> {
+    String dir = h.scratch();
+    byte[] sym = inflate.gunzip(gz(SYMLINK_GZ), LIMIT);
+    String bad = orEmpty(untar.extract(sym, dir, 1));
+    test.assert(string.contains(bad, "holds a link"), bad);
+
+    byte[] esc = inflate.gunzip(gz(ESCAPE_GZ), LIMIT);
+    String out = orEmpty(untar.extract(esc, dir, 1));
+    test.assert(string.contains(out, "leaves the directory"), out);
+    test.assert(!fs.exists(path.join(h.scratch(), "escape.nio")), "a path escaped");
+});
+
+String orEmpty(String? s) {
+    if (s == null) {
+        return "";
+    }
+    return s;
+}
+
+String readText(String p) {
+    byte[] data = fs.readFile(p) catch e {
+        return "";
+    };
+    return string.fromByteArray(data);
+}

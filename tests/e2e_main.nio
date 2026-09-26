@@ -1,0 +1,5 @@
+// The slow half on its own: `nio run tests/e2e_main.nio`.
+import './e2e' as e2e;
+import 'test';
+
+test.run();

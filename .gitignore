@@ -1,0 +1,39 @@
+# macOS
+.DS_Store
+
+# the compiler itself, wherever it lands (sh bootstrap/build.sh, or
+# nio build src/nio.nio -o nio)
+/nio
+
+# Internal notes: design documents and plans. They are kept beside the tree
+# and not published.
+/internal-docs/
+
+# coverage reports (nio run --coverage)
+coverage.lcov
+
+# built by libraries/translation/build.sh
+libraries/translation/native/*.dylib
+
+# benchmark binaries (benchmark/run.sh)
+benchmark/bin/
+
+# The VS Code extension's build products. It is the one part of this repository
+# with a JavaScript toolchain, and neither half of it is source: node_modules is
+# what npm install fetches, and out/ is what esbuild bundles from src/.
+editors/vscode/node_modules/
+editors/vscode/out/
+
+# BoringSSL's TLS test runner, its Go module cache and the shim built
+# against it. tools/bogo.sh fetches this at a pinned commit at run time; it
+# is another project's repository and needs more than clang, so it is not
+# vendored.
+build/bogo/
+
+# emitted LLVM IR
+*.ll
+
+# ...except the compiler as portable IR, which is a source file and not a
+# build product: it is stage 0 of the bootstrap. tools/bootstrap.nio
+# regenerates it.
+!bootstrap/nio.ll

@@ -1,0 +1,138 @@
+// Node identity.
+//
+// Three places build AST nodes and each must stamp an id: the parser,
+// ast.cloneMethod (§2.4) and the await normalizer. A node with a zero id shares
+// its checker.Info entry with every other unstamped node. It then gets a wrong
+// type and nothing crashes.
+import 'test';
+import 'string';
+import 'map';
+import './astwalk' as astwalk;
+import '../src/ast' as ast;
+import '../src/lexer' as lexer;
+import '../src/parser' as parser;
+import '../src/checker' as checker;
+import '../src/normalize' as normalize;
+import '../src/module' as module;
+
+// A program that reaches every node type and all three builders: it extends a
+// type, and it awaits in the shapes the normalizer rewrites.
+String const SRC = `
+import 'json';
+import 'array';
+
+sealed type Shape { int id; }
+type Circle extends Shape { float64 r; }
+type Square extends Shape { float64 side; }
+
+type Base {
+    int n;
+    int bump(int by) {
+        self.n = self.n + by;
+        if (self.n > 10) { return self.n; }
+        return 0;
+    }
+}
+type Derived extends Base { String tag; }
+
+enum Color { RED: 1, BLUE: 2 }
+
+native flags darwin '-lm';
+extern int nodeid_probe(int a);
+
+int? maybe = 3;
+int[] xs = [1, 2, 3];
+Map<String, int> m = { "a": 1 };
+
+int async slow(int n) {
+    int a = await fast(n);
+    int b = await fast(a) + await fast(1);
+    if (a > 0) { b = b + await fast(2); }
+    return b;
+}
+int async fast(int n) { return n * 2; }
+
+int mayFail(int n) {
+    if (n < 0) { return Error("negative", 1); }
+    return n;
+}
+
+String describe(Shape s) {
+    switch (s) {
+        case Circle c: return "circle";
+        case Square q: return "square";
+    }
+}
+
+Function(int)<int> f = int (int a) -> a + 1;
+Function(int)<int> g = int (int a) -> { return a * 2; };
+
+void run() {
+    int total = 0;
+    forEach(xs, e, i) { total = total + e + i; }
+    for (int i = 0; i < 3; i++) { total = total - i; }
+    while (total > 100) { total = total / 2; break; }
+    int got = mayFail(-1) catch 0;
+    int? soft = mayFail(-1) catch e { print(e.message); };
+    total = total + got + f(1) + g(2);
+    int? mv = m["a"];
+    if (mv != null) { total = total + mv; }
+    if (soft != null) { total = total + soft; }
+    switch (total) {
+        case 1: print("one");
+        default: print("other");
+    }
+    Derived d = { n: 1, tag: "t" };
+    print(d.bump(2));
+    print(describe(circle()));
+    print(maybe != null, json.toText(xs), Color.RED);
+}
+
+Circle circle() {
+    Circle c = { id: 1, r: 2.0 };
+    return c;
+}
+
+run();
+print(await slow(2));
+`;
+
+test.start("codegen: every node is numbered", void () -> {
+    parser.Parser p = parser.newParser(lexer.newLexer(SRC));
+    ast.Program prog = p.parseProgram();
+    test.assert(p.errs.length == 0, "parse errors: " + string.join(p.errs, "\n"));
+    checker.CheckResult res = checker.check(prog);
+    test.assert(res.errs.length == 0, "check errors: " + string.join(res.errs, "\n"));
+
+    // The program must use all three builders. Otherwise a pass proves
+    // nothing.
+    astwalk.Walk before = astwalk.newWalk();
+    astwalk.walkProgram(before, prog);
+    test.assert(before.problems.length == 0, string.join(before.problems, "\n"));
+    int beforeCount = map.keys(before.seen).length;
+    test.assert(beforeCount >= 200,
+        "only " + string.from(beforeCount) + " numbered nodes; the fixture is not "
+        + "exercising much");
+
+    int inherited = 0;
+    forEach(prog.statements, s) {
+        ast.TypeDeclStatement? td = s as ast.TypeDeclStatement;
+        if (td != null) {
+            inherited = inherited + td.inherited.length;
+        }
+    }
+    test.assert(inherited > 0, "no inherited methods: ast.cloneMethod never ran");
+
+    // The await normalizer adds more nodes to the same tree.
+    module.Module mod = { prog: prog, info: res.info, qual: "", path: "" };
+    Map<String, module.Module> homes = { "": mod };
+    normalize.normalizeAsync(mod, homes);
+
+    astwalk.Walk after = astwalk.newWalk();
+    astwalk.walkProgram(after, prog);
+    test.assert(after.problems.length == 0, string.join(after.problems, "\n"));
+    int afterCount = map.keys(after.seen).length;
+    test.assert(afterCount > beforeCount,
+        "the normalizer added no nodes (" + string.from(beforeCount) + " -> "
+        + string.from(afterCount) + ")");
+});

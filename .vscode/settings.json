@@ -1,0 +1,10 @@
+{
+  // Serve this workspace with the compiler built *in* it, rather than whichever
+  // `nio` happens to be installed. Working on the compiler is the one case where
+  // PATH is the wrong answer: the build in the tree is the one whose diagnostics
+  // are worth looking at, and `nio build src/nio.nio -o nio` puts it right here.
+  //
+  // The server is the running binary until it is replaced, so after rebuilding:
+  // Cmd+Shift+P -> "Nio: Restart Language Server".
+  "nio.server.path": "${workspaceFolder}/nio"
+}

@@ -1,0 +1,2212 @@
+// The `x509` module (§6.19): certificate parsing and the trust decision.
+// This file does parsing and policy. The signature check is a call into
+// `crypto`.
+//
+// This file parses bytes that an attacker can choose. Three rules apply.
+//
+// No code indexes a received array directly. Every byte goes through `Der`,
+// which raises BAD_CERTIFICATE where an index gives a runtime error (§5.5).
+// tests/x509_test.nio feeds back every prefix of every certificate it holds.
+//
+// This file enforces the DER encoding rules and refuses BER: definite minimal
+// lengths, no trailing bytes after a structure, integers without redundant
+// leading bytes, booleans 0x00 or 0xFF only. A signature covers bytes, so two
+// encodings of one certificate give a forgery primitive.
+//
+// Everything unrecognized fails closed. A critical extension that this module
+// does not implement makes the certificate unusable (RFC 5280 §4.2). An
+// algorithm that it cannot check is refused. SHA-1 signatures are refused.
+//
+// Revocation (CRL, OCSP) is not implemented. See https://nio-lang.org/docs.
+import 'crypto';
+import 'string';
+import 'array';
+import 'time';
+import 'fs';
+
+// The codes start at 300, so the http (100), tls (200) and x509 sets coexist.
+export enum ErrorCode {
+    BAD_CERTIFICATE: 300,
+    UNSUPPORTED_ALGORITHM: 301,
+    EXPIRED: 302,
+    NOT_YET_VALID: 303,
+    UNTRUSTED_ROOT: 304,
+    HOSTNAME_MISMATCH: 305,
+    CONSTRAINT_VIOLATION: 306,
+    BAD_SIGNATURE: 307
+}
+
+// ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
+//
+// Each bound covers something an attacker controls the size of. An unbounded
+// list, depth or search in hostile input is a denial of service.
+
+// No real certificate is larger than this.
+int const MAX_CERTIFICATE = 65536;
+
+// The maximum chain length, leaf included. RFC 5280 sets no limit.
+int const MAX_CHAIN_DEPTH = 10;
+
+// The maximum number of candidates the chain search examines. Without it, a
+// peer can send a pool of cross-signed certificates that makes the search
+// exponential.
+int const MAX_CHAIN_WORK = 100;
+
+int const MAX_NAME_ENTRIES = 64;
+int const MAX_SAN_ENTRIES = 256;
+int const MAX_EXTENSIONS = 64;
+
+// The deepest nesting the DER reader follows. It stops a structure built to
+// exhaust the stack.
+int const MAX_DER_DEPTH = 32;
+
+// ---------------------------------------------------------------------------
+// Object identifiers
+// ---------------------------------------------------------------------------
+//
+// OIDs are dotted decimal, so a diagnostic shows an unrecognized OID in the
+// standard form.
+
+String const OID_RSA_ENCRYPTION = "1.2.840.113549.1.1.1";
+String const OID_RSASSA_PSS = "1.2.840.113549.1.1.10";
+String const OID_SHA256_RSA = "1.2.840.113549.1.1.11";
+String const OID_SHA384_RSA = "1.2.840.113549.1.1.12";
+String const OID_SHA512_RSA = "1.2.840.113549.1.1.13";
+String const OID_SHA1_RSA = "1.2.840.113549.1.1.5";
+String const OID_MD5_RSA = "1.2.840.113549.1.1.4";
+String const OID_EC_PUBLIC_KEY = "1.2.840.10045.2.1";
+String const OID_ECDSA_SHA256 = "1.2.840.10045.4.3.2";
+String const OID_ECDSA_SHA384 = "1.2.840.10045.4.3.3";
+String const OID_ED25519 = "1.3.101.112";
+String const OID_CURVE_P256 = "1.2.840.10045.3.1.7";    // secp256r1 (RFC 5480)
+String const OID_CURVE_P384 = "1.3.132.0.34";           // secp384r1
+
+String const OID_SHA256 = "2.16.840.1.101.3.4.2.1";
+String const OID_SHA384 = "2.16.840.1.101.3.4.2.2";
+
+String const OID_EXT_KEY_USAGE = "2.5.29.15";
+String const OID_EXT_SAN = "2.5.29.17";
+String const OID_EXT_BASIC_CONSTRAINTS = "2.5.29.19";
+String const OID_EXT_NAME_CONSTRAINTS = "2.5.29.30";
+String const OID_EXT_EXT_KEY_USAGE = "2.5.29.37";
+
+String const OID_EKU_SERVER_AUTH = "1.3.6.1.5.5.7.3.1";
+String const OID_EKU_CLIENT_AUTH = "1.3.6.1.5.5.7.3.2";
+String const OID_EKU_ANY = "2.5.29.37.0";
+
+// The attribute types a distinguished name is rendered with. Anything else
+// appears by its OID.
+String attrShortName(String oid) {
+    if (oid == "2.5.4.3") { return "CN"; }
+    if (oid == "2.5.4.6") { return "C"; }
+    if (oid == "2.5.4.7") { return "L"; }
+    if (oid == "2.5.4.8") { return "ST"; }
+    if (oid == "2.5.4.10") { return "O"; }
+    if (oid == "2.5.4.11") { return "OU"; }
+    if (oid == "2.5.4.5") { return "serialNumber"; }
+    if (oid == "0.9.2342.19200300.100.1.25") { return "DC"; }
+    if (oid == "1.2.840.113549.1.9.1") { return "emailAddress"; }
+    return oid;
+}
+
+// keyUsage bits (RFC 5280 §4.2.1.3), numbered from the most significant bit
+// of the first byte, which is how a DER BIT STRING counts.
+int const KU_DIGITAL_SIGNATURE = 0;
+int const KU_KEY_ENCIPHERMENT = 2;
+int const KU_KEY_CERT_SIGN = 5;
+int const KU_CRL_SIGN = 6;
+
+// ---------------------------------------------------------------------------
+// The DER reader
+// ---------------------------------------------------------------------------
+
+int const TAG_BOOLEAN = 1;
+int const TAG_INTEGER = 2;
+int const TAG_BIT_STRING = 3;
+int const TAG_OCTET_STRING = 4;
+int const TAG_NULL = 5;
+int const TAG_OID = 6;
+int const TAG_UTF8_STRING = 12;
+int const TAG_SEQUENCE = 48;    // 0x30, constructed
+int const TAG_SET = 49;         // 0x31, constructed
+int const TAG_PRINTABLE_STRING = 19;
+int const TAG_T61_STRING = 20;
+int const TAG_IA5_STRING = 22;
+int const TAG_BMP_STRING = 30;
+int const TAG_UTC_TIME = 23;
+int const TAG_GENERALIZED_TIME = 24;
+
+// One tag-length-value header, as positions in the buffer it came from.
+// `start` and `end` give the structure's own encoding, which a signature
+// covers, with no re-encoding.
+export type Tlv {
+    int tag;
+    int start;
+    int contentStart;
+    int end;
+}
+
+// A bounds-checked cursor over DER. Every accessor raises BAD_CERTIFICATE when
+// it reads past the end. All received bytes are read through this type.
+export type Der {
+    byte[] data;
+    int pos;
+    int end;
+    int depth;
+
+    int left() {
+        return self.end - self.pos;
+    }
+
+    bool done() {
+        return self.pos >= self.end;
+    }
+
+    int at(int i) {
+        if (i < 0 || i >= self.end) {
+            return Error(`truncated DER: no byte at ${i}`,
+                ErrorCode.BAD_CERTIFICATE);
+        }
+        return self.data[i];
+    }
+
+    byte[] bytes(int from, int to) {
+        if (from < 0 || to < from || to > self.end) {
+            return Error(`truncated DER: no bytes ${from}..${to}`, ErrorCode.BAD_CERTIFICATE);
+        }
+        return array.slice(self.data, from, to);
+    }
+
+    // Reads one header. DER has no indefinite length, and a length uses the
+    // fewest bytes that hold it. This function checks both rules.
+    Tlv readTlv() {
+        int start = self.pos;
+        int tag = self.at(self.pos);
+        self.pos = self.pos + 1;
+        // The high-tag-number form (low five bits all set) starts a multi-byte
+        // tag. No certificate uses one.
+        if ((tag % 32) == 31) {
+            return Error("multi-byte DER tags are not supported",
+                ErrorCode.BAD_CERTIFICATE);
+        }
+        int first = self.at(self.pos);
+        self.pos = self.pos + 1;
+        int length = 0;
+        if (first < 128) {
+            length = first;
+        } else {
+            int count = first - 128;
+            if (count == 0) {
+                return Error("indefinite DER length (BER, not DER)",
+                    ErrorCode.BAD_CERTIFICATE);
+            }
+            if (count > 4) {
+                return Error("DER length over four bytes", ErrorCode.BAD_CERTIFICATE);
+            }
+            int firstByte = self.at(self.pos);
+            if (firstByte == 0) {
+                return Error("non-minimal DER length: leading zero byte",
+                    ErrorCode.BAD_CERTIFICATE);
+            }
+            int i = 0;
+            while (i < count) {
+                length = length * 256 + self.at(self.pos + i);
+                i = i + 1;
+            }
+            self.pos = self.pos + count;
+            if (length < 128) {
+                return Error(`non-minimal DER length: ${length} written long-form`,
+                    ErrorCode.BAD_CERTIFICATE);
+            }
+        }
+        int contentStart = self.pos;
+        int stop = contentStart + length;
+        if (length < 0 || stop > self.end) {
+            return Error(`DER length ${length} runs past the end`,
+                ErrorCode.BAD_CERTIFICATE);
+        }
+        self.pos = stop;
+        return { tag: tag, start: start, contentStart: contentStart, end: stop };
+    }
+
+    // Reads one header and requires the given tag. A wrong tag raises an
+    // error, so a field is never read as a different type.
+    Tlv expect(int tag) {
+        Tlv t = self.readTlv();
+        if (t.tag != tag) {
+            return Error(`expected DER tag ${tag}, found ${t.tag}`, ErrorCode.BAD_CERTIFICATE);
+        }
+        return t;
+    }
+
+    bool peekIs(int tag) {
+        if (self.done()) {
+            return false;
+        }
+        return self.data[self.pos] == tag;
+    }
+
+    // A cursor over a header's content, one level deeper. The depth limit stops
+    // deep nesting from exhausting the stack.
+    Der inner(Tlv t) {
+        if (self.depth + 1 > MAX_DER_DEPTH) {
+            return Error(`DER nested deeper than ${MAX_DER_DEPTH}`,
+                ErrorCode.BAD_CERTIFICATE);
+        }
+        return { data: self.data, pos: t.contentStart, end: t.end, depth: self.depth + 1 };
+    }
+
+    byte[] content(Tlv t) {
+        return self.bytes(t.contentStart, t.end);
+    }
+
+    byte[] raw(Tlv t) {
+        return self.bytes(t.start, t.end);
+    }
+
+    // Every structure ends with this check. DER has no trailing padding, so
+    // unread bytes inside a SEQUENCE make the encoding invalid.
+    void atEnd(String what) {
+        if (!self.done()) {
+            return Error(what + ": " + string.from(self.left())
+                + " unread trailing bytes", ErrorCode.BAD_CERTIFICATE);
+        }
+    }
+}
+
+export Der der(byte[] data) {
+    return { data: data, pos: 0, end: data.length, depth: 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Primitive values
+// ---------------------------------------------------------------------------
+
+// An unsigned INTEGER's magnitude under DER's rules: at least one byte, not
+// negative, no redundant leading zero. An extra leading zero on a modulus gives
+// a second encoding of one key.
+byte[] readUnsigned(Der d, String what) {
+    Tlv t = d.expect(TAG_INTEGER);
+    byte[] v = d.content(t);
+    if (v.length == 0) {
+        return Error(what + ": empty INTEGER", ErrorCode.BAD_CERTIFICATE);
+    }
+    if (v[0] >= 128) {
+        return Error(what + ": negative INTEGER", ErrorCode.BAD_CERTIFICATE);
+    }
+    if (v.length > 1 && v[0] == 0 && v[1] < 128) {
+        return Error(what + ": non-minimal INTEGER encoding", ErrorCode.BAD_CERTIFICATE);
+    }
+    if (v.length > 1 && v[0] == 0) {
+        return array.slice(v, 1, v.length);
+    }
+    return v;
+}
+
+// The same value as an int, for the fields that are counts: version and
+// pathLenConstraint.
+int readSmallInt(Der d, String what) {
+    byte[] v = readUnsigned(d, what);
+    if (v.length > 4) {
+        return Error(what + ": integer too large", ErrorCode.BAD_CERTIFICATE);
+    }
+    int n = 0;
+    forEach(v, b) {
+        n = n * 256 + b;
+    }
+    return n;
+}
+
+// A BOOLEAN. DER has one encoding each for true and false. If any nonzero byte
+// were true, `cA` (the field that lets a certificate sign others) would have
+// two encodings.
+bool readBoolean(Der d, String what) {
+    Tlv t = d.expect(TAG_BOOLEAN);
+    byte[] v = d.content(t);
+    if (v.length != 1) {
+        return Error(what + ": BOOLEAN is not one byte", ErrorCode.BAD_CERTIFICATE);
+    }
+    if (v[0] == 0) {
+        return false;
+    }
+    if (v[0] == 255) {
+        return true;
+    }
+    return Error(what + ": BOOLEAN is neither 0x00 nor 0xFF (BER, not DER)",
+        ErrorCode.BAD_CERTIFICATE);
+}
+
+// An OBJECT IDENTIFIER as dotted decimal. The first byte packs the first two
+// arcs; the rest are base-128 with the high bit as a continuation flag.
+String readOid(Der d, String what) {
+    Tlv t = d.expect(TAG_OID);
+    byte[] v = d.content(t);
+    if (v.length == 0) {
+        return Error(what + ": empty OID", ErrorCode.BAD_CERTIFICATE);
+    }
+    if (v[v.length - 1] >= 128) {
+        return Error(what + ": OID ends mid-arc", ErrorCode.BAD_CERTIFICATE);
+    }
+    String out = "";
+    int acc = 0;
+    bool startOfArc = true;
+    bool first = true;
+    int i = 0;
+    while (i < v.length) {
+        int b = v[i];
+        // A leading 0x80 is a padded arc, a second encoding of one OID.
+        if (startOfArc && b == 128) {
+            return Error(what + ": non-minimal OID arc", ErrorCode.BAD_CERTIFICATE);
+        }
+        startOfArc = false;
+        // This limit prevents overflow of the accumulator.
+        if (acc > 72057594037927936) {
+            return Error(what + ": OID arc too large", ErrorCode.BAD_CERTIFICATE);
+        }
+        acc = acc * 128 + (b % 128);
+        if (b < 128) {
+            if (first) {
+                int a1 = acc / 40;
+                if (a1 > 2) {
+                    a1 = 2;
+                }
+                out = `${a1}.${acc - a1 * 40}`;
+                first = false;
+            } else {
+                out = out + "." + string.from(acc);
+            }
+            acc = 0;
+            startOfArc = true;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// A BIT STRING's payload, plus the count of unused bits in its last byte.
+type Bits {
+    byte[] data;
+    int unused;
+}
+
+Bits readBitString(Der d, String what) {
+    Tlv t = d.expect(TAG_BIT_STRING);
+    byte[] v = d.content(t);
+    if (v.length == 0) {
+        return Error(what + ": empty BIT STRING", ErrorCode.BAD_CERTIFICATE);
+    }
+    int unused = v[0];
+    if (unused > 7) {
+        return Error(what + ": BIT STRING claims " + string.from(unused)
+            + " unused bits", ErrorCode.BAD_CERTIFICATE);
+    }
+    if (v.length == 1 && unused != 0) {
+        return Error(what + ": empty BIT STRING with unused bits",
+            ErrorCode.BAD_CERTIFICATE);
+    }
+    // DER requires the unused bits to be zero. keyUsage is a BIT STRING, and
+    // set padding bits would give it two readings.
+    if (unused > 0) {
+        int last = v[v.length - 1];
+        if (last % pow2(unused) != 0) {
+            return Error(what + ": BIT STRING has non-zero unused bits",
+                ErrorCode.BAD_CERTIFICATE);
+        }
+    }
+    return { data: array.slice(v, 1, v.length), unused: unused };
+}
+
+// Returns true when every byte is in the PrintableString alphabet. A string
+// with other bytes makes the certificate malformed.
+bool validPrintable(byte[] v) {
+    forEach(v, c) {
+        bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57);
+        // The rest of PrintableString's alphabet: space ' ( ) + , - . / : = ?
+        if (!ok && c != 32 && c != 39 && c != 40 && c != 41 && c != 43 && c != 44
+            && c != 45 && c != 46 && c != 47 && c != 58 && c != 61 && c != 63) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool validIA5(byte[] v) {
+    forEach(v, c) {
+        if (c > 127) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// UTF-8 as the standard defines it. An overlong encoding, a surrogate or a
+// value above U+10FFFF is refused, because each gives a second encoding.
+bool validUtf8(byte[] v) {
+    int i = 0;
+    while (i < v.length) {
+        int c = v[i];
+        int extra = 0;
+        int least = 0;
+        int cp = 0;
+        if (c < 128) {
+            i = i + 1;
+            continue;
+        } else if (c >= 194 && c <= 223) {
+            extra = 1;
+            least = 128;
+            cp = c - 192;
+        } else if (c >= 224 && c <= 239) {
+            extra = 2;
+            least = 2048;
+            cp = c - 224;
+        } else if (c >= 240 && c <= 244) {
+            extra = 3;
+            least = 65536;
+            cp = c - 240;
+        } else {
+            return false;    // a continuation byte, or 0xC0/0xC1/0xF5+
+        }
+        if (i + extra >= v.length) {
+            return false;
+        }
+        int j = 1;
+        while (j <= extra) {
+            int cc = v[i + j];
+            if (cc < 128 || cc > 191) {
+                return false;
+            }
+            cp = cp * 64 + (cc - 128);
+            j = j + 1;
+        }
+        if (cp < least || cp > 1114111 || (cp >= 55296 && cp <= 57343)) {
+            return false;
+        }
+        i = i + extra + 1;
+    }
+    return true;
+}
+
+// Reads a text field. The bytes must be valid for their string type, and are
+// then used as they are. This module compares names by their DER encoding, so
+// it does no Unicode normalization.
+String readText(Der d, String what) {
+    Tlv t = d.readTlv();
+    if (t.tag != TAG_UTF8_STRING && t.tag != TAG_PRINTABLE_STRING
+        && t.tag != TAG_IA5_STRING && t.tag != TAG_T61_STRING
+        && t.tag != TAG_BMP_STRING) {
+        return Error(what + ": DER tag " + string.from(t.tag) + " is not a string",
+            ErrorCode.BAD_CERTIFICATE);
+    }
+    byte[] v = d.content(t);
+    if (t.tag == TAG_PRINTABLE_STRING && !validPrintable(v)) {
+        return Error(what + ": PrintableString holds bytes it may not",
+            ErrorCode.BAD_CERTIFICATE);
+    }
+    if (t.tag == TAG_IA5_STRING && !validIA5(v)) {
+        return Error(what + ": IA5String holds a byte above 127",
+            ErrorCode.BAD_CERTIFICATE);
+    }
+    if (t.tag == TAG_UTF8_STRING && !validUtf8(v)) {
+        return Error(what + ": UTF8String is not valid UTF-8", ErrorCode.BAD_CERTIFICATE);
+    }
+    if (t.tag == TAG_BMP_STRING && v.length % 2 != 0) {
+        return Error(what + ": BMPString has an odd length", ErrorCode.BAD_CERTIFICATE);
+    }
+    if (t.tag == TAG_BMP_STRING) {
+        // UCS-2, big-endian. Only the ASCII subset is shown, for a diagnostic.
+        String out = "";
+        int i = 0;
+        while (i + 1 < v.length) {
+            int cp = v[i] * 256 + v[i + 1];
+            if (cp >= 32 && cp < 127) {
+                out = out + string.fromByteArray([cp as byte]);
+            } else {
+                out = out + "?";
+            }
+            i = i + 2;
+        }
+        return out;
+    }
+    return string.fromByteArray(v);
+}
+
+// ---------------------------------------------------------------------------
+// Time
+// ---------------------------------------------------------------------------
+//
+// UTCTime and GeneralizedTime, only in the form RFC 5280 §4.1.2.5 allows: it
+// ends in a literal Z. Local times and fractional seconds are valid ASN.1, but
+// this module refuses them.
+//
+// The result is a fixed epoch plus an offset. `time.date.fromText` makes
+// malformed input a runtime error (§6.4), so received text never goes to it.
+
+DateTime const EPOCH = time.date.fromText("1970-01-01");
+Duration const ONE_SECOND = time.duration("1s");
+
+int digitsAt(byte[] v, int off, int n, String what) {
+    int out = 0;
+    int i = 0;
+    while (i < n) {
+        int idx = off + i;
+        if (idx >= v.length) {
+            return Error(what + ": time is truncated", ErrorCode.BAD_CERTIFICATE);
+        }
+        int c = v[idx];
+        if (c < 48 || c > 57) {
+            return Error(what + ": time has a non-digit", ErrorCode.BAD_CERTIFICATE);
+        }
+        out = out * 10 + (c - 48);
+        i = i + 1;
+    }
+    return out;
+}
+
+// Days from 1970-01-01 to y-m-d, proleptic Gregorian. This is Howard Hinnant's
+// days_from_civil, which shifts the year to start in March.
+int daysFromCivil(int y, int m, int d) {
+    int yy = y;
+    if (m <= 2) {
+        yy = yy - 1;
+    }
+    int era = yy / 400;
+    if (yy < 0) {
+        era = (yy - 399) / 400;
+    }
+    int yoe = yy - era * 400;
+    int mp = m + 9;
+    if (m > 2) {
+        mp = m - 3;
+    }
+    int doy = (153 * mp + 2) / 5 + d - 1;
+    int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+int daysInMonth(int y, int m) {
+    if (m == 1 || m == 3 || m == 5 || m == 7 || m == 8 || m == 10 || m == 12) {
+        return 31;
+    }
+    if (m == 4 || m == 6 || m == 9 || m == 11) {
+        return 30;
+    }
+    if (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) {
+        return 29;
+    }
+    return 28;
+}
+
+DateTime readTime(Der d, String what) {
+    Tlv t = d.readTlv();
+    if (t.tag != TAG_UTC_TIME && t.tag != TAG_GENERALIZED_TIME) {
+        return Error(what + ": DER tag " + string.from(t.tag) + " is not a time",
+            ErrorCode.BAD_CERTIFICATE);
+    }
+    byte[] v = d.content(t);
+    int year = 0;
+    int off = 0;
+    if (t.tag == TAG_UTC_TIME) {
+        if (v.length != 13) {
+            return Error(what + ": UTCTime is not YYMMDDHHMMSSZ",
+                ErrorCode.BAD_CERTIFICATE);
+        }
+        int yy = digitsAt(v, 0, 2, what);
+        // RFC 5280 §4.1.2.5.1: 50 and above is 19xx, below is 20xx.
+        year = 2000 + yy;
+        if (yy >= 50) {
+            year = 1900 + yy;
+        }
+        off = 2;
+    } else {
+        if (v.length != 15) {
+            return Error(what + ": GeneralizedTime is not YYYYMMDDHHMMSSZ",
+                ErrorCode.BAD_CERTIFICATE);
+        }
+        year = digitsAt(v, 0, 4, what);
+        off = 4;
+    }
+    if (v[v.length - 1] != 90) {    // 'Z'
+        return Error(what + ": time is not UTC (no trailing Z)",
+            ErrorCode.BAD_CERTIFICATE);
+    }
+    int month = digitsAt(v, off, 2, what);
+    int day = digitsAt(v, off + 2, 2, what);
+    int hour = digitsAt(v, off + 4, 2, what);
+    int minute = digitsAt(v, off + 6, 2, what);
+    int second = digitsAt(v, off + 8, 2, what);
+    if (year < 1 || month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month)) {
+        return Error(what + ": time is not a date", ErrorCode.BAD_CERTIFICATE);
+    }
+    // A leap second (:60) is legal in GeneralizedTime and folds onto :59.
+    if (hour > 23 || minute > 59 || second > 60) {
+        return Error(what + ": time is not a time", ErrorCode.BAD_CERTIFICATE);
+    }
+    if (second > 59) {
+        second = 59;
+    }
+    int secs = hour * 3600 + minute * 60 + second;
+    return time.date.addDays(EPOCH, daysFromCivil(year, month, day)) + ONE_SECOND * secs;
+}
+
+// ---------------------------------------------------------------------------
+// The certificate
+// ---------------------------------------------------------------------------
+
+// One extension, kept whole, so a caller can read an extension that this
+// module does not interpret. Verification refuses a critical extension that
+// this module does not interpret, and names its OID.
+export type Extension {
+    String oid;
+    bool critical;
+    byte[] value;
+}
+
+// The general-name forms that this module reads, by context tag number. It
+// reads these three forms from a subjectAltName and compares only these forms
+// against a name constraint.
+export int const GN_EMAIL = 1;
+export int const GN_DNS = 2;
+export int const GN_IP = 7;
+
+// One entry of a permittedSubtrees or excludedSubtrees list (RFC 5280
+// §4.2.1.10). A subtree names one form and constrains only that form: a
+// certificate carrying no name of a form is not constrained by it.
+export type Subtree {
+    int kind;        // GN_DNS, GN_EMAIL or GN_IP
+    String name;     // a dNSName or rfc822Name subtree, as text
+    byte[] range;    // an iPAddress subtree: the address, then its mask
+}
+
+// A parsed certificate. The `raw*` fields are slices of the received bytes
+// with no re-encoding, because a signature covers bytes.
+export type Certificate {
+    byte[] raw;
+    byte[] rawTbs;
+    byte[] rawIssuer;
+    byte[] rawSubject;
+    byte[] rawSpki;
+
+    int version;
+    String serialNumber;
+    String issuer;
+    String subject;
+    DateTime notBefore;
+    DateTime notAfter;
+
+    String signatureAlgorithm;
+    byte[] signature;
+
+    String publicKeyAlgorithm;
+    byte[] rsaModulus;
+    int rsaExponent;
+
+    // For an id-ecPublicKey key: the curve as a short name ("p256", "p384"), or
+    // its own OID when this module does not implement it, and the SEC 1
+    // uncompressed point. Both are empty when the key is not EC.
+    String ecCurve;
+    byte[] ecPoint;
+
+    bool basicConstraintsPresent;
+    bool isCA;
+    int maxPathLen;    // -1 when the certificate sets none
+
+    bool keyUsagePresent;
+    int keyUsage;    // a bit set, indexed by the KU_ constants
+
+    bool extKeyUsagePresent;
+    String[] extKeyUsage;
+
+    String[] dnsNames;
+    String[] ipAddresses;
+    String[] emailAddresses;
+
+    // The iPAddress entries as received. A name constraint compares these
+    // bytes under a mask.
+    byte[][] rawIpAddresses;
+
+    // Name constraints (RFC 5280 §4.2.1.10) restrict the names of the
+    // certificates below this one in a chain. Each list is empty when the
+    // extension names no subtree of a form that this module compares.
+    // `unsupportedConstraints` holds the other subtrees. A certificate with
+    // one of those cannot issue certificates, because its constraint cannot
+    // be shown to hold.
+    bool nameConstraintsPresent;
+    Subtree[] permittedSubtrees;
+    Subtree[] excludedSubtrees;
+    String[] unsupportedConstraints;
+
+    Extension[] extensions;
+    String[] unhandledCritical;
+
+    bool hasKeyUsage(int bit) {
+        return (self.keyUsage / pow2(bit)) % 2 == 1;
+    }
+
+    // RFC 5280 §4.2.1.3: an absent keyUsage leaves the key unrestricted, and a
+    // present one is the complete list of permitted uses. `tls.checkPeer`
+    // calls this when it checks the signature.
+    bool mayDigitallySign() {
+        if (!self.keyUsagePresent) { return true; }
+        return self.hasKeyUsage(KU_DIGITAL_SIGNATURE);
+    }
+
+    // True when subject and issuer have the same DER encoding. Path-length
+    // counting skips these certificates.
+    bool isSelfIssued() {
+        return sameBytes(self.rawSubject, self.rawIssuer);
+    }
+}
+
+int pow2(int n) {
+    int v = 1;
+    int i = 0;
+    while (i < n) {
+        v = v * 2;
+        i = i + 1;
+    }
+    return v;
+}
+
+// Byte equality for names and key identifiers. These are public values, so an
+// early exit leaks nothing. Secrets use `string.bytesEqualConstantTime`.
+bool sameBytes(byte[] a, byte[] b) {
+    if (a.length != b.length) {
+        return false;
+    }
+    return string.fromByteArray(a) == string.fromByteArray(b);
+}
+
+// Renders a Name for display only. Comparisons use the raw DER.
+String readName(Der outer, Tlv nameTlv, String what) {
+    Der rdns = outer.inner(nameTlv);
+    String[] parts = [];
+    int count = 0;
+    while (!rdns.done()) {
+        count = count + 1;
+        if (count > MAX_NAME_ENTRIES) {
+            return Error(what + ": over " + string.from(MAX_NAME_ENTRIES) + " name entries",
+                ErrorCode.BAD_CERTIFICATE);
+        }
+        Tlv setTlv = rdns.expect(TAG_SET);
+        Der set = rdns.inner(setTlv);
+        while (!set.done()) {
+            Tlv atvTlv = set.expect(TAG_SEQUENCE);
+            Der atv = set.inner(atvTlv);
+            String oid = readOid(atv, what);
+            String value = readText(atv, what);
+            atv.atEnd(what + " attribute");
+            array.push(parts, attrShortName(oid) + "=" + value);
+        }
+    }
+    return string.join(parts, ",");
+}
+
+// Parses one DER certificate. Every Certificate comes from this function, so
+// the encoding checks always run. It raises BAD_CERTIFICATE (or
+// CONSTRAINT_VIOLATION) for malformed input.
+export Certificate parseCertificate(byte[] data) {
+    if (data.length == 0) {
+        return Error("empty certificate", ErrorCode.BAD_CERTIFICATE);
+    }
+    if (data.length > MAX_CERTIFICATE) {
+        return Error(`certificate is ${data.length} bytes, over the ${MAX_CERTIFICATE}-byte limit`,
+            ErrorCode.BAD_CERTIFICATE);
+    }
+    Der top = der(data);
+    Tlv certTlv = top.expect(TAG_SEQUENCE);
+    top.atEnd("certificate");
+    Der cert = top.inner(certTlv);
+
+    Tlv tbsTlv = cert.expect(TAG_SEQUENCE);
+    byte[] rawTbs = cert.raw(tbsTlv);
+    Der tbs = cert.inner(tbsTlv);
+
+    // RFC 5280 §4.1.1.2 requires the outer AlgorithmIdentifier to equal the one
+    // inside the TBS. The check is at the end of this function.
+    String tbsSigAlg = "";
+    byte[] tbsSigParams = [];
+
+    // version [0] EXPLICIT, defaulting to v1.
+    int version = 1;
+    if (tbs.peekIs(160)) {    // 0xA0
+        Tlv vTlv = tbs.expect(160);
+        Der v = tbs.inner(vTlv);
+        version = readSmallInt(v, "version") + 1;
+        v.atEnd("version");
+        if (version < 2 || version > 3) {
+            return Error(`certificate version ${version} is not 2 or 3`,
+                ErrorCode.BAD_CERTIFICATE);
+        }
+        // DER omits a field equal to its default.
+        if (version == 1) {
+            return Error("certificate encodes the default version explicitly",
+                ErrorCode.BAD_CERTIFICATE);
+        }
+    }
+
+    byte[] serial = readUnsigned(tbs, "serialNumber");
+
+    Tlv algTlv = tbs.expect(TAG_SEQUENCE);
+    Der alg = tbs.inner(algTlv);
+    tbsSigAlg = readOid(alg, "signature algorithm");
+    tbsSigParams = alg.bytes(alg.pos, alg.end);
+
+    Tlv issuerTlv = tbs.expect(TAG_SEQUENCE);
+    byte[] rawIssuer = tbs.raw(issuerTlv);
+    String issuer = readName(tbs, issuerTlv, "issuer");
+
+    Tlv validTlv = tbs.expect(TAG_SEQUENCE);
+    Der valid = tbs.inner(validTlv);
+    DateTime notBefore = readTime(valid, "notBefore");
+    DateTime notAfter = readTime(valid, "notAfter");
+    valid.atEnd("validity");
+
+    Tlv subjectTlv = tbs.expect(TAG_SEQUENCE);
+    byte[] rawSubject = tbs.raw(subjectTlv);
+    String subject = readName(tbs, subjectTlv, "subject");
+
+    Tlv spkiTlv = tbs.expect(TAG_SEQUENCE);
+    byte[] rawSpki = tbs.raw(spkiTlv);
+    Der spki = tbs.inner(spkiTlv);
+    Tlv keyAlgTlv = spki.expect(TAG_SEQUENCE);
+    Der keyAlg = spki.inner(keyAlgTlv);
+    String keyOid = readOid(keyAlg, "public key algorithm");
+    Bits keyBits = readBitString(spki, "subjectPublicKey");
+    spki.atEnd("subjectPublicKeyInfo");
+    if (keyBits.unused != 0) {
+        return Error("subjectPublicKey has unused bits", ErrorCode.BAD_CERTIFICATE);
+    }
+
+    byte[] rsaModulus = [];
+    int rsaExponent = 0;
+    String ecCurve = "";
+    byte[] ecPoint = [];
+    if (keyOid == OID_RSA_ENCRYPTION) {
+        // RFC 3279 §2.3.1: rsaEncryption's parameters field is present and
+        // NULL. Any other form is a second encoding of one key.
+        Tlv nullTlv = keyAlg.expect(TAG_NULL);
+        if (nullTlv.end != nullTlv.contentStart) {
+            return Error("rsaEncryption NULL parameters are not empty",
+                ErrorCode.BAD_CERTIFICATE);
+        }
+        keyAlg.atEnd("rsaEncryption parameters");
+        Der key = der(keyBits.data);
+        Tlv rsaTlv = key.expect(TAG_SEQUENCE);
+        key.atEnd("RSAPublicKey");
+        Der rsa = key.inner(rsaTlv);
+        rsaModulus = readUnsigned(rsa, "RSA modulus");
+        rsaExponent = readSmallInt(rsa, "RSA exponent");
+        rsa.atEnd("RSAPublicKey");
+    } else if (keyOid == OID_EC_PUBLIC_KEY) {
+        // RFC 5480 §2.1.1: the ECParameters CHOICE must be a namedCurve OID.
+        // Explicit parameters would make this module trust a curve that the
+        // certificate chose.
+        String curveOid = readOid(keyAlg, "EC curve");
+        keyAlg.atEnd("ecPublicKey parameters");
+        ecCurve = curveOid;
+        int pointLength = 0;
+        if (curveOid == OID_CURVE_P256) {
+            ecCurve = "p256";
+            pointLength = 65;
+        } else if (curveOid == OID_CURVE_P384) {
+            ecCurve = "p384";
+            pointLength = 97;
+        }
+        // The point is SEC 1 uncompressed (0x04 || X || Y). A compressed point
+        // is refused. A key on a curve that this module does not implement
+        // parses, but every verification with it fails.
+        if (pointLength > 0) {
+            if (keyBits.data.length != pointLength || keyBits.data[0] != 4) {
+                return Error("EC public key is not an uncompressed SEC 1 point",
+                    ErrorCode.BAD_CERTIFICATE);
+            }
+            ecPoint = keyBits.data;
+        }
+    }
+
+    // The two optional unique identifiers, [1] and [2]. This module does not
+    // use them, but skips them to read the extensions that follow.
+    if (tbs.peekIs(129)) {    // 0x81
+        tbs.readTlv();
+    }
+    if (tbs.peekIs(130)) {    // 0x82
+        tbs.readTlv();
+    }
+
+    Extension[] extensions = [];
+    String[] unhandledCritical = [];
+    bool bcPresent = false;
+    bool isCA = false;
+    int maxPathLen = -1;
+    bool kuPresent = false;
+    int keyUsage = 0;
+    bool ekuPresent = false;
+    String[] extKeyUsage = [];
+    String[] dnsNames = [];
+    String[] ipAddresses = [];
+    String[] emailAddresses = [];
+    byte[][] rawIpAddresses = [];
+    bool ncPresent = false;
+    Subtree[] permitted = [];
+    Subtree[] excluded = [];
+    String[] unsupportedConstraints = [];
+
+    if (tbs.peekIs(163)) {    // 0xA3, extensions [3] EXPLICIT
+        if (version != 3) {
+            return Error(`extensions in a version ${version} certificate`,
+                ErrorCode.BAD_CERTIFICATE);
+        }
+        Tlv extsOuter = tbs.expect(163);
+        Der extsWrap = tbs.inner(extsOuter);
+        Tlv extsTlv = extsWrap.expect(TAG_SEQUENCE);
+        extsWrap.atEnd("extensions");
+        Der exts = extsWrap.inner(extsTlv);
+        int seen = 0;
+        while (!exts.done()) {
+            seen = seen + 1;
+            if (seen > MAX_EXTENSIONS) {
+                return Error(`over ${MAX_EXTENSIONS} extensions`,
+                    ErrorCode.BAD_CERTIFICATE);
+            }
+            Tlv oneTlv = exts.expect(TAG_SEQUENCE);
+            Der one = exts.inner(oneTlv);
+            String oid = readOid(one, "extension");
+            bool critical = false;
+            if (one.peekIs(TAG_BOOLEAN)) {
+                critical = readBoolean(one, "extension " + oid);
+                // DER omits a FALSE that equals the default.
+                if (!critical) {
+                    return Error("extension " + oid + " encodes critical=FALSE explicitly",
+                        ErrorCode.BAD_CERTIFICATE);
+                }
+            }
+            Tlv valTlv = one.expect(TAG_OCTET_STRING);
+            byte[] value = one.content(valTlv);
+            one.atEnd("extension " + oid);
+            forEach(extensions, prior) {
+                if (prior.oid == oid) {
+                    return Error("extension " + oid + " appears twice",
+                        ErrorCode.BAD_CERTIFICATE);
+                }
+            }
+            Extension e = { oid: oid, critical: critical, value: value };
+            array.push(extensions, e);
+
+            if (oid == OID_EXT_BASIC_CONSTRAINTS) {
+                bcPresent = true;
+                Der bc = der(value);
+                Tlv bcTlv = bc.expect(TAG_SEQUENCE);
+                bc.atEnd("basicConstraints");
+                Der b = bc.inner(bcTlv);
+                if (b.peekIs(TAG_BOOLEAN)) {
+                    isCA = readBoolean(b, "basicConstraints cA");
+                    if (!isCA) {
+                        return Error("basicConstraints encodes cA=FALSE explicitly",
+                            ErrorCode.BAD_CERTIFICATE);
+                    }
+                }
+                if (!b.done()) {
+                    maxPathLen = readSmallInt(b, "pathLenConstraint");
+                    if (!isCA) {
+                        return Error("pathLenConstraint on a non-CA certificate",
+                            ErrorCode.CONSTRAINT_VIOLATION);
+                    }
+                }
+                b.atEnd("basicConstraints");
+            } else if (oid == OID_EXT_KEY_USAGE) {
+                kuPresent = true;
+                Der ku = der(value);
+                Bits bits = readBitString(ku, "keyUsage");
+                ku.atEnd("keyUsage");
+                int bit = 0;
+                forEach(bits.data, octet) {
+                    int mask = 128;
+                    int j = 0;
+                    while (j < 8) {
+                        if ((octet / mask) % 2 == 1) {
+                            keyUsage = keyUsage + pow2(bit);
+                        }
+                        mask = mask / 2;
+                        bit = bit + 1;
+                        j = j + 1;
+                    }
+                }
+            } else if (oid == OID_EXT_EXT_KEY_USAGE) {
+                ekuPresent = true;
+                Der eku = der(value);
+                Tlv ekuTlv = eku.expect(TAG_SEQUENCE);
+                eku.atEnd("extKeyUsage");
+                Der list = eku.inner(ekuTlv);
+                while (!list.done()) {
+                    array.push(extKeyUsage, readOid(list, "extKeyUsage"));
+                    if (extKeyUsage.length > MAX_NAME_ENTRIES) {
+                        return Error(`over ${MAX_NAME_ENTRIES} extended key usages`,
+                            ErrorCode.BAD_CERTIFICATE);
+                    }
+                }
+            } else if (oid == OID_EXT_SAN) {
+                Der san = der(value);
+                Tlv sanTlv = san.expect(TAG_SEQUENCE);
+                san.atEnd("subjectAltName");
+                Der list = san.inner(sanTlv);
+                int entries = 0;
+                while (!list.done()) {
+                    entries = entries + 1;
+                    if (entries > MAX_SAN_ENTRIES) {
+                        return Error(`over ${MAX_SAN_ENTRIES} subjectAltName entries`,
+                            ErrorCode.BAD_CERTIFICATE);
+                    }
+                    Tlv gn = list.readTlv();
+                    byte[] body = list.content(gn);
+                    // The general-name forms this module reads, by context tag:
+                    // rfc822Name [1], dNSName [2], iPAddress [7]. It skips the
+                    // other forms.
+                    if (gn.tag == 130) {
+                        // `matchHostname` compares dNSNames, so this checks
+                        // their syntax. An empty label or a non-IA5 byte puts
+                        // attacker-chosen text into the hostname comparison
+                        // (CVE-2009-2408).
+                        if (!validDnsName(body)) {
+                            return Error("subjectAltName dNSName \""
+                                + string.fromByteArray(body) + "\" is not a host name",
+                                ErrorCode.BAD_CERTIFICATE);
+                        }
+                        array.push(dnsNames, string.fromByteArray(body));
+                    } else if (gn.tag == 129) {
+                        if (!validEmail(body)) {
+                            return Error("subjectAltName rfc822Name is not an address",
+                                ErrorCode.BAD_CERTIFICATE);
+                        }
+                        array.push(emailAddresses, string.fromByteArray(body));
+                    } else if (gn.tag == 135) {
+                        String ip = formatIp(body);
+                        if (ip == "") {
+                            return Error(`subjectAltName iPAddress is ${body.length} bytes`,
+                                ErrorCode.BAD_CERTIFICATE);
+                        }
+                        array.push(ipAddresses, ip);
+                        array.push(rawIpAddresses, body);
+                    }
+                }
+            } else if (oid == OID_EXT_NAME_CONSTRAINTS) {
+                ncPresent = true;
+                Der nc = der(value);
+                Tlv ncTlv = nc.expect(TAG_SEQUENCE);
+                nc.atEnd("nameConstraints");
+                Der body = nc.inner(ncTlv);
+                // permittedSubtrees [0] and excludedSubtrees [1], both
+                // constructed and both optional.
+                if (body.peekIs(160)) {
+                    Tlv t = body.expect(160);
+                    permitted = readSubtrees(body.inner(t), "permittedSubtrees",
+                        unsupportedConstraints);
+                }
+                if (body.peekIs(161)) {
+                    Tlv t = body.expect(161);
+                    excluded = readSubtrees(body.inner(t), "excludedSubtrees",
+                        unsupportedConstraints);
+                }
+                body.atEnd("nameConstraints");
+                // RFC 5280 §4.2.1.10: one of the two must be present, and each
+                // is a SEQUENCE SIZE (1..MAX), so an extension that constrains
+                // nothing is malformed.
+                if (permitted.length == 0 && excluded.length == 0
+                    && unsupportedConstraints.length == 0) {
+                    return Error("nameConstraints constrains nothing",
+                        ErrorCode.BAD_CERTIFICATE);
+                }
+            } else if (critical) {
+                array.push(unhandledCritical, oid);
+            }
+        }
+        exts.atEnd("extensions");
+        // RFC 5280 §4.2.1.10: the extension belongs in a CA certificate. On
+        // anything else it constrains nothing, because nothing is below it.
+        if (ncPresent && !isCA) {
+            return Error("nameConstraints on a certificate that is not a "
+                + "certificate authority", ErrorCode.CONSTRAINT_VIOLATION);
+        }
+    }
+    tbs.atEnd("tbsCertificate");
+
+    Tlv outerAlgTlv = cert.expect(TAG_SEQUENCE);
+    Der outerAlg = cert.inner(outerAlgTlv);
+    String sigAlg = readOid(outerAlg, "signature algorithm");
+    byte[] sigParams = outerAlg.bytes(outerAlg.pos, outerAlg.end);
+    Bits sigBits = readBitString(cert, "signatureValue");
+    cert.atEnd("certificate");
+    if (sigBits.unused != 0) {
+        return Error("signatureValue has unused bits", ErrorCode.BAD_CERTIFICATE);
+    }
+    if (sigAlg != tbsSigAlg || !sameBytes(sigParams, tbsSigParams)) {
+        return Error("the signature algorithm inside the certificate ("
+            + tbsSigAlg + ") differs from the one outside it (" + sigAlg + ")",
+            ErrorCode.BAD_CERTIFICATE);
+    }
+
+    // RFC 5758 §3.2: an ecdsa-with-SHA2 AlgorithmIdentifier has no parameters
+    // field. A NULL there is also refused.
+    if ((sigAlg == OID_ECDSA_SHA256 || sigAlg == OID_ECDSA_SHA384)
+        && sigParams.length != 0) {
+        return Error("an ECDSA signature AlgorithmIdentifier carries parameters",
+            ErrorCode.BAD_CERTIFICATE);
+    }
+
+    Certificate out = {
+        raw: data,
+        rawTbs: rawTbs,
+        rawIssuer: rawIssuer,
+        rawSubject: rawSubject,
+        rawSpki: rawSpki,
+        version: version,
+        serialNumber: crypto.hexEncode(serial),
+        issuer: issuer,
+        subject: subject,
+        notBefore: notBefore,
+        notAfter: notAfter,
+        signatureAlgorithm: sigAlg,
+        signature: sigBits.data,
+        publicKeyAlgorithm: keyOid,
+        rsaModulus: rsaModulus,
+        rsaExponent: rsaExponent,
+        ecCurve: ecCurve,
+        ecPoint: ecPoint,
+        basicConstraintsPresent: bcPresent,
+        isCA: isCA,
+        maxPathLen: maxPathLen,
+        keyUsagePresent: kuPresent,
+        keyUsage: keyUsage,
+        extKeyUsagePresent: ekuPresent,
+        extKeyUsage: extKeyUsage,
+        dnsNames: dnsNames,
+        ipAddresses: ipAddresses,
+        emailAddresses: emailAddresses,
+        rawIpAddresses: rawIpAddresses,
+        nameConstraintsPresent: ncPresent,
+        permittedSubtrees: permitted,
+        excludedSubtrees: excluded,
+        unsupportedConstraints: unsupportedConstraints,
+        extensions: extensions,
+        unhandledCritical: unhandledCritical,
+    };
+    return out;
+}
+
+// A dNSName holds IA5 bytes, and every label between the dots is non-empty.
+// This is not a full hostname grammar, because real SANs contain characters
+// that RFC 1035 does not allow. It refuses an empty name, an empty label, a
+// leading or trailing dot, a control byte and a byte above 127.
+bool validDnsName(byte[] v) {
+    if (v.length == 0 || !validIA5(v)) {
+        return false;
+    }
+    int labelLen = 0;
+    forEach(v, c) {
+        if (c < 33 || c == 127) {
+            return false;    // a space, a control byte, a NUL
+        }
+        if (c == 46) {    // '.'
+            if (labelLen == 0) {
+                return false;
+            }
+            labelLen = 0;
+        } else {
+            labelLen = labelLen + 1;
+            if (labelLen > 63) {
+                return false;
+            }
+        }
+    }
+    return labelLen > 0;
+}
+
+// An rfc822Name: a local part, one '@' and a valid domain. A general name that
+// is not an address makes the certificate malformed.
+bool validEmail(byte[] v) {
+    if (v.length == 0 || !validIA5(v)) {
+        return false;
+    }
+    int at = -1;
+    int i = 0;
+    while (i < v.length) {
+        if (v[i] == 64) {    // '@'
+            if (at >= 0) {
+                return false;
+            }
+            at = i;
+        }
+        i = i + 1;
+    }
+    if (at <= 0 || at == v.length - 1) {
+        return false;
+    }
+    return validDnsName(array.slice(v, at + 1, v.length));
+}
+
+// Renders a SAN iPAddress. IPv6 is written in full, without :: compression,
+// because the result is compared with the caller's text.
+String formatIp(byte[] b) {
+    if (b.length == 4) {
+        return string.from(b[0]) + "." + string.from(b[1]) + "."
+            + string.from(b[2]) + "." + string.from(b[3]);
+    }
+    if (b.length == 16) {
+        String[] groups = [];
+        int i = 0;
+        while (i < 16) {
+            array.push(groups, hex4(b[i] * 256 + b[i + 1]));
+            i = i + 2;
+        }
+        return string.join(groups, ":");
+    }
+    return "";
+}
+
+String hex4(int v) {
+    String digits = "0123456789abcdef";
+    String out = "";
+    int shift = 12;
+    while (shift >= 0) {
+        int nib = (v / pow2(shift)) % 16;
+        out = out + string.substring(digits, nib, nib + 1);
+        shift = shift - 4;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Name constraints
+// ---------------------------------------------------------------------------
+
+// The permittedSubtrees or excludedSubtrees of a nameConstraints extension.
+// A subtree in a form that this module cannot compare goes into `unsupported`.
+// A certificate with one of those cannot issue certificates, because a
+// constraint that cannot be checked is not met.
+Subtree[] readSubtrees(Der list, String what, String[] unsupported) {
+    Subtree[] out = [];
+    int seen = 0;
+    while (!list.done()) {
+        seen = seen + 1;
+        if (seen > MAX_NAME_ENTRIES) {
+            return Error(what + `: over ${MAX_NAME_ENTRIES} subtrees`,
+                ErrorCode.BAD_CERTIFICATE);
+        }
+        Tlv subTlv = list.expect(TAG_SEQUENCE);
+        Der sub = list.inner(subTlv);
+        Tlv base = sub.readTlv();
+        byte[] body = sub.content(base);
+        // minimum [0] and maximum [1]: RFC 5280 §4.2.1.10 says a conforming CA
+        // must use neither. A subtree with one is refused, because ignoring a
+        // maximum widens the subtree.
+        if (sub.peekIs(128) || sub.peekIs(129)) {
+            return Error(what + ": a subtree sets minimum or maximum",
+                ErrorCode.BAD_CERTIFICATE);
+        }
+        sub.atEnd(what + " subtree");
+
+        if (base.tag == 130) {
+            // A zero-length dNSName subtree matches every name. Any other value
+            // must be a valid subjectAltName dNSName. That refuses a leading
+            // dot, which can mean "this domain" or "below this domain".
+            if (body.length > 0 && !validDnsName(body)) {
+                return Error(what + ": dNSName subtree \"" + string.fromByteArray(body)
+                    + "\" is not a host name", ErrorCode.BAD_CERTIFICATE);
+            }
+            Subtree dns = { kind: GN_DNS, name: string.fromByteArray(body), range: [] };
+            array.push(out, dns);
+        } else if (base.tag == 129) {
+            if (!validIA5(body)) {
+                return Error(what + ": rfc822Name subtree is not IA5 text",
+                    ErrorCode.BAD_CERTIFICATE);
+            }
+            Subtree mail = { kind: GN_EMAIL, name: string.fromByteArray(body), range: [] };
+            array.push(out, mail);
+        } else if (base.tag == 135) {
+            // An iPAddress subtree is an address followed by a mask of the same
+            // width: 8 bytes for IPv4, 32 for IPv6.
+            if (body.length != 8 && body.length != 32) {
+                return Error(what + `: an iPAddress subtree is ${body.length} bytes `
+                    + "rather than an address and a mask", ErrorCode.BAD_CERTIFICATE);
+            }
+            Subtree ip = { kind: GN_IP, name: "", range: body };
+            array.push(out, ip);
+        } else {
+            array.push(unsupported, what + " [" + string.from(gnNumber(base.tag)) + "]");
+        }
+    }
+    return out;
+}
+
+// A context tag's number, whether it was written primitive or constructed.
+int gnNumber(int tag) {
+    if (tag >= 160) {
+        return tag - 160;
+    }
+    return tag - 128;
+}
+
+// RFC 5280 §4.2.1.10 dNSName: a subtree matches a name equal to it and every
+// name below it. The comparison is label by label. A text comparison would put
+// "evilexample.com" inside "example.com".
+bool dnsInSubtree(String name, String constraint) {
+    if (string.length(constraint) == 0) {
+        return true;
+    }
+    String[] n = string.split(string.toLowerCaseAscii(name), ".");
+    String[] c = string.split(string.toLowerCaseAscii(constraint), ".");
+    if (n.length < c.length) {
+        return false;
+    }
+    int i = 0;
+    while (i < c.length) {
+        if (n[n.length - 1 - i] != c[c.length - 1 - i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// RFC 5280 §4.2.1.10 rfc822Name has three forms, and this reads all three: a
+// whole address, a host, or a domain with a leading dot. A bare host matches
+// only that host. The constraint "example.com" does not admit
+// "mail.example.com". Some implementations read a bare host as a domain. The
+// strict reading cannot admit a name that the CA did not write.
+bool emailInSubtree(String address, String constraint) {
+    if (string.length(constraint) == 0) {
+        return true;
+    }
+    int at = string.find(address, "@");
+    if (at < 0) {
+        return false;
+    }
+    String local = string.substring(address, 0, at);
+    String host = string.toLowerCaseAscii(
+        string.substring(address, at + 1, string.length(address)));
+
+    int cat = string.find(constraint, "@");
+    if (cat >= 0) {
+        // The local part is case-sensitive and the domain is not.
+        String want = string.substring(constraint, 0, cat);
+        String wantHost = string.toLowerCaseAscii(
+            string.substring(constraint, cat + 1, string.length(constraint)));
+        return local == want && host == wantHost;
+    }
+    if (constraint[0] == 46) {    // '.': every address in a name below it
+        String below = string.toLowerCaseAscii(
+            string.substring(constraint, 1, string.length(constraint)));
+        return host != below && dnsInSubtree(host, below);
+    }
+    return host == string.toLowerCaseAscii(constraint);
+}
+
+// An iPAddress subtree is an address and a mask. An address of the other
+// family is outside the subtree.
+bool ipInSubtree(byte[] ip, byte[] range) {
+    int width = range.length / 2;
+    if (ip.length != width) {
+        return false;
+    }
+    int i = 0;
+    while (i < width) {
+        byte mask = range[width + i];
+        if ((ip[i] & mask) != (range[i] & mask)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+bool inSubtree(int kind, String text, byte[] raw, Subtree sub) {
+    if (kind == GN_DNS) {
+        return dnsInSubtree(text, sub.name);
+    }
+    if (kind == GN_EMAIL) {
+        return emailInSubtree(text, sub.name);
+    }
+    return ipInSubtree(raw, sub.range);
+}
+
+// RFC 5280 §6.1.3: an issuer's constraints apply to every certificate below it
+// in the chain. `below` is leaf first and holds only the certificates under
+// this candidate, because the chain is built upwards.
+//
+// A self-issued certificate that is not the leaf is skipped. This lets a CA
+// re-issue its own certificate after it adds a constraint.
+void checkConstraints(Certificate parent, Certificate[] below) {
+    if (!parent.nameConstraintsPresent) {
+        return;
+    }
+    if (parent.unsupportedConstraints.length > 0) {
+        return Error("\"" + parent.subject + "\" constrains names in a form this module "
+            + "cannot compare (" + string.join(parent.unsupportedConstraints, ", ")
+            + "), so nothing below it can be shown to be within its constraint",
+            ErrorCode.CONSTRAINT_VIOLATION);
+    }
+    int i = 0;
+    while (i < below.length) {
+        Certificate cert = below[i];
+        if (i > 0 && cert.isSelfIssued()) {
+            i = i + 1;
+            continue;
+        }
+        forEach(cert.dnsNames, name) {
+            checkName(parent, cert, GN_DNS, name, [], "the name \"" + name + "\"");
+        }
+        forEach(cert.emailAddresses, addr) {
+            checkName(parent, cert, GN_EMAIL, addr, [],
+                "the address \"" + addr + "\"");
+        }
+        int j = 0;
+        while (j < cert.rawIpAddresses.length) {
+            checkName(parent, cert, GN_IP, "", cert.rawIpAddresses[j],
+                "the address " + cert.ipAddresses[j]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// Checks one name of one form against both lists. A match in the excluded list
+// always fails. The permitted list restricts only the forms that it names
+// (RFC 5280 §4.2.1.10).
+void checkName(Certificate parent, Certificate cert, int kind, String text,
+    byte[] raw, String described) {
+    forEach(parent.excludedSubtrees, sub) {
+        if (sub.kind != kind) {
+            continue;
+        }
+        if (inSubtree(kind, text, raw, sub)) {
+            return Error("\"" + cert.subject + "\" carries " + described + ", which \""
+                + parent.subject + "\" excludes", ErrorCode.CONSTRAINT_VIOLATION);
+        }
+    }
+    bool restricted = false;
+    forEach(parent.permittedSubtrees, sub) {
+        if (sub.kind != kind) {
+            continue;
+        }
+        restricted = true;
+        if (inSubtree(kind, text, raw, sub)) {
+            return;
+        }
+    }
+    if (!restricted) {
+        return;
+    }
+    return Error("\"" + cert.subject + "\" carries " + described + ", which \""
+        + parent.subject + "\" does not permit", ErrorCode.CONSTRAINT_VIOLATION);
+}
+
+// ---------------------------------------------------------------------------
+// PEM
+// ---------------------------------------------------------------------------
+
+String const PEM_BEGIN = "-----BEGIN CERTIFICATE-----";
+String const PEM_END = "-----END CERTIFICATE-----";
+
+// Returns every certificate in a PEM bundle, as DER. It skips blocks that are
+// not CERTIFICATE blocks. A block that does not close, or whose body is not
+// base64, raises BAD_CERTIFICATE. A root store with missing roots would make
+// connections fail with no visible cause.
+export byte[][] parsePem(String text) {
+    byte[][] out = [];
+    int pos = 0;
+    while (true) {
+        int begin = string.find(string.substring(text, pos, string.length(text)), PEM_BEGIN);
+        if (begin < 0) {
+            return out;
+        }
+        int bodyStart = pos + begin + string.length(PEM_BEGIN);
+        int rest = string.find(string.substring(text, bodyStart, string.length(text)), PEM_END);
+        if (rest < 0) {
+            return Error("PEM block opened and never closed", ErrorCode.BAD_CERTIFICATE);
+        }
+        String body = string.substring(text, bodyStart, bodyStart + rest);
+        String[] joined = [];
+        forEach(string.split(body, "\n"), line) {
+            String t = string.trim(line);
+            if (string.length(t) > 0) {
+                array.push(joined, t);
+            }
+        }
+        byte[] d = crypto.base64Decode(string.join(joined, "")) catch e {
+            return Error("PEM block is not base64: " + e.message,
+                ErrorCode.BAD_CERTIFICATE);
+        };
+        array.push(out, d);
+        pos = bodyStart + rest + string.length(PEM_END);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// The system root store
+// ---------------------------------------------------------------------------
+
+// The bundle paths to probe, in order. The first one that exists and parses
+// wins. Windows is not in the list, because its store is an API and not a
+// file.
+String[] rootStorePaths() {
+    return [
+        "/etc/ssl/cert.pem",                         // macOS, OpenBSD, Alpine
+        "/etc/ssl/certs/ca-certificates.crt",        // Debian, Ubuntu, Gentoo
+        "/etc/pki/tls/certs/ca-bundle.crt",          // Fedora, RHEL
+        "/etc/ssl/ca-bundle.pem",                    // OpenSUSE
+        "/etc/pki/tls/cacert.pem",                   // OpenELEC
+        "/etc/ssl/cert.pem",                         // FreeBSD
+        "/usr/local/share/certs/ca-root-nss.crt",    // DragonFly, FreeBSD
+    ];
+}
+
+// Reads the host's trusted roots. It raises UNTRUSTED_ROOT when it finds no
+// roots, and never returns an empty store.
+export Certificate[] systemRoots() {
+    String tried = "";
+    forEach(rootStorePaths(), path) {
+        bool there = fs.exists(path);
+        if (!there) {
+            if (string.length(tried) > 0) {
+                tried = tried + ", ";
+            }
+            tried = tried + path;
+            continue;
+        }
+        byte[] data = fs.readFile(path) catch e {
+            continue;
+        };
+        byte[][] ders = parsePem(string.fromByteArray(data));
+        Certificate[] roots = [];
+        forEach(ders, one) {
+            // A root that this module cannot parse is skipped. This is the only
+            // place where a parse failure is ignored, for one certificate only.
+            Certificate c = parseCertificate(one) catch e {
+                continue;
+            };
+            array.push(roots, c);
+        }
+        if (roots.length == 0) {
+            continue;
+        }
+        return roots;
+    }
+    return Error("no system root store found (tried " + tried + ")",
+        ErrorCode.UNTRUSTED_ROOT);
+}
+
+// ---------------------------------------------------------------------------
+// Hostname verification (RFC 6125)
+// ---------------------------------------------------------------------------
+
+// Checks that `cert` is valid for `host`, and raises HOSTNAME_MISMATCH when it
+// is not. Only subjectAltName is used. The common name is untyped display
+// text, and major clients do not use it.
+export void matchHostname(Certificate cert, String host) {
+    String want = string.toLowerCaseAscii(string.trim(host));
+    if (string.length(want) == 0) {
+        return Error("no hostname to check against", ErrorCode.HOSTNAME_MISMATCH);
+    }
+    // A trailing dot is a legal, fully-qualified spelling of the same name.
+    if (want[string.length(want) - 1] == 46) {    // '.'
+        want = string.substring(want, 0, string.length(want) - 1);
+    }
+    if (looksNumeric(want)) {
+        forEach(cert.ipAddresses, ip) {
+            if (ip == want) {
+                return;
+            }
+        }
+        return Error("certificate is not valid for " + host + " (it names "
+            + describeNames(cert) + ")", ErrorCode.HOSTNAME_MISMATCH);
+    }
+    forEach(cert.dnsNames, name) {
+        if (dnsMatches(string.toLowerCaseAscii(name), want)) {
+            return;
+        }
+    }
+    return Error("certificate is not valid for " + host + " (it names "
+        + describeNames(cert) + ")", ErrorCode.HOSTNAME_MISMATCH);
+}
+
+String describeNames(Certificate cert) {
+    String[] all = [];
+    forEach(cert.dnsNames, n) {
+        array.push(all, n);
+    }
+    forEach(cert.ipAddresses, n) {
+        array.push(all, n);
+    }
+    if (all.length == 0) {
+        return "no names at all";
+    }
+    if (all.length > 6) {
+        String[] head = array.slice(all, 0, 6);
+        return string.join(head, ", ") + " and " + string.from(all.length - 6) + " more";
+    }
+    return string.join(all, ", ");
+}
+
+// An address literal is matched against iPAddress entries only, never against
+// dNSName entries. `tls` uses the same test to decide whether SNI may carry a
+// name.
+bool looksNumeric(String host) {
+    if (string.contains(host, ":")) {
+        return true;
+    }
+    String[] parts = string.split(host, ".");
+    if (parts.length != 4) {
+        return false;
+    }
+    forEach(parts, p) {
+        if (string.length(p) == 0 || string.length(p) > 3) {
+            return false;
+        }
+        forEach(string.toByteArray(p), c) {
+            if (c < 48 || c > 57) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// RFC 6125 §6.4.3: a wildcard may be only the whole leftmost label and matches
+// one label. `*.example.com` covers `www.example.com`, and covers neither
+// `example.com` nor `a.b.example.com`.
+bool dnsMatches(String pattern, String host) {
+    if (string.length(pattern) == 0 || string.length(host) == 0) {
+        return false;
+    }
+    if (!string.contains(pattern, "*")) {
+        return pattern == host;
+    }
+    if (string.length(pattern) < 3 || pattern[0] != 42 || pattern[1] != 46) {
+        return false;    // '*' must be followed by '.'
+    }
+    String suffix = string.substring(pattern, 1, string.length(pattern));
+    if (string.contains(suffix, "*")) {
+        return false;
+    }
+    int dot = string.find(host, ".");
+    if (dot <= 0) {
+        return false;
+    }
+    // A wildcard may not cover a public suffix such as `*.com`. Two labels must
+    // follow the wildcard.
+    String[] tail = string.split(suffix, ".");
+    int labels = 0;
+    forEach(tail, t) {
+        if (string.length(t) > 0) {
+            labels = labels + 1;
+        }
+    }
+    if (labels < 2) {
+        return false;
+    }
+    return string.substring(host, dot, string.length(host)) == suffix;
+}
+
+// ---------------------------------------------------------------------------
+// Signatures
+// ---------------------------------------------------------------------------
+
+// Verifies that `parent`'s key signed `child`, and raises BAD_SIGNATURE when
+// it did not. Every unsupported case raises, because a permissive reading
+// accepts a forgery.
+export void checkSignature(Certificate child, Certificate parent) {
+    String alg = child.signatureAlgorithm;
+    if (alg == OID_SHA1_RSA || alg == OID_MD5_RSA) {
+        return Error("signature algorithm " + alg
+            + " (SHA-1 or MD5) is refused: chosen-prefix collisions against it are practical",
+            ErrorCode.UNSUPPORTED_ALGORITHM);
+    }
+    if (alg == OID_ED25519) {
+        return Error("signature algorithm " + alg
+            + " is not implemented yet, so this certificate cannot be verified",
+            ErrorCode.UNSUPPORTED_ALGORITHM);
+    }
+
+    // The issuer's key gives the curve and the algorithm gives the hash. The
+    // two choices are independent.
+    if (alg == OID_ECDSA_SHA256 || alg == OID_ECDSA_SHA384) {
+        if (parent.publicKeyAlgorithm != OID_EC_PUBLIC_KEY) {
+            return Error("an ECDSA signature under a " + parent.publicKeyAlgorithm
+                + " issuer key", ErrorCode.BAD_CERTIFICATE);
+        }
+        if (parent.ecPoint.length == 0) {
+            return Error("issuer's EC curve " + parent.ecCurve
+                + " is not implemented, so this certificate cannot be verified",
+                ErrorCode.UNSUPPORTED_ALGORITHM);
+        }
+        byte[] digest = crypto.sha256(child.rawTbs);
+        if (alg == OID_ECDSA_SHA384) {
+            digest = crypto.sha384(child.rawTbs);
+        }
+        EcdsaSignature sig = parseEcdsaSignature(child.signature) catch e {
+            return Error("\"" + child.subject + "\": " + e.message,
+                ErrorCode.BAD_CERTIFICATE);
+        };
+        crypto.ecdsaVerify(parent.ecCurve, parent.ecPoint, digest, sig.r, sig.s)
+        catch e {
+            return signatureError(child, parent, e);
+        };
+        return;
+    }
+
+    if (parent.publicKeyAlgorithm != OID_RSA_ENCRYPTION) {
+        return Error("issuer's key algorithm " + parent.publicKeyAlgorithm
+            + " cannot carry a " + alg + " signature", ErrorCode.BAD_CERTIFICATE);
+    }
+    if (parent.rsaModulus.length == 0) {
+        return Error("issuer has no usable RSA key", ErrorCode.BAD_CERTIFICATE);
+    }
+
+    String hash = "";
+    bool pss = false;
+    if (alg == OID_SHA256_RSA) {
+        hash = "sha256";
+    } else if (alg == OID_SHA384_RSA) {
+        hash = "sha384";
+    } else if (alg == OID_RSASSA_PSS) {
+        // Only the TLS 1.3 profile is accepted: MGF1 with the same hash, and a
+        // salt length equal to the hash length.
+        hash = pssHash(child);
+        pss = true;
+    } else {
+        return Error("signature algorithm " + alg + " is not recognized",
+            ErrorCode.UNSUPPORTED_ALGORITHM);
+    }
+
+    byte[] digest = crypto.sha256(child.rawTbs);
+    if (hash == "sha384") {
+        digest = crypto.sha384(child.rawTbs);
+    }
+    if (pss) {
+        crypto.rsaVerifyPss(parent.rsaModulus, parent.rsaExponent, hash, digest,
+            child.signature) catch e {
+            return signatureError(child, parent, e);
+        };
+        return;
+    }
+    crypto.rsaVerifyPkcs1v15(parent.rsaModulus, parent.rsaExponent, hash, digest,
+        child.signature) catch e {
+        return signatureError(child, parent, e);
+    };
+}
+
+// Keeps the two crypto failures apart. An unusable key or signature is
+// BAD_CERTIFICATE. A signature that does not verify is BAD_SIGNATURE.
+Error signatureError(Certificate child, Certificate parent, Error e) {
+    int code = ErrorCode.BAD_SIGNATURE;
+    if (e.code == crypto.ErrorCode.INVALID) {
+        code = ErrorCode.BAD_CERTIFICATE;
+    }
+    return Error("\"" + child.subject + "\" is not signed by \"" + parent.subject
+        + "\": " + e.message, code);
+}
+
+// Reads the RSASSA-PSS parameters and requires the profile that RFC 8446
+// §4.2.3 defines for rsa_pss_rsae_*.
+String pssHash(Certificate cert) {
+    // `parseCertificate` keeps only the algorithm OID, so this reads the
+    // parameters again from the certificate bytes.
+    Der top = der(cert.raw);
+    Tlv certTlv = top.expect(TAG_SEQUENCE);
+    Der body = top.inner(certTlv);
+    body.readTlv();    // tbsCertificate
+    Tlv algTlv = body.expect(TAG_SEQUENCE);
+    Der alg = body.inner(algTlv);
+    readOid(alg, "signature algorithm");
+    if (alg.done()) {
+        return Error("RSASSA-PSS with no parameters", ErrorCode.UNSUPPORTED_ALGORITHM);
+    }
+    Tlv paramsTlv = alg.expect(TAG_SEQUENCE);
+    Der params = alg.inner(paramsTlv);
+    alg.atEnd("RSASSA-PSS parameters");
+
+    String hash = OID_SHA256;
+    bool sawHash = false;
+    String mgfHash = OID_SHA256;
+    bool sawMgf = false;
+    int saltLen = 20;    // the ASN.1 default
+    while (!params.done()) {
+        Tlv f = params.readTlv();
+        Der v = params.inner(f);
+        if (f.tag == 160) {    // [0] hashAlgorithm
+            Tlv h = v.expect(TAG_SEQUENCE);
+            Der hd = v.inner(h);
+            hash = readOid(hd, "PSS hashAlgorithm");
+            sawHash = true;
+        } else if (f.tag == 161) {    // [1] maskGenAlgorithm
+            Tlv m = v.expect(TAG_SEQUENCE);
+            Der md = v.inner(m);
+            String mgf = readOid(md, "PSS maskGenAlgorithm");
+            if (mgf != "1.2.840.113549.1.1.8") {
+                return Error("RSASSA-PSS mask function " + mgf + " is not MGF1",
+                    ErrorCode.UNSUPPORTED_ALGORITHM);
+            }
+            Tlv mh = md.expect(TAG_SEQUENCE);
+            Der mhd = md.inner(mh);
+            mgfHash = readOid(mhd, "PSS MGF1 hash");
+            sawMgf = true;
+        } else if (f.tag == 162) {    // [2] saltLength
+            saltLen = readSmallInt(v, "PSS saltLength");
+        } else if (f.tag == 163) {    // [3] trailerField
+            int trailer = readSmallInt(v, "PSS trailerField");
+            if (trailer != 1) {
+                return Error("RSASSA-PSS trailerField is not 1",
+                    ErrorCode.UNSUPPORTED_ALGORITHM);
+            }
+        }
+    }
+    // The ASN.1 defaults are SHA-1 and a 20-byte salt, which this module
+    // refuses. The error for omitted fields names the SHA-1 defaults.
+    if (!sawHash || !sawMgf) {
+        return Error("RSASSA-PSS with defaulted SHA-1 parameters is refused",
+            ErrorCode.UNSUPPORTED_ALGORITHM);
+    }
+    if (hash != mgfHash) {
+        return Error("RSASSA-PSS hash and MGF1 hash differ",
+            ErrorCode.UNSUPPORTED_ALGORITHM);
+    }
+    if (hash == OID_SHA256) {
+        if (saltLen != 32) {
+            return Error(`RSASSA-PSS salt length ${saltLen} is not the hash length`,
+                ErrorCode.UNSUPPORTED_ALGORITHM);
+        }
+        return "sha256";
+    }
+    if (hash == OID_SHA384) {
+        if (saltLen != 48) {
+            return Error(`RSASSA-PSS salt length ${saltLen} is not the hash length`,
+                ErrorCode.UNSUPPORTED_ALGORITHM);
+        }
+        return "sha384";
+    }
+    return Error("RSASSA-PSS hash " + hash + " is not supported",
+        ErrorCode.UNSUPPORTED_ALGORITHM);
+}
+
+// An RSA public key from a certificate. A caller uses it to check a signature
+// that is not a certificate signature, such as TLS's CertificateVerify.
+export type RsaPublicKey {
+    byte[] modulus;
+    int exponent;
+}
+
+export RsaPublicKey rsaPublicKey(Certificate cert) {
+    if (cert.publicKeyAlgorithm != OID_RSA_ENCRYPTION) {
+        return Error("certificate holds a " + cert.publicKeyAlgorithm
+            + " key, not an RSA one", ErrorCode.UNSUPPORTED_ALGORITHM);
+    }
+    if (cert.rsaModulus.length == 0) {
+        return Error("certificate holds no usable RSA key", ErrorCode.BAD_CERTIFICATE);
+    }
+    return { modulus: cert.rsaModulus, exponent: cert.rsaExponent };
+}
+
+// An ECDSA public key from a certificate, for the same use.
+// `crypto.ecdsaVerify` takes the curve name and the point.
+export type EcdsaPublicKey {
+    String curve;    // "p256" or "p384"
+    byte[] point;    // SEC 1 uncompressed
+}
+
+export EcdsaPublicKey ecdsaPublicKey(Certificate cert) {
+    if (cert.publicKeyAlgorithm != OID_EC_PUBLIC_KEY) {
+        return Error("certificate holds a " + cert.publicKeyAlgorithm
+            + " key, not an EC one", ErrorCode.UNSUPPORTED_ALGORITHM);
+    }
+    if (cert.ecPoint.length == 0) {
+        return Error("certificate's EC curve " + cert.ecCurve + " is not implemented",
+            ErrorCode.UNSUPPORTED_ALGORITHM);
+    }
+    return { curve: cert.ecCurve, point: cert.ecPoint };
+}
+
+// The SHA-256 of a certificate's SubjectPublicKeyInfo, which is the pin value
+// (§6.18). It hashes `rawSpki`, the received bytes. A certificate reissued for
+// the same key keeps its pin, and a rotated key gets a new pin.
+export byte[] spkiPin(Certificate cert) {
+    return crypto.sha256(cert.rawSpki);
+}
+
+// Returns true when any certificate in `chain` holds a key that `pins` names.
+// Pin an intermediate to accept every leaf issued under it, or pin a leaf to
+// accept one key only.
+//
+// Call it on a chain that is already verified. A pin narrows which verified
+// chains are acceptable, and does not give trust. An empty `pins` matches
+// nothing, so `tls.Options` refuses an empty list.
+export bool pinned(Certificate[] chain, byte[][] pins) {
+    forEach(chain, cert) {
+        byte[] have = spkiPin(cert);
+        forEach(pins, pin) {
+            if (string.bytesEqualConstantTime(have, pin)) { return true; }
+        }
+    }
+    return false;
+}
+
+// An ECDSA signature value (RFC 5480 §3): SEQUENCE { r INTEGER, s INTEGER },
+// under the same DER strictness as everything else here. It is exported because
+// TLS's CertificateVerify carries the same encoding.
+export type EcdsaSignature {
+    byte[] r;
+    byte[] s;
+}
+
+export EcdsaSignature parseEcdsaSignature(byte[] data) {
+    Der d = der(data);
+    Tlv seq = d.expect(TAG_SEQUENCE);
+    d.atEnd("ECDSA signature");
+    Der body = d.inner(seq);
+    byte[] r = readUnsigned(body, "ECDSA r");
+    byte[] s = readUnsigned(body, "ECDSA s");
+    body.atEnd("ECDSA signature");
+    return { r: r, s: s };
+}
+
+// ---------------------------------------------------------------------------
+// Chain verification
+// ---------------------------------------------------------------------------
+
+export type Options {
+    // The name the server must be valid for. Left out, no hostname check runs.
+    String? dnsName;
+    // The trusted roots. Left out, the system store is read.
+    Certificate[]? roots;
+    // The instant to judge validity at. Left out, now.
+    DateTime? at;
+}
+
+// Takes the chain a peer sent, leaf first as TLS 1.3 sends it, and returns the
+// verified chain from the leaf up to the root. The received certificates are
+// only candidates, so the returned chain can differ from the received one.
+// It raises an ErrorCode that gives the reason when no chain is trusted.
+export Certificate[] verify(Certificate[] chain, Options? options) {
+    if (chain.length == 0) {
+        return Error("the peer sent no certificates", ErrorCode.BAD_CERTIFICATE);
+    }
+    Certificate leaf = chain[0];
+    DateTime at = time.now();
+    Options? opts = options;
+    if (opts != null) {
+        DateTime? given = opts.at;
+        if (given != null) {
+            at = given;
+        }
+    }
+    Certificate[] roots = [];
+    if (opts != null) {
+        Certificate[]? r = opts.roots;
+        if (r != null) {
+            roots = r;
+        }
+    }
+    if (roots.length == 0) {
+        roots = systemRoots();
+    }
+
+    // The leaf is checked before any chain is built, so the error gives the
+    // specific reason, such as a wrong host or an unhandled critical extension.
+    checkUsable(leaf, at);
+    if (leaf.basicConstraintsPresent && leaf.isCA) {
+        // Several known attacks present a CA certificate as a server identity.
+        if (leaf.extKeyUsagePresent && !hasServerAuth(leaf)) {
+            return Error("the leaf certificate is a CA and is not valid for server "
+                + "authentication", ErrorCode.CONSTRAINT_VIOLATION);
+        }
+    }
+    if (leaf.extKeyUsagePresent && !hasServerAuth(leaf)) {
+        return Error("the leaf certificate is not valid for server authentication",
+            ErrorCode.CONSTRAINT_VIOLATION);
+    }
+    if (opts != null) {
+        String? name = opts.dnsName;
+        if (name != null) {
+            matchHostname(leaf, name);
+        }
+    }
+
+    Certificate[] pool = [];
+    int i = 1;
+    while (i < chain.length) {
+        array.push(pool, chain[i]);
+        i = i + 1;
+    }
+
+    Work work = { budget: MAX_CHAIN_WORK, why: "" };
+    Certificate[] built = [];
+    array.push(built, leaf);
+    Certificate[]? found = extend(built, pool, roots, at, work);
+    if (found == null) {
+        String why = "no trusted root vouches for \"" + leaf.subject + "\"";
+        if (string.length(work.why) > 0) {
+            why = why + ": " + work.why;
+        }
+        return Error(why, ErrorCode.UNTRUSTED_ROOT);
+    }
+    return found;
+}
+
+// The shared state of the search: a budget that bounds the work on a pool of
+// cross-signed certificates, and the last reason a candidate failed.
+type Work {
+    int budget;
+    String why;
+}
+
+// The chain search. A chain is complete when its top certificate is a root by
+// identity. The store makes a root trusted, so its self-signature is not
+// checked. Roots are tried before intermediates, so the shortest trusted chain
+// comes first.
+Certificate[]? extend(Certificate[] built, Certificate[] pool, Certificate[] roots,
+    DateTime at, Work work) {
+    Certificate top = built[built.length - 1];
+    forEach(roots, root) {
+        if (sameBytes(root.rawSubject, top.rawSubject)
+            && sameBytes(root.rawSpki, top.rawSpki)) {
+            // The peer sent the root itself, which is redundant but common.
+            return built;
+        }
+    }
+    if (built.length >= MAX_CHAIN_DEPTH) {
+        work.why = `the chain is longer than ${MAX_CHAIN_DEPTH}`;
+        return null;
+    }
+    Certificate[]? viaRoot = tryParents(built, roots, pool, roots, at, work, true);
+    if (viaRoot != null) {
+        return viaRoot;
+    }
+    return tryParents(built, pool, pool, roots, at, work, false);
+}
+
+Certificate[]? tryParents(Certificate[] built, Certificate[] candidates,
+    Certificate[] pool, Certificate[] roots, DateTime at,
+    Work work, bool terminal) {
+    Certificate top = built[built.length - 1];
+    forEach(candidates, parent) {
+        if (work.budget <= 0) {
+            work.why = `the search gave up after ${MAX_CHAIN_WORK} candidates`;
+            return null;
+        }
+        if (!sameBytes(parent.rawSubject, top.rawIssuer)) {
+            continue;
+        }
+        // A certificate may not be its own parent or appear twice in one chain.
+        // Either one lets a loop in a cross-signed pool make the search
+        // endless.
+        bool seen = false;
+        forEach(built, already) {
+            if (sameBytes(already.raw, parent.raw)) {
+                seen = true;
+            }
+        }
+        if (seen) {
+            continue;
+        }
+        work.budget = work.budget - 1;
+        checkIssuer(parent, built, at) catch e {
+            work.why = e.message;
+            continue;
+        };
+        checkSignature(top, parent) catch e {
+            work.why = e.message;
+            continue;
+        };
+        Certificate[] longer = array.copy(built);
+        array.push(longer, parent);
+        if (terminal) {
+            return longer;
+        }
+        Certificate[]? done = extend(longer, pool, roots, at, work);
+        if (done != null) {
+            return done;
+        }
+    }
+    return null;
+}
+
+// What every certificate in a chain must satisfy, whatever its position: it is
+// inside its validity window, and nothing critical in it went unread.
+void checkUsable(Certificate cert, DateTime at) {
+    if (cert.unhandledCritical.length > 0) {
+        return Error("\"" + cert.subject + "\" has a critical extension this module "
+            + "does not implement (" + string.join(cert.unhandledCritical, ", ")
+            + "), so it cannot be judged safe", ErrorCode.CONSTRAINT_VIOLATION);
+    }
+    if (at < cert.notBefore) {
+        return Error("\"" + cert.subject + "\" is not valid until "
+            + time.date.toText(cert.notBefore), ErrorCode.NOT_YET_VALID);
+    }
+    if (at > cert.notAfter) {
+        return Error("\"" + cert.subject + "\" expired at "
+            + time.date.toText(cert.notAfter), ErrorCode.EXPIRED);
+    }
+}
+
+// The conditions a certificate must meet to sign the one below it. The three
+// constraints come from RFC 5280 §6.1.4. Without the CA flag check, any valid
+// certificate could sign others.
+void checkIssuer(Certificate parent, Certificate[] built, DateTime at) {
+    checkUsable(parent, at);
+    if (!parent.basicConstraintsPresent || !parent.isCA) {
+        return Error("\"" + parent.subject + "\" is not a certificate authority",
+            ErrorCode.CONSTRAINT_VIOLATION);
+    }
+    if (parent.keyUsagePresent && !parent.hasKeyUsage(KU_KEY_CERT_SIGN)) {
+        return Error("\"" + parent.subject + "\" is not allowed to sign certificates",
+            ErrorCode.CONSTRAINT_VIOLATION);
+    }
+    if (parent.maxPathLen >= 0) {
+        // pathLenConstraint counts the non-self-issued intermediates that may
+        // follow this certificate. `built` holds the leaf and every certificate
+        // between it and this one.
+        int intermediates = 0;
+        int i = 1;
+        while (i < built.length) {
+            if (!built[i].isSelfIssued()) {
+                intermediates = intermediates + 1;
+            }
+            i = i + 1;
+        }
+        if (intermediates > parent.maxPathLen) {
+            return Error("\"" + parent.subject + "\" allows " + string.from(parent.maxPathLen)
+                + " intermediates below it and this chain has " + string.from(intermediates),
+                ErrorCode.CONSTRAINT_VIOLATION);
+        }
+    }
+    checkConstraints(parent, built);
+}
+
+bool hasServerAuth(Certificate cert) {
+    forEach(cert.extKeyUsage, oid) {
+        if (oid == OID_EKU_SERVER_AUTH || oid == OID_EKU_ANY) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// The whole job, from what a peer sent
+// ---------------------------------------------------------------------------
+
+// The entry point for `tls`: DER in, verified chain out. One call does every
+// step in order, so a caller cannot skip a step. It raises the first error.
+export Certificate[] verifyChain(byte[][] ders, String? dnsName,
+    Certificate[]? roots, DateTime? at) {
+    if (ders.length == 0) {
+        return Error("the peer sent no certificates", ErrorCode.BAD_CERTIFICATE);
+    }
+    Certificate[] parsed = [];
+    forEach(ders, one) {
+        array.push(parsed, parseCertificate(one));
+    }
+    Options opts = { dnsName: dnsName, roots: roots, at: at };
+    return verify(parsed, opts);
+}

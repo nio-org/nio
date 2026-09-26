@@ -1,0 +1,1848 @@
+// The `http` module (§6.16): an HTTP/1.1 server and client over TCP. The client
+// also speaks TLS: `https://` goes through `tls.connect`, which verifies the
+// peer by default (§6.18).
+//
+// Parsing works on `String` values. A Nio string is a byte string and can hold
+// NUL (§6.6), so a binary body survives the round trip. Only `Request.body` and
+// `Response.body` hold bytes.
+//
+// Every size below has a limit, so input cannot decide how much work the
+// program does. Without them, one connection that never sends the blank line
+// could deny service.
+import 'string';
+import 'array';
+import 'map';
+import 'net';
+import 'tls';
+import 'async';
+import 'regexp';
+
+// ---------------------------------------------------------------------------
+// Methods and error codes
+// ---------------------------------------------------------------------------
+
+// `string.from` on a member gives its name (§6.1). The names are the tokens
+// sent on the wire, so `string.from` serializes a method.
+export enum Method {
+    GET: 0,
+    POST: 1,
+    PUT: 2,
+    DELETE: 3,
+    PATCH: 4,
+    HEAD: 5,
+    OPTIONS: 6
+}
+
+// The error codes of this module. A module written in Nio cannot extend the
+// compiler-declared `ErrorCode` (§2.9). These codes start at 100, so they do
+// not overlap the `NIO_ERR_*` codes and a handler can compare against both.
+export enum ErrorCode {
+    MALFORMED_REQUEST: 100,
+    MALFORMED_RESPONSE: 101,
+    TOO_LARGE: 102,
+    UNSUPPORTED_SCHEME: 103,
+    TOO_MANY_REDIRECTS: 104
+}
+
+// ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
+
+int const MAX_LINE = 8192;             // one request, status or header line
+int const MAX_HEADER_BYTES = 65536;    // the whole block, blank line included
+int const MAX_HEADERS = 100;           // how many headers one message may carry
+int const MAX_BODY = 10485760;         // 10 MB: the default server body limit
+// The size of one socket read. It is just under 8 KB, so the block and its
+// header fit the 8184-byte size class of the collector.
+int const READ_CHUNK = 8128;
+
+// The size of one bulk body read (Body.nextCounted). A parked readExactly holds
+// its buffer, so a slow peer that declares a 10 MB body must not park 10 MB per
+// connection. 65464 bytes plus the block header fill one cell.
+int const BODY_ASK = 65464;
+
+// How much body a streaming handler can leave unread. The next message starts
+// where this body ends, so the server reads and discards the rest. Past this
+// limit it closes the connection.
+int const DRAIN_LIMIT = 262144;
+
+String const HEX = "0123456789abcdef";
+String const HEXUP = "0123456789ABCDEF";
+
+// The HTTP line terminator. It is exported for programs that write a raw
+// message.
+export String const CRLF = "\r\n";
+export String const CRLF2 = "\r\n\r\n";
+
+// The one-byte string with byte value v. Both callers keep v in 0..255, so the
+// conversion (§3.6) loses nothing.
+String byteText(int v) {
+    return string.fromByteArray([v as byte]);
+}
+
+// Reads s as hexadecimal: a chunk size, or the two digits of a `%XX`.
+int hexValue(String s) {
+    int n = string.length(s);
+    if (n == 0) { return Error("empty hex number", ErrorCode.MALFORMED_REQUEST); }
+    int v = 0;
+    int i = 0;
+    while (i < n) {
+        int d = string.find(HEX, string.toLowerCaseAscii(string.substring(s, i, i + 1)));
+        if (d < 0) {
+            return Error("bad hex digit in \"" + s + "\"", ErrorCode.MALFORMED_REQUEST);
+        }
+        v = v * 16 + d;
+        i++;
+    }
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// Percent-encoding
+// ---------------------------------------------------------------------------
+
+// Decodes `%41` to `A`. A `%` that is not followed by two hex digits stays as
+// it is, so a stray `%` in a query string does not reject the request.
+export String percentDecode(String s) {
+    // A path with no `%` is returned without a copy.
+    if (string.find(s, "%") < 0) { return s; }
+
+    String[] parts = [];
+    int i = 0;
+    int n = string.length(s);
+    while (i < n) {
+        String c = string.substring(s, i, i + 1);
+        if (c == "%" && i + 3 <= n) {
+            int v = hexValue(string.substring(s, i + 1, i + 3)) catch -1;
+            if (v >= 0) {
+                array.push(parts, byteText(v));
+                i = i + 3;
+                continue;
+            }
+        }
+        array.push(parts, c);
+        i++;
+    }
+    // string.join, because appending with `+` in a loop is quadratic: the n-ary
+    // fold of §6.6 applies only within one expression.
+    return string.join(parts, "");
+}
+
+// Escapes every byte outside the unreserved set of RFC 3986, as a query value
+// needs.
+export String percentEncode(String s) {
+    String[] parts = [];
+    byte[] raw = string.toByteArray(s);
+    forEach(raw, b) {
+        int v = b;
+        bool plain = (v >= 48 && v <= 57) || (v >= 65 && v <= 90) || (v >= 97 && v <= 122);
+        if (plain || v == 45 || v == 46 || v == 95 || v == 126) {
+            array.push(parts, byteText(v));
+            continue;
+        }
+        // The digits come from an upper-case table. Upper-casing the result
+        // would also change the literal characters.
+        array.push(parts, "%");
+        array.push(parts, string.substring(HEXUP, v / 16, v / 16 + 1));
+        array.push(parts, string.substring(HEXUP, v % 16, v % 16 + 1));
+    }
+    return string.join(parts, "");
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+// The request a handler gets. `path` is percent-decoded and `query` is not.
+// Decoding a query before it is split loses the difference between a separator
+// and an escaped one.
+export type Request {
+    Method method;
+    String path;
+    String query;
+    Map<String, String> headers;
+    Map<String, String> params;
+
+    // The whole body, for a route registered with `route`. The server reads it
+    // before the handler runs, up to `Options.maxBody`. For a route registered
+    // with `routeStream` it is empty, and the handler reads through `read`.
+    byte[] body;
+    String peer;
+
+    // Answers the next piece of the body, or an empty array at the end. On a
+    // buffered route it answers `body` once, so one handler can serve both
+    // kinds of route.
+    Function()<Future<byte[]!>> read;
+
+    // The limit that `bytes` and `text` apply: the server's `maxBody`.
+    int? maxBody;
+
+    // The whole body. On a buffered route this is `body`. On a streaming route
+    // it reads to the end. A body over the limit raises TOO_LARGE and is not
+    // truncated, because a truncated body can still parse as a complete one.
+    byte[] async bytes() {
+        // A buffered route holds the body already. Reading it again through the
+        // stream would copy it twice.
+        if (self.body.length > 0) {
+            return self.body;
+        }
+        return await drainAll(self.read, self.maxBody);
+    }
+
+    String async text() {
+        return string.fromByteArray(await self.bytes());
+    }
+}
+
+// The producer of a streamed body: a closure that answers the next piece, or an
+// empty array at the end.
+//
+// It is a union because a producer that cannot fail and one that can are two
+// different types. Function types are structural and assign only when equal
+// (§2.6). The coercion of §2.9 does not apply inside a future. So no single
+// function type accepts both. §2.10 rule 7 selects the member from the value a
+// caller gives, so no call site names a tag.
+export union BodyStream {
+    Function()<Future<byte[]>> Plain,
+    Function()<Future<byte[]!>> Raising }
+
+// The response a handler returns. No field is a future, so a handler that does
+// no I/O does not use the scheduler.
+export type Response {
+    int status;
+    Map<String, String> headers;
+    byte[] body;
+
+    // A body written in pieces. When it is set, the server frames the response
+    // as chunked, calls it until it answers an empty array, and ignores `body`.
+    // It is optional, so a response literal that does not stream leaves it out
+    // (§2.4).
+    //
+    // A producer that never answers an empty array makes a response that never
+    // ends, such as a stream of server-sent events.
+    BodyStream? stream;
+}
+
+// The response the client gets. `setCookies` is separate because `Set-Cookie`
+// can repeat and its value can hold commas, so it cannot be folded into one
+// value.
+//
+// The body is a stream, so the caller decides how much to keep. `bytes` and `text` read the whole body, up to
+// `ClientOptions.maxBody`.
+export type ClientResponse {
+    int status;
+    String reason;
+    Map<String, String> headers;
+    String[] setCookies;
+
+    // Answers the next piece of the body, or an empty array at the end. The
+    // connection stays open until the body ends, and then closes.
+    Function()<Future<byte[]!>> read;
+
+    // Discards the rest of the body and closes the connection. If a response is
+    // neither read to the end nor closed, the weak hook of the collector closes
+    // its socket when nothing refers to it (§6.20). Until a collection runs,
+    // the descriptor stays open.
+    //
+    // It is safe to call after the body ended: `net.close` does nothing for a
+    // socket that is already closed.
+    Function()<void> close;
+
+    // The limit that `bytes` and `text` apply. Null means no limit.
+    int? maxBody;
+
+    byte[] async bytes() {
+        byte[] all = await drainAll(self.read, self.maxBody) catch e {
+            self.close();
+            return e;
+        };
+        return all;
+    }
+
+    String async text() {
+        return string.fromByteArray(await self.bytes());
+    }
+}
+
+// A `text/plain` response that holds `body`.
+export Response text(int status, String body) {
+    return {
+        status: status,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+        body: string.toByteArray(body),
+    };
+}
+
+// A response that holds already-encoded JSON. It takes text and not a `Json`,
+// because a program usually holds a record, and `json.toText` encodes one.
+export Response json(int status, String encoded) {
+    return {
+        status: status,
+        headers: { "content-type": "application/json" },
+        body: string.toByteArray(encoded),
+    };
+}
+
+// Raw bytes, with no content type. Set one with `setHeader` when it matters.
+export Response bytes(int status, byte[] body) {
+    return { status: status, headers: {}, body: body };
+}
+
+// A response whose body is sent in pieces. `produce` answers the next piece, or
+// an empty array to end the body. This module adds the framing. Set the content
+// type with `setHeader`: `text/event-stream` makes the response a server-sent
+// event stream.
+export Response stream(int status, BodyStream produce) {
+    return { status: status, headers: {}, body: [], stream: produce };
+}
+
+// A redirect to `location` with the given status.
+export Response redirect(int status, String location) {
+    return {
+        status: status,
+        headers: { "location": location },
+        body: string.toByteArray(""),
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Header maps
+// ---------------------------------------------------------------------------
+
+// The value of header `name` in h, or null. Header names are case-insensitive,
+// so every map in this module uses the lower-cased name as its key. Use this
+// function for every lookup.
+export String? getHeader(Map<String, String> h, String name) {
+    return h[string.toLowerCaseAscii(name)];
+}
+
+export void setHeader(Map<String, String> h, String name, String value) {
+    h[string.toLowerCaseAscii(name)] = value;
+}
+
+// Adds a header. A repeated header is appended to the existing value after a
+// comma, which RFC 9110 defines as the same list. The parsers collect
+// `Set-Cookie` separately, so it never gets here.
+void addHeader(Map<String, String> h, String name, String value) {
+    String key = string.toLowerCaseAscii(name);
+    String? had = h[key];
+    if (had == null) {
+        h[key] = value;
+        return;
+    }
+    h[key] = had + ", " + value;
+}
+
+// ---------------------------------------------------------------------------
+// Parsing: the request line
+// ---------------------------------------------------------------------------
+
+export type RequestLine {
+    Method method;
+    String path;
+    String query;
+    bool keepAlive;    // what the version implies, before the headers are read
+}
+
+Method parseMethod(String s) {
+    if (s == "GET") { return Method.GET; }
+    if (s == "POST") { return Method.POST; }
+    if (s == "PUT") { return Method.PUT; }
+    if (s == "DELETE") { return Method.DELETE; }
+    if (s == "PATCH") { return Method.PATCH; }
+    if (s == "HEAD") { return Method.HEAD; }
+    if (s == "OPTIONS") { return Method.OPTIONS; }
+    return Error("unsupported method \"" + s + "\"", ErrorCode.MALFORMED_REQUEST);
+}
+
+// Reads `GET /path?q HTTP/1.1`.
+export RequestLine parseRequestLine(String line) {
+    if (string.length(line) > MAX_LINE) {
+        return Error("request line too long", ErrorCode.TOO_LARGE);
+    }
+    int sp1 = string.find(line, " ");
+    if (sp1 <= 0) {
+        return Error("malformed request line", ErrorCode.MALFORMED_REQUEST);
+    }
+    Method m = parseMethod(string.substring(line, 0, sp1));
+
+    String rest = string.substring(line, sp1 + 1, string.length(line));
+    int sp2 = string.find(rest, " ");
+    if (sp2 <= 0) {
+        return Error("malformed request line", ErrorCode.MALFORMED_REQUEST);
+    }
+    String target = string.substring(rest, 0, sp2);
+    String version = string.substring(rest, sp2 + 1, string.length(rest));
+
+    bool keep = true;
+    if (version == "HTTP/1.0") {
+        keep = false;    // HTTP/1.0 closes unless a header asks to keep alive
+    } else if (version != "HTTP/1.1") {
+        return Error("unsupported version \"" + version + "\"", ErrorCode.MALFORMED_REQUEST);
+    }
+
+    String path = target;
+    String query = "";
+    int q = string.find(target, "?");
+    if (q >= 0) {
+        path = string.substring(target, 0, q);
+        query = string.substring(target, q + 1, string.length(target));
+    }
+    if (string.length(path) == 0) {
+        return Error("empty request target", ErrorCode.MALFORMED_REQUEST);
+    }
+    return { method: m, path: percentDecode(path), query: query, keepAlive: keep };
+}
+
+// ---------------------------------------------------------------------------
+// Parsing: the status line
+// ---------------------------------------------------------------------------
+
+export type StatusLine {
+    int status;
+    String reason;
+}
+
+// Reads `HTTP/1.1 200 OK`. The reason phrase is optional and can hold spaces,
+// so it is all the text after the code.
+export StatusLine parseStatusLine(String line) {
+    if (string.length(line) > MAX_LINE) {
+        return Error("status line too long", ErrorCode.TOO_LARGE);
+    }
+    int sp1 = string.find(line, " ");
+    if (sp1 <= 0) {
+        return Error("malformed status line", ErrorCode.MALFORMED_RESPONSE);
+    }
+    String version = string.substring(line, 0, sp1);
+    if (version != "HTTP/1.1" && version != "HTTP/1.0") {
+        return Error("unsupported version \"" + version + "\"", ErrorCode.MALFORMED_RESPONSE);
+    }
+    String rest = string.substring(line, sp1 + 1, string.length(line));
+    int sp2 = string.find(rest, " ");
+    String code = rest;
+    String reason = "";
+    if (sp2 >= 0) {
+        code = string.substring(rest, 0, sp2);
+        reason = string.substring(rest, sp2 + 1, string.length(rest));
+    }
+    int status = string.toInt(code) catch e {
+        return Error("malformed status code \"" + code + "\"", ErrorCode.MALFORMED_RESPONSE);
+    };
+    if (status < 100 || status > 599) {
+        return Error(`status out of range: ${status}`, ErrorCode.MALFORMED_RESPONSE);
+    }
+    return { status: status, reason: reason };
+}
+
+// ---------------------------------------------------------------------------
+// Parsing: the header block
+// ---------------------------------------------------------------------------
+
+// `setCookies` is empty for a request.
+export type HeaderBlock {
+    Map<String, String> headers;
+    String[] setCookies;
+}
+
+// Reads the lines between the first line and the blank one.
+export HeaderBlock parseHeaders(String[] lines) {
+    Map<String, String> h = {};
+    String[] cookies = [];
+    if (lines.length > MAX_HEADERS) {
+        return Error(`too many headers (${lines.length})`, ErrorCode.TOO_LARGE);
+    }
+    forEach(lines, line) {
+        if (string.length(line) == 0) { continue; }
+        if (string.length(line) > MAX_LINE) {
+            return Error("header line too long", ErrorCode.TOO_LARGE);
+        }
+        // A leading space or tab starts an obs-fold continuation, which RFC
+        // 9112 says a recipient must reject.
+        String lead = string.substring(line, 0, 1);
+        if (lead == " " || lead == "\t") {
+            return Error("obsolete line folding in header block", ErrorCode.MALFORMED_REQUEST);
+        }
+        int c = string.find(line, ":");
+        if (c <= 0) {
+            return Error("malformed header line \"" + line + "\"", ErrorCode.MALFORMED_REQUEST);
+        }
+        String name = string.substring(line, 0, c);
+        String value = string.trim(string.substring(line, c + 1, string.length(line)));
+        if (string.toLowerCaseAscii(name) == "set-cookie") {
+            array.push(cookies, value);
+            continue;
+        }
+        addHeader(h, name, value);
+    }
+    return { headers: h, setCookies: cookies };
+}
+
+// ---------------------------------------------------------------------------
+// Parsing: bodies
+// ---------------------------------------------------------------------------
+
+// How a message gives the length of its body. With neither framing, a response
+// ends when the connection closes and a request has no body.
+export type Framing {
+    bool chunked;
+    int length;    // -1 when unknown
+}
+
+// Reads `Transfer-Encoding` and `Content-Length`. A message with both is
+// rejected, as RFC 9112 requires, because that pair is how request smuggling is
+// done.
+export Framing framingOf(Map<String, String> h) {
+    String? te = h["transfer-encoding"];
+    String? cl = h["content-length"];
+    if (te != null && cl != null) {
+        return Error("both Transfer-Encoding and Content-Length", ErrorCode.MALFORMED_REQUEST);
+    }
+    if (te != null) {
+        if (string.toLowerCaseAscii(te) != "chunked") {
+            return Error("unsupported transfer encoding \"" + te + "\"", ErrorCode.MALFORMED_REQUEST);
+        }
+        return { chunked: true, length: -1 };
+    }
+    if (cl != null) {
+        int n = string.toInt(cl) catch e {
+            return Error("malformed Content-Length \"" + cl + "\"", ErrorCode.MALFORMED_REQUEST);
+        };
+        if (n < 0) {
+            return Error("negative Content-Length", ErrorCode.MALFORMED_REQUEST);
+        }
+        return { chunked: false, length: n };
+    }
+    return { chunked: false, length: -1 };
+}
+
+// The result of decodeChunked. `consumed` is how many bytes of the caller's
+// buffer the body used.
+export type Chunked {
+    String body;
+    int consumed;
+    bool complete;
+}
+
+// Decodes as many complete chunks as `s` holds, from offset `start`. When the
+// zero-length last chunk has not arrived, it answers `complete: false`, and the
+// caller reads more and calls again. It keeps no state between calls.
+//
+// A null `maxBody` means no limit. The client has no limit by default. The
+// server always has one.
+export Chunked decodeChunked(String s, int start, int? maxBody) {
+    String[] parts = [];
+    int total = 0;
+    int i = start;
+    int n = string.length(s);
+    while (true) {
+        int eol = findFrom(s, CRLF, i);
+        if (eol < 0) { return { body: "", consumed: 0, complete: false }; }
+
+        // A chunk size can have extensions after a `;`. They are ignored.
+        String head = string.substring(s, i, eol);
+        int semi = string.find(head, ";");
+        if (semi >= 0) { head = string.substring(head, 0, semi); }
+        int size = hexValue(string.trim(head));
+
+        int dataStart = eol + 2;
+        if (size == 0) {
+            // The trailer section, then a blank line. Trailers are skipped.
+            int end = findFrom(s, CRLF, dataStart);
+            while (end >= 0 && end != dataStart) {
+                dataStart = end + 2;
+                end = findFrom(s, CRLF, dataStart);
+            }
+            if (end < 0) { return { body: "", consumed: 0, complete: false }; }
+            return { body: string.join(parts, ""), consumed: end + 2 - start, complete: true };
+        }
+
+        total = total + size;
+        int? cap = maxBody;
+        if (cap != null && total > cap) {
+            return Error(`body larger than ${cap} bytes`, ErrorCode.TOO_LARGE);
+        }
+        if (dataStart + size + 2 > n) {
+            return { body: "", consumed: 0, complete: false };
+        }
+        array.push(parts, string.substring(s, dataStart, dataStart + size));
+        i = dataStart + size + 2;
+    }
+    return { body: "", consumed: 0, complete: false };
+}
+
+// `string.find` from offset `from`. It searches a copy of the rest of s, so its
+// cost is the length after `from`.
+int findFrom(String s, String sub, int from) {
+    int n = string.length(s);
+    if (from >= n) { return -1; }
+    int at = string.find(string.substring(s, from, n), sub);
+    if (at < 0) { return -1; }
+    return from + at;
+}
+
+// ---------------------------------------------------------------------------
+// Query strings
+// ---------------------------------------------------------------------------
+
+// Splits `a=1&b=2` into a map. A key with no `=` maps to the empty string. `+`
+// decodes to a space, as in a form-encoded body.
+export Map<String, String> parseQuery(String query) {
+    Map<String, String> out = {};
+    if (string.length(query) == 0) { return out; }
+    forEach(string.split(query, "&"), pair) {
+        if (string.length(pair) == 0) { continue; }
+        int eq = string.find(pair, "=");
+        if (eq < 0) {
+            out[formDecode(pair)] = "";
+            continue;
+        }
+        out[formDecode(string.substring(pair, 0, eq))] =
+            formDecode(string.substring(pair, eq + 1, string.length(pair)));
+    }
+    return out;
+}
+
+String formDecode(String s) {
+    return percentDecode(string.replaceAll(s, "+", " "));
+}
+
+// ---------------------------------------------------------------------------
+// URLs
+// ---------------------------------------------------------------------------
+
+export type Url {
+    String scheme;
+    String host;
+    int port;
+    String path;
+    String query;
+}
+
+// Splits an absolute URL. The port defaults to the one for the scheme and the
+// path to `/`, so the result can go on the wire as it is.
+export Url parseUrl(String url) {
+    int i = string.find(url, "://");
+    if (i <= 0) {
+        return Error("no scheme in \"" + url + "\"", ErrorCode.MALFORMED_REQUEST);
+    }
+    String scheme = string.toLowerCaseAscii(string.substring(url, 0, i));
+    String rest = string.substring(url, i + 3, string.length(url));
+
+    // A fragment is never sent.
+    int hash = string.find(rest, "#");
+    if (hash >= 0) { rest = string.substring(rest, 0, hash); }
+
+    String query = "";
+    int q = string.find(rest, "?");
+    if (q >= 0) {
+        query = string.substring(rest, q + 1, string.length(rest));
+        rest = string.substring(rest, 0, q);
+    }
+
+    String path = "/";
+    int slash = string.find(rest, "/");
+    if (slash >= 0) {
+        path = string.substring(rest, slash, string.length(rest));
+        rest = string.substring(rest, 0, slash);
+    }
+
+    int port = 80;
+    if (scheme == "https") { port = 443; }
+    String host = rest;
+
+    if (string.find(rest, "[") == 0) {
+        // An IPv6 literal, whose colons are not a port separator.
+        int close = string.find(rest, "]");
+        if (close < 0) {
+            return Error("unterminated IPv6 host in \"" + url + "\"", ErrorCode.MALFORMED_REQUEST);
+        }
+        host = string.substring(rest, 1, close);
+        String after = string.substring(rest, close + 1, string.length(rest));
+        if (string.find(after, ":") == 0) {
+            port = parsePort(string.substring(after, 1, string.length(after)));
+        }
+    } else {
+        int colon = string.find(rest, ":");
+        if (colon >= 0) {
+            host = string.substring(rest, 0, colon);
+            port = parsePort(string.substring(rest, colon + 1, string.length(rest)));
+        }
+    }
+    if (string.length(host) == 0) {
+        return Error("no host in \"" + url + "\"", ErrorCode.MALFORMED_REQUEST);
+    }
+    return { scheme: scheme, host: host, port: port, path: path, query: query };
+}
+
+int parsePort(String s) {
+    int p = string.toInt(s) catch e {
+        return Error("malformed port \"" + s + "\"", ErrorCode.MALFORMED_REQUEST);
+    };
+    if (p < 1 || p > 65535) {
+        return Error(`port out of range: ${p}`, ErrorCode.MALFORMED_REQUEST);
+    }
+    return p;
+}
+
+// ---------------------------------------------------------------------------
+// Status reasons
+// ---------------------------------------------------------------------------
+
+// The reason phrase a server writes. A client should ignore it (RFC 9110), so
+// an unlisted status gets the generic phrase for its class.
+export String reasonFor(int status) {
+    if (status == 200) { return "OK"; }
+    if (status == 201) { return "Created"; }
+    if (status == 204) { return "No Content"; }
+    if (status == 301) { return "Moved Permanently"; }
+    if (status == 302) { return "Found"; }
+    if (status == 304) { return "Not Modified"; }
+    if (status == 400) { return "Bad Request"; }
+    if (status == 401) { return "Unauthorized"; }
+    if (status == 403) { return "Forbidden"; }
+    if (status == 404) { return "Not Found"; }
+    if (status == 405) { return "Method Not Allowed"; }
+    if (status == 408) { return "Request Timeout"; }
+    if (status == 413) { return "Content Too Large"; }
+    if (status == 500) { return "Internal Server Error"; }
+    if (status == 502) { return "Bad Gateway"; }
+    if (status == 503) { return "Service Unavailable"; }
+    if (status < 200) { return "Informational"; }
+    if (status < 300) { return "Success"; }
+    if (status < 400) { return "Redirection"; }
+    if (status < 500) { return "Client Error"; }
+    return "Server Error";
+}
+
+// ---------------------------------------------------------------------------
+// Conn: the transport that every byte goes through
+// ---------------------------------------------------------------------------
+
+// A byte stream, as a record of closures. A `sealed` hierarchy would need a
+// type switch at every read, because §2.4 refuses a method call on a value
+// whose static type is the sealed base. Built-in functions are not values
+// (§3.4), so each constructor wraps `net.read` and `net.write` in a lambda.
+export type Conn {
+    Function(int)<Future<byte[]!>> read;
+    Function(byte[])<Future<void!>> write;
+    Function()<void> close;
+    String peer;
+
+    // Reads exactly n bytes in one future. A body read with a known length uses
+    // it: one parked operation instead of one per READ_CHUNK. A transport
+    // without such a call leaves it null, and Body reads in READ_CHUNK pieces.
+    Function(int)<Future<byte[]!>>? readExactly;
+}
+
+export Conn tcpConn(Socket s) {
+    return {
+        read: Future<byte[]!> (int n) -> net.read(s, n),
+        write: Future<void!> (byte[] b) -> net.write(s, b),
+        close: void () -> net.close(s),
+        peer: net.peer(s) catch "",
+        readExactly: Future<byte[]!> (int n) -> net.readExactly(s, n),
+    };
+}
+
+// A Conn over a TLS connection. `readExactly` is null because a TLS read gives
+// one whole record, decrypted and authenticated, so the layer below cannot fill
+// a caller's count in place.
+//
+// `close` starts the TLS close and does not wait for it. Conn.close is
+// synchronous, and a TLS close must write close_notify (§6.18). `async.run`
+// gives it to the scheduler, which main drains before exit.
+export Conn tlsConn(tls.Conn t, String peer) {
+    return {
+        read: Future<byte[]!> (int n) -> t.read(n),
+        write: Future<void!> (byte[] b) -> t.write(b),
+        close: void () -> { async.run(t.close(), void () -> { }); },
+        peer: peer,
+        readExactly: null,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Reader: a buffer over a Conn
+// ---------------------------------------------------------------------------
+
+// Buffers a Conn. A message does not arrive in the pieces it is made of, so
+// Reader keeps the bytes left over. A Body reads through it, so the bytes a
+// body does not use start the next message.
+//
+// Only the header scan appends to `buf` with `+`, and MAX_HEADER_BYTES limits
+// it. The n-ary fold of §6.6 applies only within one expression, so appending
+// that way over a 10 MB body would copy gigabytes.
+type Reader {
+    Conn conn;
+    String buf;
+
+    // Reads up to the blank line and answers the text before it. `buf` then
+    // starts at the body. A close between messages raises END_OF_FILE, which
+    // ends a keep-alive loop. A close inside a message raises
+    // MALFORMED_REQUEST.
+    String async headerBlock() {
+        int scanned = 0;
+        while (true) {
+            int at = findFrom(self.buf, CRLF2, scanned);
+            if (at >= 0) {
+                String block = string.substring(self.buf, 0, at);
+                self.buf = string.substring(self.buf, at + 4, string.length(self.buf));
+                return block;
+            }
+            if (string.length(self.buf) > MAX_HEADER_BYTES) {
+                return Error(`header block over ${MAX_HEADER_BYTES} bytes`,
+                    ErrorCode.TOO_LARGE);
+            }
+            // Resume three bytes back, because the terminator can cross the
+            // join.
+            scanned = string.length(self.buf) - 3;
+            if (scanned < 0) { scanned = 0; }
+
+            byte[] b = await self.conn.read(READ_CHUNK);
+            if (b.length == 0) {
+                if (string.length(self.buf) == 0) {
+                    return Error("connection closed", net.ErrorCode.END_OF_FILE);
+                }
+                return Error("connection closed mid-headers", ErrorCode.MALFORMED_REQUEST);
+            }
+            self.buf = self.buf + string.fromByteArray(b);
+        }
+        return "";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Body: a message body, in pieces
+// ---------------------------------------------------------------------------
+
+// A message body, read in pieces. `next` answers the next piece, or an empty
+// array at the end. A program gets a closure over a Body. So a body can go from
+// one direction to another without being held whole, for example from a client
+// response into a streamed server response.
+//
+// The fields give the framing. `held` is a body already read. `chunked` is
+// chunked framing. `left` at 0 or more is the Content-Length still to read.
+// `left` below 0 means the close ends the body.
+type Body {
+    Reader rd;
+    byte[]? held;    // a body already read: answered once, then nothing
+    int left;        // bytes still to read; below 0 the close ends the body
+    bool chunked;
+    bool done;
+    int chunkLeft;    // data bytes left in the chunk being delivered
+    bool needCrlf;    // the CRLF after the chunk data is not read yet
+
+    byte[] async next() {
+        if (self.done) { return []; }
+
+        byte[]? inHand = self.held;
+        if (inHand != null) {
+            self.held = null;
+            self.done = true;
+            return inHand;
+        }
+
+        if (self.chunked) { return await self.nextChunk(); }
+        if (self.left == 0) {
+            self.done = true;
+            return [];
+        }
+        if (self.left > 0) { return await self.nextCounted(); }
+        return await self.nextToClose();
+    }
+
+    // Content-Length framing. It never asks for more than is still to read, so
+    // a read cannot take bytes of the next message.
+    //
+    // When the transport has a bulk read, the body uses it: BODY_ASK bytes per
+    // parked operation instead of READ_CHUNK.
+    byte[] async nextCounted() {
+        int have = string.length(self.rd.buf);
+        if (have > 0) {
+            int take = self.left;
+            if (take > have) { take = have; }
+            String piece = string.substring(self.rd.buf, 0, take);
+            self.rd.buf = string.substring(self.rd.buf, take, have);
+            self.left = self.left - take;
+            if (self.left == 0) { self.done = true; }
+            return string.toByteArray(piece);
+        }
+
+        int ask = self.left;
+        if (ask > BODY_ASK) { ask = BODY_ASK; }
+        Function(int)<Future<byte[]!>>? bulk = self.rd.conn.readExactly;
+        if (bulk != null) {
+            byte[] b = await bulk(ask);
+            self.left = self.left - b.length;
+            if (self.left == 0) { self.done = true; }
+            return b;
+        }
+
+        if (ask > READ_CHUNK) { ask = READ_CHUNK; }
+        byte[] b = await self.rd.conn.read(ask);
+        if (b.length == 0) {
+            return Error("connection closed mid-body", ErrorCode.MALFORMED_REQUEST);
+        }
+        self.left = self.left - b.length;
+        if (self.left == 0) { self.done = true; }
+        return b;
+    }
+
+    // The close ends the body, so a close is the end and not an error.
+    byte[] async nextToClose() {
+        int have = string.length(self.rd.buf);
+        if (have > 0) {
+            String piece = self.rd.buf;
+            self.rd.buf = "";
+            return string.toByteArray(piece);
+        }
+        byte[] b = await self.rd.conn.read(READ_CHUNK);
+        if (b.length == 0) {
+            self.done = true;
+            return [];
+        }
+        return b;
+    }
+
+    // Chunked framing. It answers data in the pieces that arrived, not in the
+    // chunk sizes the peer declared. A large chunk is answered in parts, so a
+    // declared size does not control how much this holds.
+    byte[] async nextChunk() {
+        while (true) {
+            if (self.chunkLeft > 0) {
+                int have = string.length(self.rd.buf);
+                if (have == 0) {
+                    await self.fill();
+                    continue;
+                }
+                int take = self.chunkLeft;
+                if (take > have) { take = have; }
+                String piece = string.substring(self.rd.buf, 0, take);
+                self.rd.buf = string.substring(self.rd.buf, take, have);
+                self.chunkLeft = self.chunkLeft - take;
+                if (self.chunkLeft == 0) { self.needCrlf = true; }
+                return string.toByteArray(piece);
+            }
+
+            if (self.needCrlf) {
+                while (string.length(self.rd.buf) < 2) { await self.fill(); }
+                if (string.substring(self.rd.buf, 0, 2) != CRLF) {
+                    return Error("chunk not ended by CRLF", ErrorCode.MALFORMED_REQUEST);
+                }
+                self.rd.buf = string.substring(self.rd.buf, 2, string.length(self.rd.buf));
+                self.needCrlf = false;
+            }
+
+            int eol = findFrom(self.rd.buf, CRLF, 0);
+            if (eol < 0) {
+                if (string.length(self.rd.buf) > MAX_LINE) {
+                    return Error(`chunk size line over ${MAX_LINE} bytes`,
+                        ErrorCode.MALFORMED_REQUEST);
+                }
+                await self.fill();
+                continue;
+            }
+
+            // A chunk size can have extensions after a `;`. They are ignored.
+            String head = string.substring(self.rd.buf, 0, eol);
+            int semi = string.find(head, ";");
+            if (semi >= 0) { head = string.substring(head, 0, semi); }
+            int size = hexValue(string.trim(head));
+            self.rd.buf = string.substring(self.rd.buf, eol + 2, string.length(self.rd.buf));
+            if (size == 0) { return await self.trailer(); }
+            self.chunkLeft = size;
+        }
+        return [];
+    }
+
+    // The trailer section after the zero-length chunk, up to the blank line.
+    // Trailers are skipped.
+    byte[] async trailer() {
+        while (true) {
+            int eol = findFrom(self.rd.buf, CRLF, 0);
+            if (eol == 0) {
+                self.rd.buf = string.substring(self.rd.buf, 2, string.length(self.rd.buf));
+                self.done = true;
+                return [];
+            }
+            if (eol > 0) {
+                self.rd.buf = string.substring(self.rd.buf, eol + 2, string.length(self.rd.buf));
+                continue;
+            }
+            if (string.length(self.rd.buf) > MAX_HEADER_BYTES) {
+                return Error(`trailer over ${MAX_HEADER_BYTES} bytes`,
+                    ErrorCode.MALFORMED_REQUEST);
+            }
+            await self.fill();
+        }
+        return [];
+    }
+
+    // Appends one read to the buffer. A close here ends a message inside its
+    // framing, so it is malformed.
+    void async fill() {
+        byte[] b = await self.rd.conn.read(READ_CHUNK);
+        if (b.length == 0) {
+            return Error("connection closed mid-body", ErrorCode.MALFORMED_REQUEST);
+        }
+        self.rd.buf = self.rd.buf + string.fromByteArray(b);
+    }
+
+    // Reads and discards the rest of the body, up to `limit` bytes. Answers
+    // true if the body ended. If it did not, the connection cannot be used
+    // again.
+    bool async drain(int limit) {
+        int total = 0;
+        while (true) {
+            byte[] piece = await self.next() catch e { return false; };
+            if (piece.length == 0) { return true; }
+            total = total + piece.length;
+            if (total > limit) { return false; }
+        }
+        return true;
+    }
+}
+
+// A body of length n. A length of zero gives a body that is already done, as
+// for a request with no framing headers or a 204 response.
+Body counted(Reader rd, int n) {
+    return {
+        rd: rd, held: null, left: n, chunked: false, done: n == 0,
+        chunkLeft: 0, needCrlf: false,
+    };
+}
+
+Body chunkedBody(Reader rd) {
+    return {
+        rd: rd, held: null, left: -1, chunked: true, done: false,
+        chunkLeft: 0, needCrlf: false,
+    };
+}
+
+// A body that the close ends: no length and no chunks. It is read until the
+// peer closes.
+Body toCloseBody(Reader rd) {
+    return {
+        rd: rd, held: null, left: -1, chunked: false, done: false,
+        chunkLeft: 0, needCrlf: false,
+    };
+}
+
+// A body already read, answered once. Nothing is copied and the connection is
+// not used, so `read` costs nothing on a buffered route.
+Body heldBody(Reader rd, byte[] b) {
+    return {
+        rd: rd, held: b, left: 0, chunked: false, done: false,
+        chunkLeft: 0, needCrlf: false,
+    };
+}
+
+// The body that a message's framing describes. With neither framing header, a
+// request has no body and a response ends at the close. `toClose` tells which
+// of the two this is.
+Body bodyFor(Reader rd, Framing f, bool toClose) {
+    if (f.chunked) { return chunkedBody(rd); }
+    if (f.length > 0) { return counted(rd, f.length); }
+    if (f.length < 0 && toClose) { return toCloseBody(rd); }
+    return counted(rd, 0);
+}
+
+// Reads the rest of a body into one array. `cap` is the limit, and null means
+// no limit. A body over the limit raises TOO_LARGE and is not truncated,
+// because a truncated body can still parse as a complete one.
+//
+// The pieces are joined once at the end. The n-ary fold of §6.6 applies only
+// within one expression, so `all = all + piece` over a 10 MB body would copy
+// gigabytes.
+byte[] async drainAll(Function()<Future<byte[]!>> read, int? cap) {
+    String[] parts = [];
+    int total = 0;
+    while (true) {
+        byte[] piece = await read();
+        if (piece.length == 0) { break; }
+        total = total + piece.length;
+        int? limit = cap;
+        if (limit != null && total > limit) {
+            return Error(`body over ${limit} bytes`, ErrorCode.TOO_LARGE);
+        }
+        array.push(parts, string.fromByteArray(piece));
+    }
+    return string.toByteArray(string.join(parts, ""));
+}
+
+// ---------------------------------------------------------------------------
+// Writing a message
+// ---------------------------------------------------------------------------
+
+// The status line, the headers, and the blank line that ends them.
+String headText(Response r, bool keepAlive) {
+    if (keepAlive) {
+        setHeader(r.headers, "connection", "keep-alive");
+    } else {
+        setHeader(r.headers, "connection", "close");
+    }
+
+    String[] out = [];
+    array.push(out, "HTTP/1.1 " + string.from(r.status) + " " + reasonFor(r.status) + CRLF);
+    forEach(map.keys(r.headers), k) {
+        String? v = r.headers[k];
+        if (v == null) { continue; }
+        array.push(out, k + ": " + v + CRLF);
+    }
+    array.push(out, CRLF);
+    return string.join(out, "");
+}
+
+// Encodes a response. It always writes `Content-Length`, which makes the
+// framing clear: a handler answers a whole body, so its length is known.
+byte[] encodeResponse(Response r, bool keepAlive, bool headOnly) {
+    setHeader(r.headers, "content-length", string.from(r.body.length));
+    String head = headText(r, keepAlive);
+    // A HEAD response has the headers of the GET, Content-Length included, and
+    // no body (RFC 9110). The body is dropped here, not by the handler.
+    if (headOnly) { return string.toByteArray(head); }
+    return string.toByteArray(head + string.fromByteArray(r.body));
+}
+
+// The head of a streamed response. The length is not known when the head is
+// sent, so the framing is chunked. A `Content-Length` from the handler is
+// removed, because it does not describe this body.
+byte[] streamHead(Response r, bool keepAlive) {
+    map.remove(r.headers, "content-length");
+    setHeader(r.headers, "transfer-encoding", "chunked");
+    return string.toByteArray(headText(r, keepAlive));
+}
+
+// One chunk: its size in hex, the bytes, and the CRLF that ends them.
+byte[] encodeChunk(byte[] piece) {
+    return string.toByteArray(hexSize(piece.length) + CRLF
+        + string.fromByteArray(piece) + CRLF);
+}
+
+// The zero-length chunk and an empty trailer section, which end a chunked body.
+// A body that stops without it is truncated for the peer. A producer that fails
+// mid-stream has no other way to signal the failure.
+String const END_CHUNK = "0\r\n\r\n";
+
+// A chunk size in hexadecimal, with no leading zeros.
+String hexSize(int n) {
+    if (n == 0) { return "0"; }
+    String out = "";
+    int v = n;
+    while (v > 0) {
+        int d = v % 16;
+        out = string.substring(HEX, d, d + 1) + out;
+        v = v / 16;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Routing
+// ---------------------------------------------------------------------------
+
+// A handler answers a response directly or through a future. Function types are
+// structural and assign only when equal (§2.6), so no single function type
+// accepts both. A union does.
+//
+// The `Sync` member is fallible and the `Async` member is not. §2.9 coerces a
+// function value into a fallible function type, so `Sync` accepts a handler
+// that raises and one that does not. A raise becomes a 500. That coercion does
+// not apply inside a future (§2.7), so an async handler must handle its own
+// failures.
+export union ResponseFunction {
+    Function(Request)<Response!> Sync,
+    Function(Request)<Future<Response>> Async }
+
+// What a route matches: a path pattern split on "/", or a compiled RegExp for
+// what segments cannot express. Each member takes its tag from its type
+// (§2.11). Rule 7 wraps the value a caller gives.
+export union Pattern {
+    String,
+    RegExp }
+
+// One registered route. Only one of `segments` and `pattern` is set.
+//
+// `routeStream` sets `stream`. The server then does not read the request body
+// of this route, and the handler reads it through `Request.read`.
+type Route {
+    Method method;
+    String[] segments;
+    RegExp? pattern;
+    ResponseFunction fn;
+    bool stream;
+}
+
+// A route and the parameters its pattern captured. Matching comes before the
+// body is read, because the route decides whether to read it.
+type Match {
+    Route route;
+    Map<String, String> params;
+}
+
+// Splits a path on "/" and drops the empty piece before a leading "/", so
+// "/a/b" and "a/b" give the same result. A trailing "/" is kept.
+String[] splitPath(String p) {
+    String[] all = string.split(p, "/");
+    String[] out = [];
+    int i = 0;
+    forEach(all, piece) {
+        if (i == 0 && string.length(piece) == 0) { i++; continue; }
+        array.push(out, piece);
+        i++;
+    }
+    return out;
+}
+
+// The bound parameters, or null when the route does not match. Each call builds
+// a new map, so a failed match leaves no bindings.
+Map<String, String>? matchRoute(Route r, Method m, String path, String[] got) {
+    if (r.method != m) { return null; }
+
+    RegExp? re = r.pattern;
+    if (re != null) {
+        if (!regexp.match(path, re)) { return null; }
+        return {};
+    }
+
+    Map<String, String> params = {};
+    String[] want = r.segments;
+    int i = 0;
+    while (i < want.length) {
+        String w = want[i];
+        // "*" matches this segment and every one after it.
+        if (w == "*") { return params; }
+        if (i >= got.length) { return null; }
+        if (string.find(w, ":") == 0) {
+            params[string.substring(w, 1, string.length(w))] = got[i];
+        } else if (w != got[i]) {
+            return null;
+        }
+        i++;
+    }
+    if (got.length != want.length) { return null; }
+    return params;
+}
+
+// ---------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------
+
+export type Options {
+    Duration? timeout;
+    int? backlog;
+    int? maxBody;
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+export type Server {
+    Route[] routes;
+    Listener? listener;
+    int maxBody;
+    bool running;
+
+    // Registers handler h for requests with method m whose path matches p. `p`
+    // and `h` are unions (§2.11), and §2.10 rule 7 selects the member from what
+    // a caller gives, so no call site names a tag. A path pattern is split
+    // here, not per request.
+    void route(Method m, Pattern p, ResponseFunction h) {
+        self.add(m, p, h, false);
+    }
+
+    // Registers a handler that reads the request body itself. The server reads
+    // none of the body: `Request.body` is empty and `Request.read` answers the
+    // pieces as they arrive, so an upload is never held whole.
+    //
+    // This is not the default, because a handler that reads the body must
+    // await, and only a named async function can (§5.2). If every route
+    // streamed, no inline handler could be used. After the handler answers, the
+    // server reads and discards up to DRAIN_LIMIT unread bytes. If more remain,
+    // it closes the connection.
+    void routeStream(Method m, Pattern p, ResponseFunction h) {
+        self.add(m, p, h, true);
+    }
+
+    void add(Method m, Pattern p, ResponseFunction h, bool stream) {
+        switch (p) {
+            case Pattern.String path:
+                array.push(self.routes, {
+                    method: m, segments: splitPath(path), pattern: null, fn: h,
+                    stream: stream,
+                });
+            case Pattern.RegExp re:
+                array.push(self.routes, {
+                    method: m, segments: [], pattern: re, fn: h, stream: stream,
+                });
+        }
+    }
+
+    // The first route that matches a method and a path, with the parameters its
+    // pattern captured. The first match wins, so register a catch-all last.
+    Match? routeFor(Method m, String path) {
+        String[] got = splitPath(path);
+        forEach(self.routes, r) {
+            Map<String, String>? params = matchRoute(r, m, path, got);
+            if (params == null) { continue; }
+            return { route: r, params: params };
+        }
+        return null;
+    }
+
+    // Runs one route's handler.
+    Response async run(Route r, Request req) {
+        switch (r.fn) {
+            case ResponseFunction.Sync h: return h(req);
+            case ResponseFunction.Async a: return await a(req);
+        }
+    }
+
+    // Finds the route a request lands on and runs it.
+    Response async dispatch(Request req) {
+        Match? m = self.routeFor(req.method, req.path);
+        if (m == null) { return text(404, "not found"); }
+        Match hit = m;
+        req.params = hit.params;
+        return await self.run(hit.route, req);
+    }
+
+    // Binds the listener and answers the bound port, so a caller that asks for
+    // port 0 learns its port. It is synchronous and separate from `serve`,
+    // because a call to an async function does not run its body (§5.2). A
+    // program that starts `serve` with `async.run` would otherwise read
+    // `port()` before the bind.
+    int bind(String host, int port, Options? o) {
+        int backlog = 128;
+        Options? opts = o;
+        if (opts != null) {
+            int? b = opts.backlog;
+            if (b != null) { backlog = b; }
+            int? mb = opts.maxBody;
+            if (mb != null) { self.maxBody = mb; }
+        }
+        Listener l = net.tcp.listen(joinAddr(host, port), { backlog: backlog });
+        self.listener = l;
+        self.running = true;
+        return self.port();
+    }
+
+    // Accepts connections until `close`. Call `bind` first.
+    void async serve() {
+        Listener? bound = self.listener;
+        if (bound == null) {
+            return Error("serve before bind", ErrorCode.MALFORMED_REQUEST);
+        }
+        Listener l = bound;
+
+        while (self.running) {
+            Socket c = await net.accept(l) catch e {
+                if (!self.running) { break; }
+                // Running out of descriptors is temporary, because a finished
+                // connection releases one. It does not stop the server.
+                if (e.code == net.ErrorCode.TOO_MANY_FILES) { continue; }
+                if (e.code == net.ErrorCode.NOT_CONNECTED) { break; }
+                return e;
+            };
+            async.run(serveConn(self, tcpConn(c)), void () -> { });
+        }
+        net.close(l);
+    }
+
+    // Calls `bind`, then `serve`. A caller that must read `port()` between them
+    // calls the two itself.
+    void async listen(String host, int port, Options? o) {
+        self.bind(host, port, o);
+        await self.serve();
+    }
+
+    // The bound port. A caller that asked for port 0 reads its port here.
+    int port() {
+        Listener? l = self.listener;
+        if (l == null) { return 0; }
+        String a = net.address(l) catch "";
+        int c = lastIndexOf(a, ":");
+        if (c < 0) { return 0; }
+        return string.toInt(string.substring(a, c + 1, string.length(a))) catch 0;
+    }
+
+    // Stops the accept loop. Connections already being served finish.
+    void close() {
+        self.running = false;
+        Listener? l = self.listener;
+        if (l != null) { net.close(l); }
+        self.listener = null;
+    }
+}
+
+// A new server with no routes. Each call gives a separate server, so a program
+// can run two at once.
+export Server server() {
+    return { routes: [], listener: null, maxBody: MAX_BODY, running: false };
+}
+
+// Formats the address that `net` takes. It puts brackets around a bare IPv6
+// literal.
+String joinAddr(String host, int port) {
+    if (string.find(host, ":") >= 0 && string.find(host, "[") != 0) {
+        return "[" + host + "]:" + string.from(port);
+    }
+    return host + ":" + string.from(port);
+}
+
+int lastIndexOf(String s, String sub) {
+    int best = -1;
+    int at = string.find(s, sub);
+    int base = 0;
+    while (at >= 0) {
+        best = base + at;
+        base = best + 1;
+        if (base >= string.length(s)) { break; }
+        at = string.find(string.substring(s, base, string.length(s)), sub);
+    }
+    return best;
+}
+
+// ---------------------------------------------------------------------------
+// Serving one connection
+// ---------------------------------------------------------------------------
+
+// Serves requests on one connection until it closes or asks to close. It
+// catches every error: `async.run` refuses a fallible future (§6.8), and one
+// bad connection must not stop the program.
+//
+// `serveOne` is separate to limit memory. The locals of an async body live in
+// its heap frame while it runs. This function runs for the whole life of a
+// keep-alive connection, so a body held in its frame would stay reachable while
+// the connection is idle. In the frame of `serveOne` it becomes garbage when
+// the response is written.
+void async serveConn(Server s, Conn c) {
+    Reader rd = { conn: c, buf: "" };
+    while (true) {
+        bool keep = await serveOne(s, c, rd);
+        if (!keep) { break; }
+    }
+    c.close();
+}
+
+// Serves one request. Answers true if the connection can take another request.
+bool async serveOne(Server s, Conn c, Reader rd) {
+    String block = await rd.headerBlock() catch e {
+        // END_OF_FILE between messages is how a keep-alive connection ends.
+        if (e.code != net.ErrorCode.END_OF_FILE) {
+            await writeStatus(c, 400, e.message) catch e2 { };
+        }
+        return false;
+    };
+
+    String[] lines = string.split(block, CRLF);
+    RequestLine rl = parseRequestLine(lines[0]) catch e {
+        await writeStatus(c, 400, e.message) catch e2 { };
+        return false;
+    };
+    HeaderBlock hb = parseHeaders(array.slice(lines, 1)) catch e {
+        await writeStatus(c, 400, e.message) catch e2 { };
+        return false;
+    };
+    Framing f = framingOf(hb.headers) catch e {
+        await writeStatus(c, 400, e.message) catch e2 { };
+        return false;
+    };
+
+    // The route decides whether the body is read, so find the route first.
+    Match? found = s.routeFor(rl.method, rl.path);
+    bool streaming = false;
+    if (found != null) {
+        Match hit = found;
+        streaming = hit.route.stream;
+    }
+
+    // Most requests have no body, and then `wire` is already done. It becomes
+    // the source as it is, with no read, join or copy.
+    Body wire = bodyFor(rd, f, false);
+    Body source = wire;
+    byte[] held = [];
+    if (!streaming && !wire.done) {
+        // A declared length over the limit is refused before any of the body is
+        // read. A chunked body declares no length, so the limit is checked
+        // while it is read.
+        if (!f.chunked && f.length > s.maxBody) {
+            await writeStatus(c, 413, `body over ${s.maxBody} bytes`) catch e2 { };
+            return false;
+        }
+        held = await drainAll(Future<byte[]!> () -> wire.next(), s.maxBody) catch e {
+            await writeStatus(c, statusForError(e), e.message) catch e2 { };
+            return false;
+        };
+        source = heldBody(rd, held);
+    }
+
+    bool keep = keepAliveFor(rl, hb.headers);
+
+    Request req = {
+        method: rl.method,
+        path: rl.path,
+        query: rl.query,
+        headers: hb.headers,
+        params: {},
+        body: held,
+        peer: c.peer,
+        read: Future<byte[]!> () -> source.next(),
+        maxBody: s.maxBody,
+    };
+
+    // A handler that raised gets a bare 500. The error message is for the
+    // server to report, not for the client. A catch for a non-optional target
+    // must leave the block (§3.7), so the failure arrives here as null.
+    Response? answered = null;
+    if (found != null) {
+        Match hit = found;
+        req.params = hit.params;
+        answered = await s.run(hit.route, req) catch null;
+    } else {
+        answered = text(404, "not found");
+    }
+    if (answered == null) {
+        keep = false;
+        answered = text(500, "internal server error");
+    }
+    Response resp = answered;
+
+    // The next message on this connection starts where this body ends, so the
+    // server must read what a streaming handler did not. It reads up to
+    // DRAIN_LIMIT and closes the connection if more remains.
+    if (streaming && !source.done) {
+        bool drained = await source.drain(DRAIN_LIMIT);
+        if (!drained) { keep = false; }
+    }
+
+    bool headOnly = rl.method == Method.HEAD;
+    BodyStream? produce = resp.stream;
+    if (produce == null) {
+        await c.write(encodeResponse(resp, keep, headOnly)) catch e {
+            return false;
+        };
+        return keep;
+    }
+    return await writeStream(c, resp, produce, keep, headOnly);
+}
+
+// Writes a streamed response: the chunked head, one chunk per piece, and the
+// terminator. Answers true if the connection can take another request.
+//
+// The head goes out before the first piece is requested, so a producer that
+// fails mid-stream cannot send a status. The body then ends without its
+// terminator and the connection closes, which tells the peer that the body is
+// incomplete.
+bool async writeStream(Conn c, Response r, BodyStream produce,
+    bool keepAlive, bool headOnly) {
+    await c.write(streamHead(r, keepAlive)) catch e { return false; };
+
+    // A HEAD response has the headers of the GET and no body. The producer is
+    // never called, so a HEAD costs only the headers.
+    if (headOnly) { return keepAlive; }
+
+    while (true) {
+        byte[] piece = [];
+        switch (produce) {
+            case BodyStream.Plain p: piece = await p();
+            case BodyStream.Raising q: piece = await q() catch e { return false; };
+        }
+        if (piece.length == 0) { break; }
+        await c.write(encodeChunk(piece)) catch e { return false; };
+    }
+    await c.write(string.toByteArray(END_CHUNK)) catch e { return false; };
+    return keepAlive;
+}
+
+// Whether to keep the connection open. The version decides, and a Connection
+// header overrides it.
+bool keepAliveFor(RequestLine rl, Map<String, String> h) {
+    String? conn = h["connection"];
+    if (conn == null) { return rl.keepAlive; }
+    String lc = string.toLowerCaseAscii(conn);
+    if (string.contains(lc, "close")) { return false; }
+    if (string.contains(lc, "keep-alive")) { return true; }
+    return rl.keepAlive;
+}
+
+int statusForError(Error e) {
+    if (e.code == ErrorCode.TOO_LARGE) { return 413; }
+    return 400;
+}
+
+// A bare status, for a request too malformed to have a route.
+void async writeStatus(Conn c, int status, String message) {
+    Response r = text(status, message);
+    await c.write(encodeResponse(r, false, false));
+}
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+
+// The options of a client request. Every field is optional, because §2.4
+// requires every non-optional field in a record literal, and each caller would
+// have to give it.
+//
+// `body` is a `String`, so that `body: "test"` type-checks (§2.10 has no
+// implicit conversion). `bodyBytes` carries a body that is not text, and is
+// used when both are set.
+export type ClientOptions {
+    Map<String, String>? headers;
+    String? body;
+    byte[]? bodyBytes;
+    Duration? timeout;
+    bool? followRedirects;
+
+    // The options that an `https` dial gives to `tls.connect`, such as `roots`,
+    // `pins` or `insecureSkipVerify` (§6.18). When null, the peer is verified
+    // against the host's trust store. `alpn` is ignored, because this module
+    // speaks HTTP/1.1.
+    tls.Options? tls;
+
+    // The largest response body that `ClientResponse.bytes` and `text` hold.
+    // Null means no limit: the body is a stream and the caller decides how
+    // much to keep. `ClientResponse.read` does not
+    // apply this limit, because a caller that reads piece by piece makes that
+    // decision itself.
+    //
+    // When set, the declared length is compared with it before any of the body
+    // is read, so refusing a large response costs nothing.
+    int? maxBody;
+
+    // Sets header `name`. Header names are case-insensitive and map keys are
+    // not, so these accessors use the lower-cased name: `Content-Type` and
+    // `content-type` are one header.
+    void setHeader(String name, String value) {
+        Map<String, String>? h = self.headers;
+        if (h == null) {
+            Map<String, String> fresh = {};
+            self.headers = fresh;
+            h = fresh;
+        }
+        h[string.toLowerCaseAscii(name)] = value;
+    }
+
+    String? getHeader(String name) {
+        Map<String, String>? h = self.headers;
+        if (h == null) { return null; }
+        return h[string.toLowerCaseAscii(name)];
+    }
+
+    void removeHeader(String name) {
+        Map<String, String>? h = self.headers;
+        if (h == null) { return; }
+        map.remove(h, string.toLowerCaseAscii(name));
+    }
+}
+
+// An empty ClientOptions, for a caller that fills it with the setters.
+export ClientOptions options() {
+    return {
+        headers: null, body: null, bodyBytes: null, timeout: null,
+        followRedirects: null, tls: null, maxBody: null,
+    };
+}
+
+// The response body limit of a request. Null means no limit.
+int? maxBodyOf(ClientOptions? o) {
+    ClientOptions? opts = o;
+    if (opts == null) { return null; }
+    return opts.maxBody;
+}
+
+int const MAX_REDIRECTS = 5;
+
+// Sends a request and answers the response. A failure is raised at the `await`.
+// When `followRedirects` is set, it follows up to MAX_REDIRECTS redirects.
+export ClientResponse async request(Method m, String url, ClientOptions? o) {
+    String at = url;
+    int hops = 0;
+    while (true) {
+        Url u = parseUrl(at);
+        if (u.scheme != "http" && u.scheme != "https") {
+            return Error("unsupported scheme \"" + u.scheme + "\"", ErrorCode.UNSUPPORTED_SCHEME);
+        }
+
+        ClientResponse res = await once(m, u, o);
+        if (!wantsRedirect(o) || !isRedirect(res.status)) { return res; }
+
+        String? loc = res.headers["location"];
+        if (loc == null) { return res; }
+
+        // The body of a redirect is not the one the caller asked for, and
+        // nothing else reads it, so the connection closes.
+        res.close();
+        hops++;
+        if (hops > MAX_REDIRECTS) {
+            return Error(`more than ${MAX_REDIRECTS} redirects`,
+                ErrorCode.TOO_MANY_REDIRECTS);
+        }
+        at = absolute(u, loc);
+    }
+    return Error("unreachable", ErrorCode.MALFORMED_RESPONSE);
+}
+
+bool wantsRedirect(ClientOptions? o) {
+    ClientOptions? opts = o;
+    if (opts == null) { return false; }
+    bool? f = opts.followRedirects;
+    if (f == null) { return false; }
+    return f;
+}
+
+bool isRedirect(int status) {
+    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+}
+
+// Resolves a Location against the URL it came from. A full URL carries its own
+// scheme, so a redirect from http to https changes the transport. A rooted path
+// keeps the scheme of the current URL.
+String absolute(Url from, String loc) {
+    if (string.find(loc, "://") > 0) { return loc; }
+    String base = from.scheme + "://" + joinAddr(from.host, from.port);
+    if (string.find(loc, "/") == 0) { return base + loc; }
+    return base + "/" + loc;
+}
+
+// One request and response on a new connection. There is no connection pool. A
+// pool is a cache with an eviction policy, and belongs above this function.
+ClientResponse async once(Method m, Url u, ClientOptions? o) {
+    Map<String, String> headers = {};
+    String bodyText = "";
+    ClientOptions? opts = o;
+    if (opts != null) {
+        Map<String, String>? h = opts.headers;
+        if (h != null) {
+            forEach(map.keys(h), k) {
+                String? v = h[k];
+                if (v != null) { headers[string.toLowerCaseAscii(k)] = v; }
+            }
+        }
+        byte[]? raw = opts.bodyBytes;
+        if (raw != null) {
+            bodyText = string.fromByteArray(raw);
+        } else {
+            String? t = opts.body;
+            if (t != null) { bodyText = t; }
+        }
+    }
+
+    // HTTP/1.1 requires Host. A Host that the caller set is kept.
+    if (headers["host"] == null) {
+        headers["host"] = hostHeader(u);
+    }
+    headers["content-length"] = string.from(string.length(bodyText));
+    headers["connection"] = "close";
+
+    String target = u.path;
+    if (string.length(u.query) > 0) { target = target + "?" + u.query; }
+
+    String[] out = [];
+    array.push(out, string.from(m) + " " + target + " HTTP/1.1" + CRLF);
+    forEach(map.keys(headers), k) {
+        String? v = headers[k];
+        if (v == null) { continue; }
+        array.push(out, k + ": " + v + CRLF);
+    }
+    array.push(out, CRLF);
+    array.push(out, bodyText);
+
+    Conn c = await dial(u, o);
+    await c.write(string.toByteArray(string.join(out, "")));
+
+    Reader rd = { conn: c, buf: "" };
+    String block = await rd.headerBlock();
+    String[] lines = string.split(block, CRLF);
+    StatusLine sl = parseStatusLine(lines[0]);
+    HeaderBlock hb = parseHeaders(array.slice(lines, 1));
+
+    int? maxBody = maxBodyOf(o);
+
+    // 204 and 304 responses have no body, whatever their headers say (RFC
+    // 9110). A read would block until the connection closed.
+    Body body = counted(rd, 0);
+    if (sl.status != 204 && sl.status != 304 && m != Method.HEAD) {
+        Framing f = framingOf(hb.headers);
+        // A limit that the caller set is checked against the declared length
+        // before the body is read. The server answers 413 here. A client has
+        // nobody to answer, so it raises.
+        int? cap = maxBody;
+        if (cap != null && !f.chunked && f.length > cap) {
+            c.close();
+            return Error(`response body over ${cap} bytes`, ErrorCode.TOO_LARGE);
+        }
+        body = bodyFor(rd, f, true);
+    }
+
+    // A message with no body is done with its connection, so close it now.
+    // Otherwise the connection stays open as long as the body, and `readPiece`
+    // closes it at the end. There is no pool, so a drained connection has no
+    // other use.
+    if (body.done) { c.close(); }
+
+    return {
+        status: sl.status,
+        reason: sl.reason,
+        headers: hb.headers,
+        setCookies: hb.setCookies,
+        read: Future<byte[]!> () -> readPiece(body, c),
+        close: void () -> c.close(),
+        maxBody: maxBody,
+    };
+}
+
+// Answers the next piece of the body. It closes the connection at the end of
+// the body and on a failure. A caller that stops early must close it.
+byte[] async readPiece(Body b, Conn c) {
+    byte[] piece = await b.next() catch e {
+        c.close();
+        return e;
+    };
+    if (piece.length == 0) { c.close(); }
+    return piece;
+}
+
+// Opens the transport for the scheme: a TCP socket for `http`, a TLS connection
+// for `https`. For https, `tls.connect` verifies the host of the URL, and a
+// caller cannot give a different name. ALPN is fixed to `http/1.1`.
+Conn async dial(Url u, ClientOptions? o) {
+    Duration? timeout = null;
+    tls.Options? given = null;
+    ClientOptions? opts = o;
+    if (opts != null) {
+        timeout = opts.timeout;
+        given = opts.tls;
+    }
+
+    if (u.scheme == "http") {
+        Socket sock = await net.tcp.connect(joinAddr(u.host, u.port), { timeout: timeout });
+        return tcpConn(sock);
+    }
+
+    // The caller's TLS options are copied one field at a time, so that this
+    // module controls `alpn`. Each field that `tls.Options` gets and that a
+    // caller can set must be copied here too, or it has no effect over https.
+    tls.Options handed = { timeout: timeout, alpn: ["http/1.1"] };
+    if (given != null) {
+        handed.roots = given.roots;
+        handed.insecureSkipVerify = given.insecureSkipVerify;
+        handed.pins = given.pins;
+        Duration? t = given.timeout;
+        if (t != null) { handed.timeout = t; }
+    }
+    tls.Conn conn = await tls.connect(joinAddr(u.host, u.port), u.host, handed);
+    return tlsConn(conn, joinAddr(u.host, u.port));
+}
+
+// The value of the `Host` header. The port is left out when it is the default
+// for the scheme, because virtual hosts are matched against that form.
+String hostHeader(Url u) {
+    String h = u.host;
+    if (string.find(h, ":") >= 0) { h = "[" + h + "]"; }
+    if (u.scheme == "http" && u.port == 80) { return h; }
+    if (u.scheme == "https" && u.port == 443) { return h; }
+    return h + ":" + string.from(u.port);
+}

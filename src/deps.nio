@@ -1,0 +1,1014 @@
+// Packages: the manifest that a project writes, and the versions that a build
+// resolves from it.
+//
+// A compatibility band is a package. `nio-log` v0.1.4 and v0.2.0 are two
+// packages with the same name. Both can be in one build, and §2.10's
+// declaration identity keeps their types different. Within a band, semver
+// promises compatibility, so the newest version that a manifest asks for
+// satisfies all of them. This is Minimal Version Selection. It is exact,
+// because no manifest holds a range.
+//
+// Resolution is a pure function of the manifests. It gives the same result on
+// each machine and in any order, with no network and no backtracking. Thus
+// there is no lock file and no solver.
+//
+// The band comes from the version and is not written, so an author does
+// nothing extra to release 0.3.0. This module does not use the network: a
+// package is in the project's own `modules/` or in the shared cache, or it is
+// reported as missing.
+import 'string';
+import 'array';
+import 'map';
+import 'fs';
+import 'path';
+import 'crypto';
+import 'lib/str' as str;
+
+// The manifest file, at the root of a project and of every package.
+export String const MANIFEST = "nio.deps";
+
+// The module a package presents when an import names the package alone.
+export String const DEFAULT_ENTRY = "lib.nio";
+
+// The project-local package directory. It has priority over the shared cache.
+export String const VENDOR = "modules";
+
+// `require '<pkg>' <version> as <alias>;`: a dependency of this project.
+export type Require {
+    String pkg;
+    String version;
+    String alias;
+    int line;
+}
+
+// `resolved '<pkg>' <version> <hash>;`. nio writes these lines. The hash
+// covers the extracted tree and not the archive, because the tarballs that a
+// host generates are not byte-stable.
+export type Resolved {
+    String pkg;
+    String version;
+    String hash;
+    int line;
+}
+
+// `unify '<pkg>' <version>;` and `replace '<pkg>' with ...;`. Any manifest can
+// hold them, but only the directives of the entry manifest apply. Thus a
+// dependency cannot change the graph of the project that uses it.
+export type Directive {
+    String kind;    // "unify" or "replace"
+    String pkg;
+    String withPkg;    // the package a replacement names, or ""
+    String version;    // the version unify names, or the replacement package's
+    String dir;        // the directory a replacement names, as written, or ""
+    int line;
+}
+
+export type Manifest {
+    String name;
+    String entry;
+    Require[] requires;
+    Resolved[] resolved;
+    Directive[] directives;
+    String file;
+    String[] errs;
+}
+
+// Where a requirement goes after the entry manifest's directives apply. A
+// local replacement has no version and is in the band LOCAL.
+export type Target {
+    String pkg;
+    String version;
+    String band;
+    String dir;
+}
+
+// The band of a package replaced by a directory. It is not a version, so no
+// requirement can name it. No hash is recorded for it, because the tree is
+// being edited.
+export String const LOCAL = "local";
+
+// One (package, band) in a build, with the version selected for it.
+export type Package {
+    String pkg;
+    String version;
+    String band;
+    String dir;
+    String entry;
+    // Who required this band, in the order the graph was read. The project
+    // shows as its package name, and a dependency as its path and version.
+    String[] by;
+}
+
+export type Resolution {
+    // The entry manifest's aliases. Each is bound to the version selected for
+    // its band, which can be newer than the version it asked for.
+    Map<String, Package> aliases;
+    Package[] selected;
+    String[] errs;
+    // The manifest and directory where resolution started. Every alias table
+    // is read through the directives of this manifest.
+    Manifest entry;
+    String root;
+}
+
+export Manifest emptyManifest(String file) {
+    Manifest m = {
+        name: "", entry: DEFAULT_ENTRY, requires: [], resolved: [], directives: [],
+        file: file, errs: [],
+    };
+    return m;
+}
+
+export Resolution emptyResolution() {
+    Resolution r = { aliases: {}, selected: [], errs: [], entry: emptyManifest(""), root: "" };
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// Versions and bands
+// ---------------------------------------------------------------------------
+
+// Returns the three numbers of a version, or an empty array when v is not a
+// version. A version starts with `v`, as a tag does.
+export int[] numbers(String v) {
+    int[] none = [];
+    if (!str.hasPrefix(v, "v")) {
+        return none;
+    }
+    String[] parts = string.split(string.substring(v, 1, string.length(v)), ".");
+    if (parts.length != 3) {
+        return none;
+    }
+    int[] out = [];
+    forEach(parts, p) {
+        if (p == "" || !allDigits(p)) {
+            return none;
+        }
+        int n = string.toInt(p) catch e {
+            return none;
+        };
+        array.push(out, n);
+    }
+    return out;
+}
+
+bool allDigits(String s) {
+    return array.every(bytesOf(s), bool (int b) -> b >= 48 && b <= 57);
+}
+
+int[] bytesOf(String s) {
+    int[] out = [];
+    forEach(s, c) {
+        array.push(out, c);
+    }
+    return out;
+}
+
+export bool validVersion(String v) {
+    return numbers(v).length == 3;
+}
+
+// The compatibility band of a version: `v1` for `v1.2.3`, `v0.2` for `v0.2.4`.
+// This is semver read literally: major versions are incompatible, and below 1.0
+// minor versions are also incompatible. The band is computed here and written
+// nowhere, so a package path needs no `/v2` suffix.
+export String band(String v) {
+    int[] n = numbers(v);
+    if (n.length != 3) {
+        return "";
+    }
+    if (n[0] == 0) {
+        return "v0." + string.from(n[1]);
+    }
+    return "v" + string.from(n[0]);
+}
+
+// Returns -1, 0 or 1. Only versions of one band are compared, because MVS
+// never crosses a band.
+export int compare(String a, String b) {
+    int[] x = numbers(a);
+    int[] y = numbers(b);
+    if (x.length != 3 || y.length != 3) {
+        return 0;
+    }
+    for (int i = 0; i < 3; i++) {
+        if (x[i] < y[i]) {
+            return -1;
+        }
+        if (x[i] > y[i]) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Returns the newest of versions that is in the band of current, or current
+// when none is newer. A requirement never moves down or into another band. A
+// new band is a different package and can have a different API, so a move to
+// it needs an explicit `nio get`.
+export String newestInBand(String current, String[] versions) {
+    String want = band(current);
+    String best = current;
+    forEach(versions, v) {
+        if (want != "" && band(v) == want && compare(v, best) > 0) {
+            best = v;
+        }
+    }
+    return best;
+}
+
+// Returns the newest of versions that is newer than current and in a later
+// band, or "" when there is none. An update reports this version but does not
+// use it.
+export String newestInLaterBand(String current, String[] versions) {
+    String want = band(current);
+    String best = "";
+    forEach(versions, v) {
+        if (want == "" || band(v) == "" || band(v) == want || compare(v, current) <= 0) {
+            continue;
+        }
+        if (best == "" || compare(v, best) > 0) {
+            best = v;
+        }
+    }
+    return best;
+}
+
+// ---------------------------------------------------------------------------
+// The manifest
+// ---------------------------------------------------------------------------
+
+// Reads a manifest. The format is not Nio syntax: each line has a keyword and
+// quoted words. Thus `nio` can rewrite the resolved block and keep the lines
+// that a person wrote above it.
+export Manifest parse(String text, String file) {
+    Manifest m = emptyManifest(file);
+    forEach(string.split(text, "\n"), raw, i) {
+        int line = i + 1;
+        String[] w = fields(uncomment(raw));
+        if (w.length == 0) {
+            continue;
+        }
+        String head = w[0];
+        if (head == "package") {
+            if (w.length != 2) {
+                bad(m, line, "package takes one name");
+                continue;
+            }
+            m.name = w[1];
+            continue;
+        }
+        if (head == "entry") {
+            if (w.length != 2) {
+                bad(m, line, "entry takes one file name");
+                continue;
+            }
+            m.entry = w[1];
+            continue;
+        }
+        if (head == "require") {
+            readRequire(m, w, line);
+            continue;
+        }
+        if (head == "resolved") {
+            readResolved(m, w, line);
+            continue;
+        }
+        if (head == "unify") {
+            readUnify(m, w, line);
+            continue;
+        }
+        if (head == "replace") {
+            readReplace(m, w, line);
+            continue;
+        }
+        bad(m, line, "unknown directive " + quoteWord(head)
+            + "; a manifest holds package, entry, require, unify, replace and resolved");
+    }
+    return m;
+}
+
+void readUnify(Manifest m, String[] w, int line) {
+    if (w.length != 3) {
+        bad(m, line, "unify reads: unify '<package>' <version>;");
+        return;
+    }
+    if (!validVersion(w[2])) {
+        bad(m, line, "not a version: " + quoteWord(w[2]));
+        return;
+    }
+    Directive d = { kind: "unify", pkg: w[1], withPkg: "", version: w[2], dir: "", line: line };
+    addDirective(m, d);
+}
+
+void readReplace(Manifest m, String[] w, int line) {
+    String form = "replace reads: replace '<package>' with '<package>' <version>; "
+        + "or replace '<package>' with '<directory>';";
+    if (w.length < 4 || w.length > 5 || w[2] != "with") {
+        bad(m, line, form);
+        return;
+    }
+    if (w.length == 4) {
+        if (!pathLike(w[3])) {
+            bad(m, line, "a replacement package names its version, and a directory starts with . or /; "
+                + form);
+            return;
+        }
+        Directive local = { kind: "replace", pkg: w[1], withPkg: "", version: "", dir: w[3], line: line };
+        addDirective(m, local);
+        return;
+    }
+    if (!validVersion(w[4])) {
+        bad(m, line, "not a version: " + quoteWord(w[4]));
+        return;
+    }
+    Directive fork = { kind: "replace", pkg: w[1], withPkg: w[3], version: w[4], dir: "", line: line };
+    addDirective(m, fork);
+}
+
+// One directive per package. With two, the file would not say which one
+// applies.
+void addDirective(Manifest m, Directive d) {
+    forEach(m.directives, had) {
+        if (had.pkg == d.pkg) {
+            bad(m, d.line, d.pkg + " already has a directive, on line " + string.from(had.line));
+            return;
+        }
+    }
+    array.push(m.directives, d);
+}
+
+bool pathLike(String s) {
+    if (str.hasPrefix(s, ".") || str.hasPrefix(s, "/") || str.hasPrefix(s, "\\")) {
+        return true;
+    }
+    // A Windows drive, as in C:\\src.
+    return string.length(s) >= 2 && s[1] == 58;
+}
+
+void readRequire(Manifest m, String[] w, int line) {
+    if (w.length != 5 || w[3] != "as") {
+        bad(m, line, "require reads: require '<package>' <version> as <alias>;");
+        return;
+    }
+    if (!validVersion(w[2])) {
+        bad(m, line, "not a version: " + quoteWord(w[2])
+            + "; a requirement is exact, as in v1.2.3, because nothing here is a range");
+        return;
+    }
+    Require r = { pkg: w[1], version: w[2], alias: w[4], line: line };
+    array.push(m.requires, r);
+}
+
+void readResolved(Manifest m, String[] w, int line) {
+    if (w.length != 4) {
+        bad(m, line, "resolved reads: resolved '<package>' <version> <hash>;");
+        return;
+    }
+    if (!validVersion(w[2])) {
+        bad(m, line, "not a version: " + quoteWord(w[2]));
+        return;
+    }
+    Resolved r = { pkg: w[1], version: w[2], hash: w[3], line: line };
+    array.push(m.resolved, r);
+}
+
+void bad(Manifest m, int line, String message) {
+    array.push(m.errs, m.file + ":" + string.from(line) + ": " + message);
+}
+
+String quoteWord(String s) {
+    return "\"" + s + "\"";
+}
+
+// Removes a `//` comment. A `//` inside a quoted word is not a comment.
+String uncomment(String l) {
+    bool quoted = false;
+    int n = string.length(l);
+    for (int i = 0; i < n; i++) {
+        if (l[i] == 39) {
+            quoted = !quoted;
+        }
+        if (!quoted && i + 1 < n && l[i] == 47 && l[i + 1] == 47) {
+            return string.substring(l, 0, i);
+        }
+    }
+    return l;
+}
+
+// Splits a line into words. A `'...'` word keeps its spaces and loses its
+// quotes. A `;` ends the statement and is not part of the last word.
+String[] fields(String l) {
+    String[] out = [];
+    int n = string.length(l);
+    int i = 0;
+    while (i < n) {
+        int c = l[i];
+        if (c == 32 || c == 9 || c == 13) {
+            i++;
+            continue;
+        }
+        if (c == 59) {
+            break;
+        }
+        if (c == 39) {
+            int start = i + 1;
+            int j = start;
+            while (j < n && l[j] != 39) {
+                j++;
+            }
+            array.push(out, string.substring(l, start, j));
+            i = j + 1;
+            continue;
+        }
+        int k = i;
+        while (k < n && l[k] != 32 && l[k] != 9 && l[k] != 13 && l[k] != 59) {
+            k++;
+        }
+        array.push(out, string.substring(l, i, k));
+        i = k;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Writing a manifest back
+// ---------------------------------------------------------------------------
+
+// The alias a package gets when no alias is given: the last segment of the
+// path, without a leading `nio-`, because the language name tells an importer
+// nothing. Dashes and dots become underscores, and a name that is empty or
+// starts with a digit gets the prefix `pkg_`.
+export String aliasFor(String pkg) {
+    String[] parts = string.split(pkg, "/");
+    String last = parts[parts.length - 1];
+    if (str.hasPrefix(last, "nio-") && string.length(last) > 4) {
+        last = string.substring(last, 4, string.length(last));
+    }
+    String out = "";
+    forEach(last, c, i) {
+        if (c == 45 || c == 46) {
+            out = out + "_";
+            continue;
+        }
+        out = out + string.fromRunes([c]);
+    }
+    if (out == "" || (out[0] >= 48 && out[0] <= 57)) {
+        return "pkg_" + out;
+    }
+    return out;
+}
+
+// Adds a requirement after the last require, package or entry line. The rest
+// of the file does not change, because a person wrote it. To move an existing
+// requirement, use withVersionAt, which keeps the alias of that line.
+export String withRequire(String text, String pkg, String version, String alias) {
+    String[] out = [];
+    int lastRequire = -1;
+    String[] lines = string.split(text, "\n");
+    forEach(lines, l, i) {
+        String[] w = fields(uncomment(l));
+        array.push(out, l);
+        if (w.length >= 1 && (w[0] == "require" || w[0] == "package" || w[0] == "entry")) {
+            lastRequire = out.length - 1;
+        }
+    }
+    String line = "require " + quotePath(pkg) + " " + version + " as " + alias + ";";
+    if (lastRequire < 0) {
+        array.push(out, line);
+        return string.join(out, "\n");
+    }
+    String[] merged = [];
+    forEach(out, l, i) {
+        array.push(merged, l);
+        if (i == lastRequire) {
+            array.push(merged, line);
+        }
+    }
+    return string.join(merged, "\n");
+}
+
+// Moves the requirement on one line to a new version. The line selects the
+// requirement, because a manifest can require two bands of one package under
+// two aliases. Only the version word changes, so the spacing and a trailing
+// comment stay.
+export String withVersionAt(String text, Require r, String version) {
+    String[] lines = string.split(text, "\n");
+    if (r.line < 1 || r.line > lines.length) {
+        return text;
+    }
+    String l = lines[r.line - 1];
+    int start = afterPath(uncomment(l));
+    int at = string.find(string.substring(l, start, string.length(l)), r.version);
+    if (at < 0) {
+        return text;
+    }
+    at = at + start;
+    lines[r.line - 1] = string.substring(l, 0, at) + version
+        + string.substring(l, at + string.length(r.version), string.length(l));
+    return string.join(lines, "\n");
+}
+
+// The offset after the closing quote of the path on a requirement line. A
+// version found after this offset is the version word, because an alias has no
+// dot.
+int afterPath(String code) {
+    int last = 0;
+    int n = string.length(code);
+    for (int i = 0; i < n; i++) {
+        if (code[i] == 39) {
+            last = i + 1;
+        }
+    }
+    return last;
+}
+
+// Replaces the resolved block. nio owns this block, so it writes the block
+// again in full. The block goes last, so a person reads their own lines first.
+export String withResolved(String text, Resolved[] rs) {
+    String[] kept = [];
+    forEach(string.split(text, "\n"), l) {
+        String[] w = fields(uncomment(l));
+        if (w.length >= 1 && w[0] == "resolved") {
+            continue;
+        }
+        if (str.hasPrefix(trimLeft(l), "// resolved")) {
+            continue;
+        }
+        array.push(kept, l);
+    }
+    while (kept.length > 0 && trimLeft(kept[kept.length - 1]) == "") {
+        array.pop(kept);
+    }
+    if (rs.length == 0) {
+        return string.join(kept, "\n") + "\n";
+    }
+    array.push(kept, "");
+    array.push(kept, "// resolved -- maintained by nio, do not edit");
+    forEach(rs, r) {
+        array.push(kept, "resolved " + quotePath(r.pkg) + " " + r.version + " " + r.hash + ";");
+    }
+    return string.join(kept, "\n") + "\n";
+}
+
+String quotePath(String p) {
+    return "'" + p + "'";
+}
+
+String trimLeft(String s) {
+    int i = 0;
+    int n = string.length(s);
+    while (i < n && (s[i] == 32 || s[i] == 9 || s[i] == 13)) {
+        i++;
+    }
+    return string.substring(s, i, n);
+}
+
+// ---------------------------------------------------------------------------
+// Where a package lives
+// ---------------------------------------------------------------------------
+
+// The directory of a package. A vendored tree in the project's `modules/` has
+// priority over the shared cache. Returns "" when the package is in neither.
+export String locate(String root, String pkg, String version) {
+    String rel = pkg + "@" + version;
+    String vendored = path.join(root, path.localize(VENDOR + "/" + rel));
+    if (fs.exists(vendored)) {
+        return vendored;
+    }
+    String base = path.userData("nio") catch e {
+        return "";
+    };
+    String cached = path.join(base, path.localize("pkg/" + rel));
+    if (fs.exists(cached)) {
+        return cached;
+    }
+    return "";
+}
+
+// Reads the manifest of a package that is already on disk. A package without
+// a manifest is valid and has no dependencies.
+export Manifest manifestIn(String dir) {
+    String file = path.join(dir, MANIFEST);
+    if (!fs.exists(file)) {
+        return emptyManifest(file);
+    }
+    byte[] data = fs.readFile(file) catch e {
+        Manifest unread = emptyManifest(file);
+        array.push(unread.errs, file + ": " + e.message);
+        return unread;
+    };
+    return parse(string.fromByteArray(data), file);
+}
+
+// Finds the manifest that governs a directory: the nearest `nio.deps` at or
+// above it. Returns "" when there is none, and then the project has no
+// packages.
+export String manifestPath(String dir) {
+    String at = dir;
+    if (at == "") {
+        at = ".";
+    }
+    while (true) {
+        String candidate = path.join(at, MANIFEST);
+        if (fs.exists(candidate)) {
+            return candidate;
+        }
+        String up = parentOf(at);
+        if (up == at) {
+            return "";
+        }
+        at = up;
+    }
+}
+
+// The parent of a directory, or the directory itself when it has no parent.
+// path.join does not fold `..`, so a walk up with `..` never ends. This
+// function removes the last segment.
+String parentOf(String p) {
+    int cut = -1;
+    int n = string.length(p);
+    for (int i = 0; i < n; i++) {
+        if (p[i] == 47 || p[i] == 92) {
+            cut = i;
+        }
+    }
+    if (cut < 0) {
+        return p;
+    }
+    if (cut == 0) {
+        if (n == 1) {
+            return p;
+        }
+        return string.substring(p, 0, 1);
+    }
+    return string.substring(p, 0, cut);
+}
+
+// ---------------------------------------------------------------------------
+// Verifying what is on disk
+// ---------------------------------------------------------------------------
+
+// The hash of a package tree: sha256 over the sorted list of
+// `<sha256 of the file>  <path>` lines, one per file, with `/` separators on
+// every host.
+//
+// The hash covers the tree and not the archive, because the tarballs that a
+// host generates are not byte-stable. A change of compression changes the
+// checksum of every published archive. A tree hash is the same for a clone, a
+// tarball and a mirror, and it detects a tag that was moved by force.
+export String treeHash(String dir) {
+    String[] lines = [];
+    hashInto(lines, dir, "");
+    array.sort(lines, bool (String a, String b) -> a < b);
+    byte[] all = string.toByteArray(string.join(lines, "\n") + "\n");
+    return "sha256:" + crypto.hexEncode(crypto.sha256(all));
+}
+
+void hashInto(String[] lines, String dir, String prefix) {
+    String[] names = fs.readDir(dir) catch e {
+        return;
+    };
+    forEach(names, name) {
+        String full = path.join(dir, name);
+        String rel = prefix + name;
+        fs.Stat st = fs.stat(full) catch e {
+            continue;
+        };
+        if (st.isDirectory) {
+            hashInto(lines, full, rel + "/");
+            continue;
+        }
+        byte[] data = fs.readFile(full) catch e {
+            continue;
+        };
+        array.push(lines, crypto.hexEncode(crypto.sha256(data)) + "  " + rel);
+    }
+}
+
+// Compares each selected package with the hash that the manifest recorded for
+// it, and returns one message for each mismatch. A package with no recorded
+// hash is not an error: `nio get` writes the line, and a project that never ran
+// it has nothing to compare. This finds a tree that changed after its hash was
+// recorded.
+export String[] verify(Manifest m, Package[] selected) {
+    Map<String, String> want = {};
+    forEach(m.resolved, r) {
+        want[r.pkg + "@" + r.version] = r.hash;
+    }
+    String[] out = [];
+    forEach(selected, p) {
+        String? expected = want[p.pkg + "@" + p.version];
+        if (expected == null || p.dir == "" || p.band == LOCAL) {
+            continue;
+        }
+        String got = treeHash(p.dir);
+        if (got != expected) {
+            array.push(out, "package " + p.pkg + " " + p.version
+                + " does not match the hash " + m.file + " recorded for it"
+                + "\n  recorded: " + expected
+                + "\n  on disk:  " + got
+                + "\n  the tree at " + p.dir + " changed after it was resolved");
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Resolution
+// ---------------------------------------------------------------------------
+
+// Resolves the full graph from the manifests alone. root is the directory of
+// the entry manifest.
+//
+// Requirements are grouped by (package, band), and the maximum version of each
+// group is selected. Thus v0.1.1 and v0.2.0 do not conflict, because they are
+// requirements on two different packages.
+export Resolution resolve(String root, Manifest entry) {
+    Resolution res = { aliases: {}, selected: [], errs: [], entry: entry, root: root };
+    Walk w = {
+        best: {}, visited: {}, queue: [], askedBy: {}, byBand: {}, dirs: {},
+    };
+    String project = entry.name;
+    if (project == "") {
+        project = "this project";
+    }
+
+    forEach(entry.requires, r) {
+        seed(res, w, r.pkg, r.version, project);
+    }
+    int at = 0;
+    while (at < w.queue.length) {
+        String item = w.queue[at];
+        at++;
+        if (w.visited[item] != null) {
+            continue;
+        }
+        w.visited[item] = true;
+        int cut = string.find(item, "@");
+        if (cut < 0) {
+            continue;
+        }
+        String pkg = string.substring(item, 0, cut);
+        String version = string.substring(item, cut + 1, string.length(item));
+        String who = "this project";
+        String? asked = w.askedBy[item];
+        if (asked != null) {
+            who = asked;
+        }
+        String dir = "";
+        String? local = w.dirs[item];
+        if (local != null) {
+            if (!fs.exists(local)) {
+                array.push(res.errs, "package " + pkg + " is replaced by " + local
+                    + ", and there is no directory there (required by " + who + ")");
+                continue;
+            }
+            dir = local;
+        } else {
+            dir = locate(root, pkg, version);
+        }
+        if (dir == "") {
+            array.push(res.errs, "package " + pkg + " " + version
+                + " is not in " + VENDOR + "/ or in the cache (required by "
+                + who + ")");
+            continue;
+        }
+        Manifest m = manifestIn(dir);
+        forEach(m.errs, e) {
+            array.push(res.errs, e);
+        }
+        String asker = pkg + " " + version;
+        if (local != null) {
+            asker = pkg + " (" + local + ")";
+        }
+        forEach(m.requires, r) {
+            seed(res, w, r.pkg, r.version, asker);
+        }
+    }
+    // The selection is the maximum version of each band, in a fixed order.
+    forEach(map.keys(w.best), key) {
+        String? v = w.best[key];
+        if (v == null) {
+            continue;
+        }
+        int cut = string.find(key, "@");
+        String pkg = string.substring(key, 0, cut);
+        String version = v;
+        String bandOf = band(version);
+        String dir = "";
+        String? local = w.dirs[pkg + "@" + LOCAL];
+        if (version == LOCAL && local != null) {
+            version = "";
+            bandOf = LOCAL;
+            dir = local;
+        } else {
+            dir = locate(root, pkg, version);
+        }
+        String[] by = [];
+        String[]? asked = w.byBand[key];
+        if (asked != null) {
+            by = asked;
+        }
+        Package p = {
+            pkg: pkg, version: version, band: bandOf, dir: dir,
+            entry: manifestIn(dir).entry, by: by,
+        };
+        array.push(res.selected, p);
+    }
+    // An alias names the version selected for its band, which can be newer
+    // than the version it asked for. Semver makes one band compatible.
+    res.aliases = aliasesFor(res, entry);
+    return res;
+}
+
+// What a walk over the graph keeps while it runs.
+type Walk {
+    Map<String, String> best;     // package@band -> the version chosen so far
+    Map<String, bool> visited;    // package@version whose manifest was read
+    String[] queue;
+    Map<String, String> askedBy;     // package@version -> who asked first
+    Map<String, String[]> byBand;    // package@band -> everyone who asked
+    Map<String, String> dirs;        // package@local -> the directory it is
+}
+
+// Where a requirement goes after the entry manifest's directives apply. A
+// replacement applies first, because it changes the package. Then a unify
+// applies to the resulting package.
+export Target targetOf(Resolution res, String pkg, String version) {
+    Target t = { pkg: pkg, version: version, band: band(version), dir: "" };
+    forEach(res.entry.directives, d) {
+        if (d.kind != "replace" || d.pkg != pkg) {
+            continue;
+        }
+        if (d.dir != "") {
+            t.version = LOCAL;
+            t.band = LOCAL;
+            t.dir = localDir(res.root, d.dir);
+            return t;
+        }
+        t.pkg = d.withPkg;
+        t.version = d.version;
+        t.band = band(d.version);
+    }
+    forEach(res.entry.directives, d) {
+        if (d.kind == "unify" && d.pkg == t.pkg) {
+            t.version = d.version;
+            t.band = band(d.version);
+        }
+    }
+    return t;
+}
+
+String localDir(String root, String dir) {
+    if (str.hasPrefix(dir, "/") || str.hasPrefix(dir, "\\") || (string.length(dir) >= 2 && dir[1] == 58)) {
+        return path.localize(dir);
+    }
+    return path.join(root, path.localize(dir));
+}
+
+// The alias table of one manifest, bound to the versions that the build
+// selected. Aliases are local to each manifest: a dependency can bind the same
+// package under a different name, and this does not change the names in other
+// manifests. A requirement is read through the entry manifest's directives, so
+// a dependency that asked for a band that `unify` merged still has its alias
+// bound.
+export Map<String, Package> aliasesFor(Resolution res, Manifest m) {
+    Map<String, Package> out = {};
+    forEach(m.requires, r) {
+        Target t = targetOf(res, r.pkg, r.version);
+        forEach(res.selected, p) {
+            if (p.pkg == t.pkg && p.band == t.band) {
+                out[r.alias] = p;
+            }
+        }
+    }
+    return out;
+}
+
+// Records one requirement, keeping the newest of its band, and queues that
+// version's own manifest to be read.
+void seed(Resolution res, Walk w, String pkg, String version, String who) {
+    if (!validVersion(version)) {
+        return;
+    }
+    Target t = targetOf(res, pkg, version);
+    String key = t.pkg + "@" + t.band;
+    String item = t.pkg + "@" + t.version;
+    if (t.dir != "") {
+        w.dirs[item] = t.dir;
+    }
+    if (w.askedBy[item] == null) {
+        w.askedBy[item] = who;
+    }
+    String[]? had = w.byBand[key];
+    if (had == null) {
+        String[] first = [who];
+        w.byBand[key] = first;
+    } else if (!array.contains(had, who)) {
+        array.push(had, who);
+    }
+    array.push(w.queue, item);
+    String? have = w.best[key];
+    if (have == null || (t.dir == "" && compare(t.version, have) > 0)) {
+        w.best[key] = t.version;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The versions a repository advertises
+// ---------------------------------------------------------------------------
+
+// Reads the versions from git's ref advertisement: the body that a host sends
+// for `GET <repository>/info/refs?service=git-upload-pack`. Every git host
+// serves it, with no API and no login for a public repository.
+//
+// The body is a sequence of pkt-lines. Four hex digits give the line length,
+// which includes those four digits. A length below four is a marker with no
+// line (`0000` is a flush). The first line names the service. Each later line
+// is `<object id> <ref>`, and the first of them also has the capabilities
+// after a NUL.
+//
+// Only a tag that is a version is returned. A peeled line (`^{}`) repeats a
+// tag. A pre-release such as v1.2.0-rc1 is not a version here, because a
+// manifest cannot name one. The body comes from the host, so no read goes past
+// a length that the body holds.
+export String[] advertisedVersions(byte[] body) {
+    String[] out = [];
+    Map<String, bool> seen = {};
+    bool service = false;
+    int at = 0;
+    int n = body.length;
+    while (at < n) {
+        if (n - at < 4) {
+            return Error("the ref advertisement ends inside a line length");
+        }
+        int size = hexLength(body, at);
+        if (size < 0) {
+            return Error("the ref advertisement has a malformed line length at byte "
+                + string.from(at));
+        }
+        if (size < 4) {
+            at = at + 4;
+            continue;
+        }
+        if (size > n - at) {
+            return Error("the ref advertisement ends inside a line");
+        }
+        String line = string.fromByteArray(array.slice(body, at + 4, at + size));
+        at = at + size;
+        if (!service) {
+            if (!str.hasPrefix(line, "# service=git-upload-pack")) {
+                return Error("the answer is not a git ref advertisement");
+            }
+            service = true;
+            continue;
+        }
+        int nul = string.find(line, "\0");
+        if (nul >= 0) {
+            line = string.substring(line, 0, nul);
+        }
+        if (str.hasSuffix(line, "\n")) {
+            line = string.substring(line, 0, string.length(line) - 1);
+        }
+        int sp = string.find(line, " ");
+        if (sp < 0) {
+            continue;
+        }
+        String ref = string.substring(line, sp + 1, string.length(line));
+        if (!str.hasPrefix(ref, "refs/tags/") || str.hasSuffix(ref, "^{}")) {
+            continue;
+        }
+        String v = string.substring(ref, 10, string.length(ref));
+        if (validVersion(v) && seen[v] == null) {
+            seen[v] = true;
+            array.push(out, v);
+        }
+    }
+    if (!service) {
+        return Error("the answer is not a git ref advertisement");
+    }
+    return out;
+}
+
+// The value of the four hex digits at body[at], or -1 when one of them is not
+// a hex digit.
+int hexLength(byte[] body, int at) {
+    int v = 0;
+    for (int i = at; i < at + 4; i++) {
+        int c = body[i];
+        int d = -1;
+        if (c >= 48 && c <= 57) {
+            d = c - 48;
+        } else if (c >= 97 && c <= 102) {
+            d = c - 87;
+        } else if (c >= 65 && c <= 70) {
+            d = c - 55;
+        }
+        if (d < 0) {
+            return -1;
+        }
+        v = v * 16 + d;
+    }
+    return v;
+}

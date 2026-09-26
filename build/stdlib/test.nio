@@ -1,0 +1,154 @@
+// The `test` module (§6.13): declaring tests, asserting inside them, and
+// reporting how they went.
+//
+// An assertion raises (§2.9). `assert` returns an Error, which makes the test
+// body fallible, and `start` catches it at the closure boundary. A test stops
+// at its first failed assertion. An unexpected error is reported as a failure
+// and does not end the program.
+//
+// A test program reads `--filter text` off its own command line and runs only
+// the tests whose title holds that text, so `nio test --filter lexer` and
+// `nio run tests/all.nio --filter lexer` select the same way.
+import 'array';
+import 'string';
+import 'process';
+
+type Pending {
+    String title;
+    Future<void!> task;
+}
+
+int passed = 0;
+int failed = 0;
+int filtered = 0;
+Pending[] pending = [];
+
+// The `--filter text` or `--filter=text` the program was started with, read
+// once. A title that holds the text is selected, so a filter names one test or
+// a family of them.
+String chosen = "";
+bool asked = false;
+
+String filter() {
+    if (asked) {
+        return chosen;
+    }
+    asked = true;
+    String[] args = process.getArgs();
+    forEach(args, a, i) {
+        if (a == "--filter" && i + 1 < args.length) {
+            chosen = args[i + 1];
+        }
+        if (string.find(a, "--filter=") == 0) {
+            chosen = string.substring(a, 9, string.length(a));
+        }
+    }
+    return chosen;
+}
+
+bool selected(String title) {
+    String f = filter();
+    if (f == "") {
+        return true;
+    }
+    return string.contains(title, f);
+}
+
+// Each result prints when it is known. A run that never reaches `run` still
+// shows what it checked.
+void note(String title, bool ok, String message) {
+    if (ok) {
+        passed++;
+        print("ok   " + title);
+        return;
+    }
+    failed++;
+    print("FAIL " + title + " - " + message);
+}
+
+// Runs body now and reports it. The parameter is fallible, which lets the body
+// assert. A body that cannot fail is accepted too.
+export void start(String title, Function()<void!> body) {
+    if (!selected(title)) {
+        filtered++;
+        return;
+    }
+    body() catch e {
+        note(title, false, e.message);
+        return;
+    };
+    note(title, true, "");
+}
+
+// Registers a task. Calling an async function does not run its body (§5.2).
+// The scheduler does not step until `run` awaits, so all tests registered
+// before then interleave at their awaits.
+export void startAsync(String title, Future<void!> task) {
+    array.push(pending, { title: title, task: task });
+}
+
+export void assert(bool ok, String message) {
+    if (!ok) { return Error(message); }
+}
+
+// There are no generics (§7), so each type has its own expectation. `assert`
+// covers the other types.
+export void expectInt(int got, int want) {
+    if (got != want) {
+        return Error(`expected ${want}, got ${got}`);
+    }
+}
+
+export void expectFloat(float got, float want) {
+    if (got != want) {
+        return Error(`expected ${want}, got ${got}`);
+    }
+}
+
+// For a computed value: arithmetic that gives 0.3 rarely gives exactly 0.3.
+export void expectFloatNear(float got, float want, float tolerance) {
+    float d = got - want;
+    if (d < 0.0) { d = -d; }
+    if (d > tolerance) {
+        return Error(`expected ${want} within ${tolerance}, got ${got}`);
+    }
+}
+
+export void expectString(String got, String want) {
+    if (got != want) {
+        return Error("expected \"" + want + "\", got \"" + got + "\"");
+    }
+}
+
+export void expectBool(bool got, bool want) {
+    if (got != want) {
+        return Error(`expected ${want}, got ${got}`);
+    }
+}
+
+// Waits for every test started with startAsync, prints the summary, and exits
+// with status 1 if anything failed. A successful run returns.
+export void run() {
+    forEach(pending, p) {
+        if (!selected(p.title)) {
+            // The caller started the task before registering it (§5.2), so a
+            // filter cannot stop it. Await it and discard the result, or the
+            // drain reports an error that no await took.
+            await p.task catch e { };
+            filtered++;
+            continue;
+        }
+        await p.task catch e {
+            note(p.title, false, e.message);
+            continue;
+        };
+        note(p.title, true, "");
+    }
+    pending = [];
+    if (filter() == "") {
+        print(`${passed} passed, ${failed} failed`);
+    } else {
+        print(`${passed} passed, ${failed} failed, ${filtered} filtered out`);
+    }
+    if (failed > 0) { process.exit(1); }
+}

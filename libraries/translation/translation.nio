@@ -1,0 +1,215 @@
+// translation: on-device text translation through the platform's own engine.
+// On macOS it is Apple's Translation framework, the models Safari translates
+// with. The text never leaves the machine, and a pair works offline once its
+// models are downloaded. An external library (§5.8, libraries/README.md).
+//
+//     import './libraries/translation/translation';
+//
+//     translation.load("./libraries/translation/native/libNioTranslation.dylib")
+//         catch e { print(e.message); return; };
+//     int job = translation.translate("", "it", ["Hello, world"]) catch e { return; };
+//     // ... pump the event loop (webview.pump) and poll ...
+//     if (translation.poll(job) == translation.JobState.DONE) {
+//         String[] out = translation.takeTexts(job) catch e { return; };
+//         print(out[0]);    // "Ciao, mondo"
+//     }
+//
+// The Swift half lives in a dylib that build.sh builds and the program loads
+// at run time, because `native source` compiles C and Objective-C only. Every
+// program calls load() first, so a machine without the dylib gets an error
+// instead of a build failure.
+//
+// The framework is asynchronous and needs the platform's event loop turning,
+// so the work is jobs. translate, prepare and availability answer an id, the
+// program pumps its loop (webview.pump), and poll and take collect the answer.
+// Call every function from the main thread.
+//
+// A language is a BCP-47 tag ("en", "it", "zh-Hans"). A source of "" makes the
+// engine detect the language of each text.
+
+import 'json';
+import 'string';
+
+native source './native/translation_glue.c';
+
+extern int nt_load(String path);
+extern int nt_loaded();
+extern int nt_supported();
+extern String nt_detect(String text);
+extern String nt_syslang();
+extern int nt_start(String source, String target, String textsJson);
+extern int nt_prepare(String source, String target);
+extern int nt_avail(String source, String target);
+extern int nt_langs();
+extern String nt_langname(String tag);
+extern int nt_poll(int job);
+extern String nt_take(int job);
+
+// The `Error.code` values this library raises. They start at 500, so they
+// coexist with http's at 100 and webview's at 400 (§2.9).
+export enum ErrorCode {
+    UNAVAILABLE: 500,    // no dylib, or a platform with no translation engine
+    INVALID: 501,        // a bad argument: an empty target, an unknown job
+    FAILED: 502          // the engine could not translate (models missing, ...)
+}
+
+// What poll answers.
+export enum JobState {
+    RUNNING: 0,
+    DONE: 1,
+    FAILED: 2
+}
+
+// Opens libNioTranslation.dylib, which this library's build.sh builds. Call it
+// once, before anything else. A second call does nothing. The program resolves
+// the path: a packaged app passes the copy in webview.resourcesPath().
+export void load(String dylibPath) {
+    int r = nt_load(dylibPath);
+    if (r == 0) {
+        return;
+    }
+    if (r == -22) {
+        return Error("translation: '" + dylibPath
+            + "' is not the shim this library expects -- rebuild it with build.sh",
+            ErrorCode.UNAVAILABLE);
+    }
+    return Error("translation: cannot load '" + dylibPath
+        + "' -- build it with libraries/translation/build.sh (needs swiftc)",
+        ErrorCode.UNAVAILABLE);
+}
+
+// Answers whether load() has succeeded.
+export bool loaded() {
+    return nt_loaded() == 1;
+}
+
+// Answers whether the loaded shim has an engine. It is false on macOS before
+// 15, and wherever there is no shim.
+export bool supported() {
+    return nt_supported() == 1;
+}
+
+// Answers the user's own language as a BCP-47 tag, or "" when nothing is
+// loaded. Use it as the default target, and pick your own fallback for "".
+export String systemLanguage() {
+    return nt_syslang();
+}
+
+// Answers the dominant language of the text as a BCP-47 tag, or "" when the
+// recognizer cannot say. It is synchronous: no job, no models, no download.
+export String detect(String text) {
+    return nt_detect(text);
+}
+
+// Starts a translation and answers the job to poll. takeTexts answers the
+// texts in the order given, one for one. Batch what belongs together: send
+// one page's paragraphs in one call.
+export int translate(String source, String target, String[] texts) {
+    return startJob(nt_start(source, target, json.toText(texts)), target);
+}
+
+// Asks the system to download the pair's models, behind its own consent
+// prompt. DONE means the pair is usable now. FAILED means the user declined
+// or the download stopped, and take() holds the reason.
+export int prepare(String source, String target) {
+    return startJob(nt_prepare(source, target), target);
+}
+
+// Asks what the pair can do. The settled job's take() answers "installed",
+// "supported" (call prepare first) or "unsupported".
+export int availability(String source, String target) {
+    return startJob(nt_avail(source, target), target);
+}
+
+// Starts a job whose takeTexts answers every BCP-47 tag the engine has. Each
+// tag works as a source or a target, and carries no region: "en-US" and
+// "en-GB" are both "en". The list belongs to the system, so ask once.
+export int supportedLanguages() {
+    int r = nt_langs();
+    if (r > 0) {
+        return r;
+    }
+    if (r == -1) {
+        return Error("translation: this system has no translation engine (macOS 15+ today)",
+            ErrorCode.UNAVAILABLE);
+    }
+    if (r == -20 || r == -21) {
+        return Error("translation: load() the shim first", ErrorCode.UNAVAILABLE);
+    }
+    return Error("translation: cannot ask which languages are supported", ErrorCode.INVALID);
+}
+
+// Answers the name of a tag in the user's own language, or "" when the system
+// has no name for it. It needs no engine, only a successful load().
+export String languageName(String tag) {
+    return nt_langname(tag);
+}
+
+// Answers a `JobState`. It raises INVALID for a job this library never handed
+// out, or one already taken.
+export int poll(int job) {
+    int s = nt_poll(job);
+    if (s < 0) {
+        return Error("translation: no such job " + string.from(job), ErrorCode.INVALID);
+    }
+    return s;
+}
+
+// Collects a settled job's answer and forgets the job. The answer is the
+// translated texts as JSON, an availability word, or the engine's reason for
+// a FAILED job. Poll first: taking a running job raises.
+export String take(int job) {
+    int s = nt_poll(job);
+    if (s < 0) {
+        return Error("translation: no such job " + string.from(job), ErrorCode.INVALID);
+    }
+    if (s == 0) {
+        return Error("translation: job " + string.from(job) + " is still running",
+            ErrorCode.INVALID);
+    }
+    return nt_take(job);
+}
+
+// take for a job that answers a list: the translated texts in the order given,
+// or the supported tags. A FAILED job raises with the engine's reason.
+export String[] takeTexts(int job) {
+    int s = nt_poll(job);
+    if (s < 0) {
+        return Error("translation: no such job " + string.from(job), ErrorCode.INVALID);
+    }
+    if (s == 0) {
+        return Error("translation: job " + string.from(job) + " is still running",
+            ErrorCode.INVALID);
+    }
+    String answer = nt_take(job);
+    if (s == 2) {
+        return Error("translation: " + answer, ErrorCode.FAILED);
+    }
+    Json v = json.parse(answer) catch e {
+        return Error("translation: unreadable answer from the engine", ErrorCode.FAILED);
+    };
+    String[] out = v as String[] catch e {
+        return Error("translation: unreadable answer from the engine", ErrorCode.FAILED);
+    };
+    return out;
+}
+
+// Turns a shim return code into a job or an Error. The three starters share
+// it, so they answer the same errors.
+int startJob(int r, String target) {
+    if (r > 0) {
+        return r;
+    }
+    if (r == -1) {
+        return Error("translation: this system has no translation engine (macOS 15+ today)",
+            ErrorCode.UNAVAILABLE);
+    }
+    if (r == -2) {
+        return Error("translation: a target language is required", ErrorCode.INVALID);
+    }
+    if (r == -20 || r == -21) {
+        return Error("translation: load() the shim first", ErrorCode.UNAVAILABLE);
+    }
+    return Error("translation: cannot start the job for '" + target + "'",
+        ErrorCode.INVALID);
+}

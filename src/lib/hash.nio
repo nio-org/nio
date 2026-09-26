@@ -1,0 +1,46 @@
+// FNV-1a, 64 bits, over the bytes of a string.
+//
+// This is not a cryptographic hash, and nothing uses it as one. It names a
+// build cache entry, where the inputs are this compiler's own files. The
+// compiler imports no `crypto` module, so the `nio` binary does not link it.
+import 'string';
+import 'array';
+
+// The published constants. §1.6 has no way to write a number above an int64,
+// so the offset basis is built from its halves; the prime fits as written.
+uint const OFFSET = (0xcbf29ce4 as uint) * 4294967296 + 0x84222325;
+uint const PRIME = 0x100000001b3;
+
+byte[] const HEX = string.toByteArray("0123456789abcdef");
+
+// The hash of s, continuing from a previous answer. Hashing several pieces in
+// turn is the same as hashing them joined, so a caller mixes in a flag or a
+// file name without building the joined string first.
+export uint add(uint seed, String s) {
+    uint h = seed;
+    byte[] bytes = string.toByteArray(s);
+    forEach(bytes, b) {
+        h = h ^ (b as uint);
+        h = h * PRIME;
+    }
+    return h;
+}
+
+export uint of(String s) {
+    return add(OFFSET, s);
+}
+
+export uint start() {
+    return OFFSET;
+}
+
+// Sixteen lower-case hexadecimal digits, most significant first. The width is
+// fixed, so every entry name has the same length.
+export String hex(uint h) {
+    byte[] out = [];
+    for (int i = 15; i >= 0; i--) {
+        uint shifted = h >> (i * 4);
+        array.push(out, HEX[(shifted & 15) as int]);
+    }
+    return string.fromByteArray(out);
+}

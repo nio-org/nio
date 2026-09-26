@@ -1,0 +1,114 @@
+// Holds the two generated bakes to the trees they embed. Each file in
+// build/runtime/ and build/stdlib/ is byte for byte the text in
+// src/embed/runtime.nio and src/embed/stdlib.nio, and neither side has an
+// entry that the other does not have. Regenerate with `nio run tools/bake.nio`.
+//
+// The compiler writes a program's runtime from the bake, never from the tree.
+// A stale bake is not visible: the C file on disk is correct, but the compiler
+// does not use it.
+//
+// The test compares the bake with the tree and does not run the generator, so
+// it is fast.
+import 'test';
+import 'string';
+import 'array';
+import 'fs';
+import 'path';
+import './repo' as repo;
+import '../src/lib/str' as str;
+import '../src/embed/runtime' as rtsrc;
+import '../src/embed/stdlib' as stdlibsrc;
+
+String const REGENERATE = "nio run tools/bake.nio";
+
+// Lists build/runtime as tools/bake.nio does: the .c and .h files at the top
+// level, then in lib/, each group sorted. The tree is two levels deep.
+String[] walkRuntime() {
+    String[] out = [];
+    String dir = repo.at("build/runtime");
+    String[] top = fs.readDir(dir);
+    array.sort(top);
+    forEach(top, f) {
+        if (str.hasSuffix(f, ".c") || str.hasSuffix(f, ".h")) {
+            array.push(out, f);
+        }
+    }
+    String[] lib = fs.readDir(path.join(dir, "lib"));
+    array.sort(lib);
+    forEach(lib, f) {
+        if (str.hasSuffix(f, ".c") || str.hasSuffix(f, ".h")) {
+            array.push(out, "lib/" + f);
+        }
+    }
+    return out;
+}
+
+// Gives the first line on which two texts differ. A C file has thousands of
+// lines.
+String firstDiff(String got, String want) {
+    String[] g = string.split(got, "\n");
+    String[] w = string.split(want, "\n");
+    int n = g.length;
+    if (w.length < n) {
+        n = w.length;
+    }
+    for (int i = 0; i < n; i++) {
+        if (g[i] != w[i]) {
+            return "first differing at line " + string.from(i + 1)
+                + "\n  baked:   " + g[i] + "\n  on disk: " + w[i];
+        }
+    }
+    return "the baked copy has " + string.from(g.length) + " lines and the file has "
+        + string.from(w.length);
+}
+
+test.start("bake: the embedded runtime is the runtime on disk", void () -> {
+    String[] onDisk = walkRuntime();
+    String[] baked = rtsrc.names();
+    if (string.join(baked, ",") != string.join(onDisk, ",")) {
+        return Error("src/embed/runtime.nio embeds a different set of files:\n"
+            + "  baked:   " + string.join(baked, ",") + "\n"
+            + "  on disk: " + string.join(onDisk, ",")
+            + "\n\nregenerate with: " + REGENERATE);
+    }
+    forEach(onDisk, name) {
+        String? got = rtsrc.file(name);
+        if (got == null) {
+            return Error("src/embed/runtime.nio has no text for " + name
+                + "\n\nregenerate with: " + REGENERATE);
+        }
+        String want = repo.readText("build/runtime/" + name);
+        if (got != want) {
+            return Error("src/embed/runtime.nio is stale for " + name + ": "
+                + firstDiff(got, want) + "\n\nregenerate with: " + REGENERATE);
+        }
+    }
+    test.assert(onDisk.length > 5,
+        "only " + string.from(onDisk.length) + " runtime files were found");
+});
+
+test.start("bake: the embedded stdlib is the stdlib on disk", void () -> {
+    String[] files = fs.readDir(repo.at("build/stdlib"));
+    array.sort(files);
+    int n = 0;
+    forEach(files, f) {
+        if (!str.hasSuffix(f, ".nio")) {
+            continue;
+        }
+        // The import path is the base name without the extension, as in the
+        // loader's table.
+        String name = string.substring(f, 0, string.length(f) - 4);
+        String? got = stdlibsrc.source(name);
+        if (got == null) {
+            return Error("src/embed/stdlib.nio has no source for the module \"" + name
+                + "\"\n\nregenerate with: " + REGENERATE);
+        }
+        String want = repo.readText("build/stdlib/" + f);
+        if (got != want) {
+            return Error("src/embed/stdlib.nio is stale for " + name + ": "
+                + firstDiff(got, want) + "\n\nregenerate with: " + REGENERATE);
+        }
+        n++;
+    }
+    test.assert(n > 0, "no stdlib module was checked");
+});

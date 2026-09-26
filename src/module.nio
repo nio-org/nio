@@ -1,0 +1,15 @@
+// One compilation unit as the back end sees it. It is a separate module, so the
+// await normalizer and the generator can both name it and the import graph
+// stays acyclic (§5.4).
+import 'ast';
+import 'checker';
+
+export type Module {
+    ast.Program prog;
+    checker.Info info;
+    String qual;
+    // The source file that a coverage report gives this module's lines to. It
+    // is empty for a standard library module, which gets no instrumentation
+    // (§6.13).
+    String path;
+}

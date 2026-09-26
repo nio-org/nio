@@ -1,0 +1,209 @@
+// The formatter (§3.2).
+//
+// The tests check three properties over all `.nio` files in the repository.
+// Each file is already formatted. Formatting a file twice gives the same text
+// as formatting it once. Formatting changes no token, so the formatter cannot
+// drop a paren or change the quotes of a string.
+import 'test';
+import 'string';
+import 'array';
+import '../src/lexer' as lexer;
+import '../src/token' as token;
+import '../src/fmtcmd' as fmtcmd;
+
+// Returns the tokens of a file, without the punctuation that the grammar makes
+// optional: a `,` after the last element of a list, a `;` after the last field
+// of a body, and a `;` after a statement that ends in a brace (parser
+// endStatement). The canonical style always writes these, so they are the only
+// tokens the formatter can add.
+String[] tokens(String src) {
+    lexer.Lexer lx = lexer.newLexer(src);
+    token.Token[] raw = [];
+    while (true) {
+        token.Token t = lx.nextToken();
+        if (t.type == token.EOF) {
+            break;
+        }
+        array.push(raw, t);
+    }
+    String[] out = [];
+    forEach(raw, t, i) {
+        if (t.type == token.COMMA || t.type == token.SEMICOLON) {
+            if (i + 1 < raw.length) {
+                String next = raw[i + 1].type;
+                if (next == token.RBRACE || next == token.RBRACKET || next == token.RPAREN) {
+                    continue;
+                }
+            }
+        }
+        if (t.type == token.SEMICOLON && i > 0 && raw[i - 1].type == token.RBRACE) {
+            continue;
+        }
+        array.push(out, t.type + "|" + t.literal + "|" + t.quote);
+    }
+    return out;
+}
+
+String fmt(String src) {
+    String[] errs = [];
+    String? out = fmtcmd.formatted(src, errs);
+    if (out == null) {
+        return "PARSE ERROR: " + string.join(errs, "; ");
+    }
+    return out;
+}
+
+test.start("format: the canonical style", void () -> {
+    // Indent, the space around each token, and one blank line where the file
+    // has one or more.
+    test.expectString(fmt(`int   x=1;
+
+
+int y  =  x+2 ;
+`), "int x = 1;\n\nint y = x + 2;\n");
+
+    // A block on one line stays on one line, and a block on several lines
+    // stays on several lines. The file decides where a construct breaks.
+    test.expectString(fmt("if (true) { print(1); }\n"), "if (true) { print(1); }\n");
+    test.expectString(fmt("if (true) {\nprint(1);\n}\n"), "if (true) {\n    print(1);\n}\n");
+
+    // An `else if` chain is written flat, although the parser puts each one in
+    // its own block.
+    test.expectString(fmt("if (true) {\nprint(1);\n} else if (false) {\nprint(2);\n} else {\nprint(3);\n}\n"),
+        "if (true) {\n    print(1);\n} else if (false) {\n    print(2);\n} else {\n    print(3);\n}\n");
+});
+
+test.start("format: a construct keeps the shape the file gave it", void () -> {
+    // A literal whose bracket closes on another line keeps its line breaks,
+    // gets a comma after the last element, and puts the bracket on its own
+    // line. A literal on one line stays on one line.
+    test.expectString(fmt("int[] a = [1, 2];\n"), "int[] a = [1, 2];\n");
+    test.expectString(fmt("int[] a = [\n1, 2\n];\n"), "int[] a = [\n    1, 2,\n];\n");
+    test.expectString(fmt("int[] a = [\n1,\n2\n];\n"), "int[] a = [\n    1,\n    2,\n];\n");
+
+    // A block in an argument list on several lines aligns with the statement.
+    test.expectString(fmt("void f(int a, Function()<void> g) { }\nf(1,\nvoid () -> {\nprint(2);\n});\n"),
+        "void f(int a, Function()<void> g) { }\nf(1,\n    void () -> {\n        print(2);\n    });\n");
+
+    // An operator at the start of a line is indented one level from the line
+    // that holds its left operand.
+    test.expectString(fmt("String s = \"a\"\n+ \"b\";\n"), "String s = \"a\"\n    + \"b\";\n");
+});
+
+test.start("format: a re-export is written back in its three forms", void () -> {
+    test.expectString(fmt("import './der' as der;\nexport der;\n"),
+        "import './der' as der;\nexport der;\n");
+    test.expectString(fmt("import './der' as der;\nexport der    show   A,B;\n"),
+        "import './der' as der;\nexport der show A, B;\n");
+    test.expectString(fmt("import './der' as der;\nexport der hide A,B;\n"),
+        "import './der' as der;\nexport der hide A, B;\n");
+});
+
+test.start("format: comments keep their place", void () -> {
+    // A comment above a declaration stays above it. A trailing comment stays
+    // on its line, four spaces after the code.
+    test.expectString(fmt("// what follows\nint x = 1; // how many\n"),
+        "// what follows\nint x = 1;    // how many\n");
+
+    // Trailing comments on adjacent lines align after the longest line.
+    test.expectString(fmt("int x = 1; // one\nint yy = 22; // two\n"),
+        "int x = 1;      // one\nint yy = 22;    // two\n");
+
+    // A comment last in a block stays inside it.
+    test.expectString(fmt("void f() {\nprint(1);\n// the end\n}\n"),
+        "void f() {\n    print(1);\n    // the end\n}\n");
+});
+
+test.start("format: what a printed tree would otherwise lose", void () -> {
+    // Grouping parens stay as the file wrote them.
+    test.expectString(fmt("bool b = (1 + 2) * 3 == 9;\n"), "bool b = (1 + 2) * 3 == 9;\n");
+    test.expectString(fmt("bool b = 1 + (2 * 3) == 7;\n"), "bool b = 1 + (2 * 3) == 7;\n");
+
+    // Each of the three string delimiters stays as the file wrote it.
+    test.expectString(fmt("String a = \"x\";\nString b = 'y';\n"), "String a = \"x\";\nString b = 'y';\n");
+    test.expectString(fmt("String a = `one\ntwo`;\n"), "String a = `one\ntwo`;\n");
+
+    // A union is written back as a union, although the parser makes a sealed
+    // type and one extender per member.
+    test.expectString(fmt("union Text { String, byte[] Bytes }\n"),
+        "union Text { String, byte[] Bytes }\n");
+    test.expectString(fmt("export union Text { String, byte[] Bytes }\n"),
+        "export union Text { String, byte[] Bytes }\n");
+});
+
+// Returns all `.nio` files in this repository, the corpus for the three tests
+// below. The suite runs from the repository root.
+String[] corpus() {
+    return fmtcmd.nioFiles(["."]);
+}
+
+test.start("format: every file in the repository is formatted", void () -> {
+    String[] unformatted = [];
+    forEach(corpus(), f) {
+        String src = fmtcmd.readText(f) catch e {
+            array.push(unformatted, f + ": " + e.message);
+            continue;
+        };
+        if (fmt(src) != src) {
+            array.push(unformatted, f);
+        }
+    }
+    test.expectString(string.join(unformatted, "\n"), "");
+});
+
+test.start("format: formatting is settled after one pass", void () -> {
+    String[] moved = [];
+    forEach(corpus(), f) {
+        String src = fmtcmd.readText(f) catch e {
+            continue;
+        };
+        String once = fmt(src);
+        if (fmt(once) != once) {
+            array.push(moved, f);
+        }
+    }
+    test.expectString(string.join(moved, "\n"), "");
+});
+
+test.start("format: formatting changes no token", void () -> {
+    String[] changed = [];
+    forEach(corpus(), f) {
+        String src = fmtcmd.readText(f) catch e {
+            continue;
+        };
+        String[] before = tokens(src);
+        String[] after = tokens(fmt(src));
+        if (before.length != after.length) {
+            array.push(changed, f + ": " + string.from(before.length)
+                + " tokens became " + string.from(after.length));
+            continue;
+        }
+        forEach(before, t, i) {
+            if (t != after[i]) {
+                array.push(changed, f + " #" + string.from(i) + ": " + t + " became " + after[i]);
+            }
+        }
+    }
+    test.expectString(string.join(changed, "\n"), "");
+});
+
+test.start("format: an interpolated string is written back as one", void () -> {
+    // The parser turns it into a concatenation. The formatter writes the
+    // template back.
+    test.expectString(fmt("String s = `a ${n + 1} b`;\n"), "String s = `a ${n + 1} b`;\n");
+    test.expectString(fmt("String s = `${n}`;\n"), "String s = `${n}`;\n");
+    test.expectString(fmt("String s = `${a}${b}`;\n"), "String s = `${a}${b}`;\n");
+    // A template in a plain concatenation stays a template.
+    test.expectString(fmt("String s = `x ${n} y` + `z`;\n"), "String s = `x ${n} y` + `z`;\n");
+    test.expectString(fmt("String s = `z` + `x ${n} y`;\n"), "String s = `z` + `x ${n} y`;\n");
+    // Text that would open a hole is written back escaped.
+    test.expectString(fmt("String s = `a\\${b}`;\n"), "String s = `a\\${b}`;\n");
+    // A template can span lines, as any backtick string can.
+    test.expectString(fmt("String s = `one ${n}\ntwo`;\n"), "String s = `one ${n}\ntwo`;\n");
+});
+
+test.start("format: escapes are written back by value", void () -> {
+    // \r, \0 and a control byte stay escapes. A printable \xNN becomes its
+    // byte.
+    test.expectString(fmt("String s = \"\\r\\0\\x41\\x01\";\n"), "String s = \"\\r\\0A\\x01\";\n");
+});

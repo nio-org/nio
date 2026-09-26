@@ -1,0 +1,417 @@
+// Errors as values (§2.9), end to end: what a compiled program does when an
+// error is raised, caught, propagated through frames, or not caught.
+// tests/checker_errors_test.nio holds the checker half.
+import 'test';
+import './harness' as h;
+
+test.start("errors: error catch default", void () -> {
+    h.expectOutput(`
+String lookup(int id) {
+    if (id < 0) { return Error("negative id"); }
+    return "Jean";
+}
+print(lookup(1) catch "nobody");
+print(lookup(-1) catch "nobody");
+`, [
+        "Jean", "nobody",
+    ]);
+});
+
+// A function between the raise and the catch never mentions errors.
+test.start("errors: error propagates through frames", void () -> {
+    h.expectOutput(`
+String lookup(int id) {
+    if (id < 0) { return Error("negative id"); }
+    return "Jean";
+}
+String greet(int id) { return "hello " + lookup(id); }
+String page(int id) { return greet(id) + "!"; }
+String site(int id) { return "[" + page(id) + "]"; }
+print(site(1) catch "fallback");
+print(site(-1) catch "fallback");
+`, [
+        "[hello Jean!]", "fallback",
+    ]);
+});
+
+test.start("errors: error catch block leaves scope", void () -> {
+    h.expectOutput(`
+String lookup(int id) {
+    if (id < 0) { return Error("negative id"); }
+    return "Jean";
+}
+String describe(int id) {
+    String name = lookup(id) catch e {
+        print("failed: " + e.message);
+        return "unknown";
+    };
+    return "found " + name;
+}
+print(describe(2));
+print(describe(-1));
+`, [
+        "found Jean", "failed: negative id", "unknown",
+    ]);
+});
+
+// A block that falls through is allowed only where a null can land.
+test.start("errors: error catch block falls through to null", void () -> {
+    h.expectOutput(`
+String lookup(int id) {
+    if (id < 0) { return Error("negative id"); }
+    return "Jean";
+}
+String? a = lookup(1) catch e { print("caught: " + e.message); };
+String? b = lookup(-1) catch e { print("caught: " + e.message); };
+print(a);
+print(b);
+if (b == null) { print("b is absent"); }
+String? c = lookup(-1) catch null;
+print(c);
+`, [
+        "caught: negative id", "Jean", "null", "b is absent", "null",
+    ]);
+});
+
+// In statement position nothing is bound, so the handler can run alone.
+test.start("errors: error catch statement position", void () -> {
+    h.expectOutput(`
+void run(int id) {
+    if (id < 0) { return Error("negative id"); }
+    print("ran " + "ok");
+}
+run(1) catch e { print("ignored: " + e.message); };
+run(-1) catch e { print("ignored: " + e.message); };
+print("done");
+`, [
+        "ran ok", "ignored: negative id", "done",
+    ]);
+});
+
+// `return e` in a catch block hands the error to the caller: the rethrow.
+test.start("errors: error rethrow", void () -> {
+    h.expectOutput(`
+String lookup(int id) {
+    if (id < 0) { return Error("negative id"); }
+    return "Jean";
+}
+String shout(int id) {
+    String name = lookup(id) catch e {
+        print("giving up");
+        return e;
+    };
+    return name + "!";
+}
+print(shout(2) catch "quiet");
+print(shout(-1) catch "quiet");
+`, [
+        "Jean!", "giving up", "quiet",
+    ]);
+});
+
+// One catch covers the whole expression it follows.
+test.start("errors: error catch covers whole expression", void () -> {
+    h.expectOutput(`
+String a(int n) { if (n == 1) { return Error("a failed"); } return "A"; }
+String b(int n) { if (n == 2) { return Error("b failed"); } return "B"; }
+String join(int n) {
+    return a(n) + b(n) catch e { return "caught " + e.message; };
+}
+print(join(0));
+print(join(1));
+print(join(2));
+`, [
+        "AB", "caught a failed", "caught b failed",
+    ]);
+});
+
+// Top-level code has no `return`, so the outermost handler is a function's.
+test.start("errors: error nested catch", void () -> {
+    h.expectOutput(`
+String inner(int n) { if (n < 0) { return Error("inner"); } return "in"; }
+String outer(int n) {
+    String s = inner(n) catch e {
+        print("outer sees: " + e.message);
+        return Error("outer");
+    };
+    return s;
+}
+String top(int n) {
+    String s = outer(n) catch e { print("top sees: " + e.message); return "end"; };
+    return s;
+}
+print(top(-1));
+print(top(1));
+print(inner(-1) catch (inner(1) catch "double"));
+`, [
+        "outer sees: inner", "top sees: outer", "end", "in", "in",
+    ]);
+});
+
+// A fallible void function has only an error to return.
+test.start("errors: error void function", void () -> {
+    h.expectOutput(`
+void check(int n) {
+    if (n < 0) { return Error("bad " + "input"); }
+    print("checked");
+}
+void runAll(int n) { check(n); print("all done"); }
+runAll(1) catch e { print("stopped: " + e.message); };
+runAll(-1) catch e { print("stopped: " + e.message); };
+`, [
+        "checked", "all done", "stopped: bad input",
+    ]);
+});
+
+test.start("errors: error in loops", void () -> {
+    h.expectOutput(`
+int half(int n) {
+    if (n % 2 == 1) { return Error("odd"); }
+    return n / 2;
+}
+int total = 0;
+for (int i = 0; i < 6; i++) {
+    int h = half(i) catch e { continue; };   // skips 1, 3, 5
+    total = total + h;
+}
+print(total);                                 // 0 + 1 + 2
+for (int i = 0; i < 6; i++) {
+    int h = half(i + 1) catch e { break; };   // half(1) fails at once
+    print(h);
+}
+print("after");
+`, [
+        "3", "after",
+    ]);
+});
+
+// A function value's type carries fallibility, because the call site has no
+// body to infer it from.
+test.start("errors: error function values", void () -> {
+    h.expectOutput(`
+Function(int)<String!> maker() {
+    return String (int id) -> {
+        if (id == 0) { return Error("bad seed"); }
+        return "Jack";
+    };
+}
+Function(int)<String!> gen = maker();
+print(gen(1) catch "anonymous");
+print(gen(0) catch "anonymous");
+
+Function(int)<String!> safe = String (int id) -> "always";
+print(safe(0) catch "anonymous");
+`, [
+        "Jack", "anonymous", "always",
+    ]);
+});
+
+// A catch binding captured by a closure lives in a shared box.
+test.start("errors: error binding captured", void () -> {
+    h.expectOutput(`
+String fail() { return Error("captured"); }
+String? s = fail() catch e {
+    Function()<String> show = String () -> e.message;
+    print(show());
+};
+print(s);
+`, [
+        "captured", "null",
+    ]);
+});
+
+test.start("errors: error async await", void () -> {
+    h.expectOutput(`
+String async fetch(int id) {
+    if (id < 0) { return Error("bad id"); }
+    return "remote";
+}
+print(await fetch(1) catch "offline");
+print(await fetch(-1) catch "offline");
+Future<String!> pending = fetch(-1);
+print(await pending catch "offline");
+`, [
+        "remote", "offline", "offline",
+    ]);
+});
+
+// The inner task raises after the outer one has already parked on it.
+test.start("errors: error async across suspension", void () -> {
+    h.expectOutput(`
+import 'time';
+String async inner(int id) {
+    await time.sleep(1);
+    if (id < 0) { return Error("inner failed"); }
+    return "inner ok";
+}
+String async outer(int id) {
+    String s = await inner(id) catch e { return Error("outer: " + e.message); };
+    return "outer got " + s;
+}
+String async top(int id) {
+    String s = await outer(id) catch e { print("caught " + e.message); return "done"; };
+    return s;
+}
+print(await top(1));
+print(await top(-1));
+`, [
+        "outer got inner ok", "caught outer: inner failed", "done",
+    ]);
+});
+
+test.start("errors: error uncaught aborts", void () -> {
+    h.expectRuntimeError(`
+String lookup(int id) {
+    if (id < 0) { return Error("negative id"); }
+    return "Jean";
+}
+String greet(int id) { return "hello " + lookup(id); }
+print(greet(1));
+print(greet(-1));
+print("never reached");
+`, "runtime error: negative id");
+});
+
+// An unawaited task cannot lose its error: the drain at the end reports it.
+test.start("errors: error uncaught async aborts", void () -> {
+    h.expectRuntimeError(`
+String async fetch(int id) {
+    if (id < 0) { return Error("dropped on the floor"); }
+    return "ok";
+}
+fetch(-1);
+print("top-level done");
+`, "runtime error: dropped on the floor");
+});
+
+// The Error itself is an ordinary record, so a program can hold and pass one.
+test.start("errors: error as value", void () -> {
+    h.expectOutput(`
+Error make(String what) { return Error("cannot " + what); }
+String describe(Error e) { return "[" + e.message + "]"; }
+Error e = make("open");
+print(describe(e));
+String? boom = alwaysFails() catch caught { print(describe(caught)); };
+print(boom);
+String alwaysFails() { return Error("always"); }
+`, [
+        "[cannot open]", "[always]", "null",
+    ]);
+});
+
+// A fallible call is an expression like any other, and the catch after the
+// whole thing still covers it.
+test.start("errors: error in expression positions", void () -> {
+    h.expectOutput(`
+type Box { String label; }
+String risky(int n) { if (n < 0) { return Error("risky"); } return "v"; }
+String tag(String s) { return "<" + s + ">"; }
+
+Function()<String> pick(int n) {
+    if (n < 0) { return Error("no pick"); }
+    return String () -> "picked";
+}
+
+print(tag(risky(1)) catch "arg failed");
+print(tag(risky(-1)) catch "arg failed");
+print(pick(1)() catch "none");
+print(pick(-1)() catch "none");
+
+Box a = { label: risky(1) } catch { label: "default" };
+Box b = { label: risky(-1) } catch { label: "default" };
+print(a.label);
+print(b.label);
+`, [
+        "<v>", "arg failed", "picked", "none", "v", "default",
+    ]);
+});
+
+// A bare return from a fallible void function pairs with a null error.
+test.start("errors: error void bare return", void () -> {
+    h.expectOutput(`
+void check(int n) {
+    if (n < 0) { return Error("neg"); }
+    if (n == 0) { return; }
+    print("checked");
+}
+check(0) catch e { print(e.message); };
+check(1) catch e { print(e.message); };
+check(-1) catch e { print("caught " + e.message); };
+`, [
+        "checked", "caught neg",
+    ]);
+});
+
+// Fallibility is inferred per function and crosses module boundaries. greet
+// does not mention an Error, but it is fallible because lookup is.
+test.start("errors: error across modules", void () -> {
+    h.expectFilesOutput([
+        h.file("lib.nio", `
+export String lookup(int id) {
+    if (id < 0) { return Error("lib says: negative"); }
+    return "Jean";
+}
+export String greet(int id) { return "hello " + lookup(id); }
+`),
+        h.file("main.nio", `
+import 'lib.nio';
+print(lib.greet(1) catch "fallback");
+print(lib.greet(-1) catch "fallback");
+String? s = lib.lookup(-1) catch e { print("caught: " + e.message); };
+print(s);
+`),
+    ], "main.nio", ["hello Jean", "fallback", "caught: lib says: negative", "null"]);
+});
+
+// An Error lives in a caller slot that is a GC root of the frame. A handler
+// that `continue`s a loop must not leave a stale Error in it.
+test.start("errors: GC stress errors", void () -> {
+    String out = h.sameUnderStress(`
+import 'array';
+String label(int n) {
+    if (n % 3 == 0) { return Error("multiple of three: " + text(n)); }
+    return "value " + text(n);
+}
+String text(int n) {
+    String[] digits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    return digits[n % 10];
+}
+String[] out = [];
+for (int i = 0; i < 30; i++) {
+    String s = label(i) catch e { array.push(out, "err " + e.message); continue; };
+    array.push(out, s);
+}
+forEach(out, line) { print(line); }
+String? last = label(30) catch e { print("last: " + e.message); };
+print(last);
+`);
+    h.expectContains(out, "err multiple of three: 3");
+    h.expectContains(out, "last: multiple of three: 0");
+});
+
+// A fallible async body leaves its Error in frame slot 3. The scheduler moves
+// it into the future, and the await takes it back through rt_future_error. All
+// of this must survive a collection at every allocation.
+test.start("errors: GC stress async errors", void () -> {
+    String out = h.sameUnderStress(`
+import 'time';
+String async step(int n) {
+    await time.sleep(0);
+    if (n % 2 == 0) { return Error("even " + text(n)); }
+    return "odd " + text(n);
+}
+String text(int n) {
+    String[] digits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    return digits[n % 10];
+}
+String async runOne(int n) {
+    String s = await step(n) catch e { return "handled " + e.message; };
+    return s;
+}
+for (int i = 0; i < 8; i++) {
+    print(await runOne(i));
+}
+`);
+    h.expectContains(out, "handled even 0");
+    h.expectContains(out, "odd 1");
+});

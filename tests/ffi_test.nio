@@ -1,0 +1,83 @@
+// Native interop (§5.8), checker half: what an extern declaration and a native
+// statement may contain, and what each records for the later stages.
+// tests/ffi_e2e_test.nio holds the end-to-end half, which needs clang.
+import 'test';
+import 'string';
+import 'array';
+import './checkerlib' as lib;
+import '../src/types' as types;
+
+test.start("ffi: extern declarations register and check", void () -> {
+    lib.Checked c = lib.checkProg(`
+import 'string';
+extern int add(int a, int b);
+extern void poke();
+extern String greet(String name);
+extern float mean(float[] xs);
+extern bool flag(byte[] data);
+int use() {
+    poke();
+    if (flag(string.toByteArray(greet("x")))) {
+        return add(1, 2);
+    }
+    return 0;
+}
+`);
+    test.assert(c.errs.length == 0, "unexpected errors:\n" + string.join(c.errs, "\n"));
+    String[] names = ["add", "poke", "greet", "mean", "flag"];
+    forEach(names, n) {
+        types.FuncType? sig = c.info.funcs[n];
+        if (sig == null) {
+            return Error("no signature recorded for extern " + n);
+        }
+        test.assert(sig.extern, n + " is not marked extern on its signature");
+        test.assert(!sig.fallible, n + " must not be fallible: an extern has no body to raise from");
+        test.assert(c.info.externs[n] != null, n + " missing from Info.externs");
+    }
+    types.FuncType? plain = c.info.funcs["use"];
+    if (plain == null) {
+        return Error("no signature recorded for use");
+    }
+    test.assert(!plain.extern, "a plain function must not be marked extern");
+});
+
+test.start("ffi: extern type restrictions", void () -> {
+    lib.rejects([
+        lib.bad("record param", "type T { int n; } extern void f(T t);", "cannot cross the C boundary"),
+        lib.bad("optional param", "extern void f(int? n);", "cannot cross the C boundary"),
+        lib.bad("map param", "extern void f(Map<String, int> m);", "cannot cross the C boundary"),
+        lib.bad("function param", "extern void f(Function(int)<int> g);", "cannot cross the C boundary"),
+        lib.bad("nested array param", "extern void f(int[][] rows);", "cannot cross the C boundary"),
+        lib.bad("record return", "type T { int n; } extern T f();", "cannot cross the C boundary"),
+        lib.bad("optional return", "extern String? f();", "cannot cross the C boundary"),
+        lib.bad("variadic", "extern int f(...int xs);", "cannot be variadic"),
+        lib.bad("runtime prefix", "extern int rt_alloc(int n);", "collides with the runtime"),
+        lib.bad("main", "extern int main(int argc);", "collides with the runtime"),
+        lib.bad("duplicate", "extern int f(int a); extern int f(int a);", "already declared"),
+    ]);
+});
+
+test.start("ffi: native statement checks", void () -> {
+    lib.accepts([
+        lib.ok("flags for one platform", "native flags darwin '-framework Cocoa';"),
+        lib.ok("flags for every platform", "native flags '-lm';"),
+        // The checker validates spelling only. The loader asks whether the
+        // file exists.
+        lib.ok("source shape", "native source './x.c';"),
+        lib.ok("objective-c source", "native source './x.m';"),
+        lib.ok("header source", "native source './x.h';"),
+    ]);
+    lib.rejects([
+        lib.bad("unknown platform", "native flags plan9 '-lfoo';", "unknown platform"),
+        lib.bad("not a source", "native source './x.txt';", "a native source is a .c, .m or .h file"),
+        lib.bad("nested", "void f() { native flags '-lm'; }", "only allowed at the top level"),
+    ]);
+});
+
+test.start("ffi: extern and native stay ordinary identifiers", void () -> {
+    lib.accepts([
+        lib.ok("extern as a variable", "int extern = 3; print(extern);"),
+        lib.ok("native as a variable", "int native = 4; print(native);"),
+        lib.ok("extern as a function name", "int extern() { return 1; } print(extern());"),
+    ]);
+});

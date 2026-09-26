@@ -1,0 +1,78 @@
+// The Nio server for the visual HTTP benchmark. bench.py drives it over a
+// growing number of keep-alive connections. It binds port 0 and prints the
+// port it gets.
+import 'http';
+import 'json';
+import 'string';
+import 'process';
+
+type Message {
+    String message;
+}
+
+// The POST /data scenario sends a ~50 KB document of these items.
+type Item {
+    int id;
+    String name;
+    float price;
+    int qty;
+    bool active;
+}
+
+type Payload {
+    Item[] items;
+}
+
+type Summary {
+    int count;
+    float total;
+}
+
+http.Server s = http.server();
+
+http.Response plaintext(http.Request req) {
+    return http.text(200, "Hello, World!");
+}
+
+http.Response jsonMessage(http.Request req) {
+    Message m = { message: "Hello, World!" };
+    return http.json(200, json.toText(m));
+}
+
+http.Response postData(http.Request req) {
+    // Parses the body in place (§6.3), without a fromByteArray copy.
+    Payload p = json.parse(req.body) as Payload catch e {
+        return http.text(400, "bad json: " + e.message);
+    };
+    float total = 0.0;
+    forEach(p.items, it) {
+        total = total + it.price;
+    }
+    Summary s = { count: p.items.length, total: total };
+    return http.json(200, json.toText(s));
+}
+
+http.Response showUser(http.Request req) {
+    String? id = req.params["id"];
+    if (id == null) { return http.text(400, "missing id"); }
+    return http.text(200, "user " + id);
+}
+
+void async main() {
+    s.route(http.Method.GET, "/plaintext", http.Response (http.Request r) -> plaintext(r));
+    s.route(http.Method.GET, "/json", http.Response (http.Request r) -> jsonMessage(r));
+    s.route(http.Method.GET, "/users/:id", http.Response (http.Request r) -> showUser(r));
+    s.route(http.Method.POST, "/data", http.Response (http.Request r) -> postData(r));
+
+    // A backlog of 1024 matches the Java server. With the default of 128, the
+    // 500-connection stage waits for SYN retries.
+    int port = s.bind("127.0.0.1", 0, { backlog: 1024 });
+    print(string.from(port));
+    process.stdout.flush();
+
+    await s.serve();
+}
+
+await main() catch e {
+    print("failed: " + e.message);
+};

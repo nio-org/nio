@@ -1,0 +1,580 @@
+// Signatures of the built-in library functions whose types are fixed (§6), as
+// data. The checker looks one up and checks the call like any other. A module
+// of their own keeps the import graph acyclic (§5.4).
+// Functions with no fixed signature are not here, and the checker checks each
+// by hand: array and map are generic, json.parse and `as` take a type,
+// string.from takes what print takes, and async.run follows its future.
+import 'types';
+import 'map';
+
+types.Basic const bStr = types.StringT;
+types.Basic const bInt = types.IntT;
+types.Basic const bBool = types.BoolT;
+types.Basic const bVoid = types.VoidT;
+types.Array const bBytes = types.newArray(types.Uint8T);
+types.Array const bStrs = types.newArray(types.StringT);
+types.Basic const bFloat = types.FloatT;
+
+types.FuncType sig(types.Type[] params, types.Type ret) {
+    return types.newFuncType(params, ret);
+}
+
+types.FuncType fallibleSig(types.Type[] params, types.Type ret) {
+    types.FuncType f = types.newFuncType(params, ret);
+    f.fallible = true;
+    return f;
+}
+
+types.FuncType variadicSig(types.Type[] params, types.Type ret) {
+    types.FuncType f = types.newFuncType(params, ret);
+    f.variadic = true;
+    return f;
+}
+
+// Fixed signature per built-in function, keyed by "module.function". A
+// namespace member keeps its dotted name.
+export Map<String, types.FuncType> builtinSigs = {};
+
+builtinSigs["os.getArch"] = sig([], bStr);
+builtinSigs["os.getCpus"] = sig([], types.newArray(types.CpuT));
+builtinSigs["os.getPlatform"] = sig([], bStr);
+
+// math (§6.21). abs, min, max, clamp and toFloat take any number type and are
+// checked by hand. PI and E are constants (builtinConsts below).
+builtinSigs["math.acos"] = sig([bFloat], bFloat);
+builtinSigs["math.asin"] = sig([bFloat], bFloat);
+builtinSigs["math.atan"] = sig([bFloat], bFloat);
+builtinSigs["math.atan2"] = sig([bFloat, bFloat], bFloat);
+builtinSigs["math.ceil"] = sig([bFloat], bFloat);
+builtinSigs["math.cos"] = sig([bFloat], bFloat);
+builtinSigs["math.exp"] = sig([bFloat], bFloat);
+builtinSigs["math.floor"] = sig([bFloat], bFloat);
+builtinSigs["math.isInfinite"] = sig([bFloat], bBool);
+builtinSigs["math.isNaN"] = sig([bFloat], bBool);
+builtinSigs["math.log"] = sig([bFloat], bFloat);
+builtinSigs["math.log10"] = sig([bFloat], bFloat);
+builtinSigs["math.log2"] = sig([bFloat], bFloat);
+builtinSigs["math.pow"] = sig([bFloat, bFloat], bFloat);
+builtinSigs["math.round"] = sig([bFloat], bFloat);
+builtinSigs["math.sin"] = sig([bFloat], bFloat);
+builtinSigs["math.sqrt"] = sig([bFloat], bFloat);
+builtinSigs["math.tan"] = sig([bFloat], bFloat);
+builtinSigs["math.toInt"] = sig([bFloat], bInt);
+
+// random (§6.22). shuffle and pick take any array and are checked by hand.
+builtinSigs["random.float"] = sig([], bFloat);
+builtinSigs["random.int"] = sig([bInt, bInt], bInt);
+builtinSigs["random.seed"] = sig([bInt], bVoid);
+
+builtinSigs["path.getCwd"] = sig([], bStr);
+builtinSigs["path.join"] = variadicSig([bStr, bStrs], bStr);
+builtinSigs["path.localize"] = sig([bStr], bStr);
+builtinSigs["path.userData"] = fallibleSig([bStr], bStr);
+
+builtinSigs["fs.copy"] = fallibleSig([bStr, bStr], bVoid);
+builtinSigs["fs.createDir"] = fallibleSig([bStr], bVoid);
+builtinSigs["fs.createTempDir"] = fallibleSig([bStr], bStr);
+builtinSigs["fs.delete"] = fallibleSig([bStr, types.DeleteOptionsT], bVoid);
+builtinSigs["fs.exists"] = sig([bStr], bBool);
+builtinSigs["fs.readDir"] = fallibleSig([bStr], bStrs);
+builtinSigs["fs.readFile"] = fallibleSig([bStr], bBytes);
+builtinSigs["fs.rename"] = fallibleSig([bStr, bStr], bVoid);
+builtinSigs["fs.stat"] = fallibleSig([bStr], types.StatT);
+builtinSigs["fs.writeFile"] = fallibleSig([bStr, bBytes], bVoid);
+
+builtinSigs["string.append"] = sig([bStr, bStr], bStr);
+builtinSigs["string.bytesEqualConstantTime"] = sig([bBytes, bBytes], bBool);
+builtinSigs["string.contains"] = sig([bStr, bStr], bBool);
+builtinSigs["string.copy"] = sig([bStr], bStr);
+builtinSigs["string.equalsConstantTime"] = sig([bStr, bStr], bBool);
+builtinSigs["string.find"] = sig([bStr, bStr], bInt);
+builtinSigs["string.fromByteArray"] = sig([bBytes], bStr);
+builtinSigs["string.join"] = sig([bStrs, bStr], bStr);
+builtinSigs["string.length"] = sig([bStr], bInt);
+builtinSigs["string.replace"] = sig([bStr, bStr, bStr], bStr);
+builtinSigs["string.replaceAll"] = sig([bStr, bStr, bStr], bStr);
+builtinSigs["string.split"] = sig([bStr, bStr], bStrs);
+builtinSigs["string.substring"] = sig([bStr, bInt, bInt], bStr);
+builtinSigs["string.toByteArray"] = sig([bStr], bBytes);
+builtinSigs["string.toFloat"] = fallibleSig([bStr], types.FloatT);
+builtinSigs["string.toInt"] = fallibleSig([bStr], bInt);
+builtinSigs["string.toUint"] = fallibleSig([bStr], types.UintT);
+// The names state the mapping (§6.6): ASCII only.
+builtinSigs["string.toLowerCaseAscii"] = sig([bStr], bStr);
+builtinSigs["string.toUpperCaseAscii"] = sig([bStr], bStr);
+// Code points (§4.7, §6.6). runeAt takes a byte offset, so it runs in constant
+// time. A program walks the string to reach a code-point index.
+builtinSigs["string.runeCount"] = sig([bStr], bInt);
+builtinSigs["string.runeAt"] = sig([bStr, bInt], bInt);
+builtinSigs["string.fromRunes"] = sig([types.newArray(types.IntT)], bStr);
+builtinSigs["string.isValidUtf8"] = sig([bStr], bBool);
+builtinSigs["string.trim"] = sig([bStr], bStr);
+
+builtinSigs["time.now"] = sig([], types.DateTimeT);
+builtinSigs["time.duration"] = sig([bStr], types.DurationT);
+builtinSigs["time.milliseconds"] = sig([types.DurationT], bInt);
+builtinSigs["time.sleep"] = sig([types.DurationT], types.newFutureType(bVoid, false));
+
+// The time.date namespace: calendar reads and moves on a DateTime, in UTC.
+// addDays works on the calendar, and adding a Duration works on elapsed time.
+builtinSigs["time.date.fromText"] = sig([bStr], types.DateTimeT);
+builtinSigs["time.date.toText"] = sig([types.DateTimeT], bStr);
+builtinSigs["time.date.year"] = sig([types.DateTimeT], bInt);
+builtinSigs["time.date.month"] = sig([types.DateTimeT], bInt);
+builtinSigs["time.date.day"] = sig([types.DateTimeT], bInt);
+builtinSigs["time.date.addDays"] = sig([types.DateTimeT, bInt], types.DateTimeT);
+
+builtinSigs["process.exit"] = sig([bInt], bVoid);
+builtinSigs["process.getArgs"] = sig([], bStrs);
+builtinSigs["process.stdout.write"] = sig([bStr], bVoid);
+builtinSigs["process.stdout.flush"] = sig([], bVoid);
+builtinSigs["process.stderr.write"] = sig([bStr], bVoid);
+builtinSigs["process.stderr.flush"] = sig([], bVoid);
+builtinSigs["process.stdin.read"] = fallibleSig([], bBytes);
+builtinSigs["process.stdin.readLine"] = fallibleSig([], types.newOptional(bStr));
+builtinSigs["process.stdin.readBytes"] = fallibleSig([bInt], bBytes);
+
+// child.run returns a future. Its only failure, that the program did not start,
+// travels on the future, so the call itself is not fallible.
+builtinSigs["process.child.run"] = sig(
+    [bStr, bStrs, types.ChildRunOptionsT],
+    types.newFutureType(types.ChildRunResultT, true));
+
+// A net call that waits returns a fallible future, so the caller gets the
+// failure at the await. Most calls take an optional net.Options last argument.
+builtinSigs["net.tcp.listen"] = fallibleSig([bStr, types.NetOptionsT], types.ListenerT);
+builtinSigs["net.tcp.connect"] = sig([bStr, types.NetOptionsT],
+    types.newFutureType(types.SocketT, true));
+builtinSigs["net.udp.bind"] = fallibleSig([bStr], types.SocketT);
+builtinSigs["net.unix.listen"] = fallibleSig([bStr, types.NetOptionsT], types.ListenerT);
+builtinSigs["net.unix.connect"] = sig([bStr, types.NetOptionsT],
+    types.newFutureType(types.SocketT, true));
+
+builtinSigs["net.accept"] = sig([types.ListenerT, types.NetOptionsT],
+    types.newFutureType(types.SocketT, true));
+builtinSigs["net.read"] = sig([types.SocketT, bInt, types.NetOptionsT],
+    types.newFutureType(bBytes, true));
+builtinSigs["net.readExactly"] = sig([types.SocketT, bInt, types.NetOptionsT],
+    types.newFutureType(bBytes, true));
+builtinSigs["net.write"] = sig([types.SocketT, bBytes, types.NetOptionsT],
+    types.newFutureType(bVoid, true));
+builtinSigs["net.receive"] = sig([types.SocketT, bInt, types.NetOptionsT],
+    types.newFutureType(types.DatagramT, true));
+builtinSigs["net.send"] = sig([types.SocketT, bStr, bBytes, types.NetOptionsT],
+    types.newFutureType(bVoid, true));
+builtinSigs["net.peer"] = fallibleSig([types.SocketT], bStr);
+
+builtinSigs["regexp.create"] = fallibleSig([bStr, bStr], types.RegExpT);
+builtinSigs["regexp.find"] = sig([bStr, types.RegExpT], bInt);
+builtinSigs["regexp.match"] = sig([bStr, types.RegExpT], bBool);
+
+// The crypto module (§6.17). The hash is part of the function name and is not
+// an argument, so a wrong algorithm name is a compile error. The decoders are
+// fallible, because encoded text comes from outside the program.
+builtinSigs["crypto.base64Decode"] = fallibleSig([bStr], bBytes);
+builtinSigs["crypto.chacha20Poly1305Open"] = fallibleSig([bBytes, bBytes, bBytes, bBytes], bBytes);
+builtinSigs["crypto.chacha20Poly1305Seal"] = sig([bBytes, bBytes, bBytes, bBytes], bBytes);
+builtinSigs["crypto.base64Encode"] = sig([bBytes], bStr);
+builtinSigs["crypto.hexDecode"] = fallibleSig([bStr], bBytes);
+builtinSigs["crypto.hexEncode"] = sig([bBytes], bStr);
+builtinSigs["crypto.hkdfExpandSha256"] = sig([bBytes, bBytes, bInt], bBytes);
+builtinSigs["crypto.hkdfExpandSha384"] = sig([bBytes, bBytes, bInt], bBytes);
+builtinSigs["crypto.hkdfExtractSha256"] = sig([bBytes, bBytes], bBytes);
+builtinSigs["crypto.hkdfExtractSha384"] = sig([bBytes, bBytes], bBytes);
+builtinSigs["crypto.hmacSha256"] = sig([bBytes, bBytes], bBytes);
+builtinSigs["crypto.hmacSha384"] = sig([bBytes, bBytes], bBytes);
+builtinSigs["crypto.randomBytes"] = sig([bInt], bBytes);
+builtinSigs["crypto.sha256"] = sig([bBytes], bBytes);
+builtinSigs["crypto.sha384"] = sig([bBytes], bBytes);
+builtinSigs["crypto.x25519PublicKey"] = sig([bBytes], bBytes);
+builtinSigs["crypto.x25519SharedSecret"] = fallibleSig([bBytes, bBytes], bBytes);
+
+// The RSA verifiers (§6.17) return nothing and raise on failure, so there is no
+// boolean a caller can forget to test.
+builtinSigs["crypto.rsaVerifyPkcs1v15"] =
+    fallibleSig([bBytes, bInt, bStr, bBytes, bBytes], bVoid);
+builtinSigs["crypto.rsaVerifyPss"] =
+    fallibleSig([bBytes, bInt, bStr, bBytes, bBytes], bVoid);
+
+// The ECDSA verifier (§6.17) raises the same way. The name holds the curve. A
+// key length never selects it. r and s arrive without their DER encoding,
+// because x509 does the ASN.1 parsing.
+builtinSigs["crypto.ecdsaVerify"] =
+    fallibleSig([bStr, bBytes, bBytes, bBytes, bBytes], bVoid);
+
+// AES-128-GCM (§6.17). Seal and open are both fallible. The cipher runs only
+// where the CPU does it in constant time, and there is no software fallback.
+// A caller checks aesGcmAvailable first.
+builtinSigs["crypto.aesGcmAvailable"] = sig([], bBool);
+builtinSigs["crypto.aes128GcmSeal"] =
+    fallibleSig([bBytes, bBytes, bBytes, bBytes], bBytes);
+builtinSigs["crypto.aes128GcmOpen"] =
+    fallibleSig([bBytes, bBytes, bBytes, bBytes], bBytes);
+
+// What a diagnostic prints when a module has no function with the given name.
+// It is not derived from the table above, because several entries are prose.
+Map<String, String> builtinAvailable = {
+    "os": "getArch, getCpus, getPlatform",
+    "math": "PI, E, abs, acos, asin, atan, atan2, ceil, clamp, cos, exp, floor, isInfinite, isNaN, log, log10, log2, max, min, pow, round, sin, sqrt, tan, toFloat, toInt",
+    "random": "float, int, pick, seed, shuffle",
+    "path": "getCwd, join, localize, userData",
+    "fs": "copy, createDir, createTempDir, delete, exists, readDir, readFile, rename, stat, writeFile",
+    "string": "append, bytesEqualConstantTime, contains, copy, equalsConstantTime, find, from, fromByteArray, fromRunes, isValidUtf8, join, length, replace, replaceAll, runeAt, runeCount, split, substring, toByteArray, toFloat, toInt, toLowerCaseAscii, toUint, toUpperCaseAscii, trim",
+    "time.date": "fromText, toText, year, month, day, addDays",
+    "process": "exit, getArgs, and the stdout, stderr, stdin, child groups",
+    "process.stdout": "flush, write",
+    "process.stderr": "flush, write",
+    "process.stdin": "read, readBytes, readLine",
+    "process.child": "run",
+    "regexp": "create, find, match",
+    "crypto": "aes128GcmOpen, aes128GcmSeal, aesGcmAvailable, base64Decode, base64Encode, chacha20Poly1305Open, chacha20Poly1305Seal, ecdsaVerify, hexDecode, hexEncode, hkdfExpandSha256, hkdfExpandSha384, hkdfExtractSha256, hkdfExtractSha384, hmacSha256, hmacSha384, randomBytes, rsaVerifyPkcs1v15, rsaVerifyPss, sha256, sha384, x25519PublicKey, x25519SharedSecret",
+    "net": "accept, address, close, peer, read, readExactly, receive, send, write, and the tcp, udp, unix groups",
+    "net.tcp": "connect, listen",
+    "net.udp": "bind",
+    "net.unix": "connect, listen",
+};
+
+// Built-in functions whose last parameter is an options record a call can omit.
+// An omitted record is a record with every field null.
+Map<String, bool> builtinOptionalTail = {
+    "fs.delete": true,
+    "process.child.run": true,
+    "regexp.create": true,
+    "net.tcp.listen": true,
+    "net.tcp.connect": true,
+    "net.unix.listen": true,
+    "net.unix.connect": true,
+    "net.accept": true,
+    "net.read": true,
+    "net.readExactly": true,
+    "net.write": true,
+    "net.receive": true,
+    "net.send": true,
+};
+
+// What a program can write after `module.`, in the order of §6. The language
+// server completes from this table: builtinAvailable is prose, and builtinSigs
+// has no member without a fixed signature. tests/lsp_test.nio checks that this
+// table and builtinSigs agree.
+export Map<String, String[]> const builtinMemberNames = {
+    "array": [
+        "concat", "contains", "copy", "every", "fill", "filter", "find", "flatten",
+        "indexOf", "map", "pop", "push", "reduce", "reverse", "slice", "some", "sort",
+    ],
+    "map": ["copy", "has", "keys", "remove", "values"],
+    "json": [
+        "asBool", "asFloat", "asInt", "asText", "getType", "keys", "length",
+        "parse", "push", "remove", "toText",
+    ],
+    "async": ["race", "run"],
+    "string": [
+        "append", "bytesEqualConstantTime", "contains", "copy",
+        "equalsConstantTime", "find", "from", "fromByteArray", "fromRunes",
+        "isValidUtf8", "join", "length", "replace", "replaceAll", "runeAt",
+        "runeCount", "split", "substring", "toByteArray", "toFloat", "toInt",
+        "toLowerCaseAscii", "toUint", "toUpperCaseAscii", "trim",
+    ],
+    "time": ["date", "duration", "milliseconds", "now", "sleep"],
+    "time.date": ["addDays", "day", "fromText", "month", "toText", "year"],
+    "math": [
+        "PI", "E", "abs", "acos", "asin", "atan", "atan2", "ceil", "clamp", "cos",
+        "exp", "floor", "isInfinite", "isNaN", "log", "log10", "log2", "max", "min",
+        "pow", "round", "sin", "sqrt", "tan", "toFloat", "toInt",
+    ],
+    "random": ["float", "int", "pick", "seed", "shuffle"],
+    "os": ["getArch", "getCpus", "getPlatform"],
+    "path": ["getCwd", "join", "localize", "userData"],
+    "fs": [
+        "copy", "createDir", "createTempDir", "delete", "exists", "readDir",
+        "readFile", "rename", "stat", "writeFile",
+    ],
+    "regexp": ["create", "find", "match"],
+    "crypto": [
+        "aes128GcmOpen", "aes128GcmSeal", "aesGcmAvailable",
+        "base64Decode", "base64Encode", "chacha20Poly1305Open",
+        "chacha20Poly1305Seal", "ecdsaVerify", "hexDecode", "hexEncode",
+        "hkdfExpandSha256", "hkdfExpandSha384", "hkdfExtractSha256",
+        "hkdfExtractSha384", "hmacSha256", "hmacSha384", "randomBytes",
+        "rsaVerifyPkcs1v15", "rsaVerifyPss", "sha256", "sha384",
+        "x25519PublicKey", "x25519SharedSecret",
+    ],
+    "net": [
+        "accept", "address", "close", "peer", "read", "readExactly", "receive",
+        "send", "tcp", "udp", "unix", "write",
+    ],
+    "net.tcp": ["connect", "listen"],
+    "net.udp": ["bind"],
+    "net.unix": ["connect", "listen"],
+    "process": ["child", "exit", "getArgs", "stderr", "stdin", "stdout"],
+    "process.child": ["run"],
+    "process.stdin": ["read", "readBytes", "readLine"],
+    "process.stdout": ["flush", "write"],
+    "process.stderr": ["flush", "write"],
+};
+
+// The name §6 gives each parameter above, for hover text. A types.FuncType is
+// only a list of types, so without this a hover reads `String path.join(String,
+// ...String)`. Every key of builtinSigs has a row here with the same parameter
+// count. tests/lsp_test.nio checks this.
+export Map<String, String[]> const builtinParamNames = {
+    "os.getArch": [],
+    "os.getCpus": [],
+    "os.getPlatform": [],
+    "math.acos": ["x"],
+    "math.asin": ["x"],
+    "math.atan": ["x"],
+    "math.atan2": ["y", "x"],
+    "math.ceil": ["x"],
+    "math.cos": ["x"],
+    "math.exp": ["x"],
+    "math.floor": ["x"],
+    "math.isInfinite": ["x"],
+    "math.isNaN": ["x"],
+    "math.log": ["x"],
+    "math.log10": ["x"],
+    "math.log2": ["x"],
+    "math.pow": ["x", "y"],
+    "math.round": ["x"],
+    "math.sin": ["x"],
+    "math.sqrt": ["x"],
+    "math.tan": ["x"],
+    "math.toInt": ["x"],
+    "random.float": [],
+    "random.int": ["lo", "hi"],
+    "random.seed": ["seed"],
+    "path.getCwd": [],
+    "path.join": ["first", "more"],
+    "path.localize": ["p"],
+    "path.userData": ["app"],
+    "fs.copy": ["from", "to"],
+    "fs.createDir": ["p"],
+    "fs.createTempDir": ["prefix"],
+    "fs.delete": ["p", "options"],
+    "fs.exists": ["p"],
+    "fs.readDir": ["p"],
+    "fs.readFile": ["p"],
+    "fs.rename": ["from", "to"],
+    "fs.stat": ["p"],
+    "fs.writeFile": ["p", "content"],
+    "string.append": ["s", "t"],
+    "string.bytesEqualConstantTime": ["a", "b"],
+    "string.contains": ["s", "sub"],
+    "string.copy": ["s"],
+    "string.equalsConstantTime": ["a", "b"],
+    "string.find": ["s", "sub"],
+    "string.fromByteArray": ["bytes"],
+    "string.join": ["parts", "sep"],
+    "string.length": ["s"],
+    "string.replace": ["s", "old", "new"],
+    "string.replaceAll": ["s", "old", "new"],
+    "string.split": ["s", "sep"],
+    "string.substring": ["s", "start", "end"],
+    "string.toByteArray": ["s"],
+    "string.toFloat": ["s"],
+    "string.toInt": ["s"],
+    "string.toUint": ["s"],
+    "string.toLowerCaseAscii": ["s"],
+    "string.toUpperCaseAscii": ["s"],
+    "string.runeCount": ["s"],
+    "string.runeAt": ["s", "byteOffset"],
+    "string.fromRunes": ["runes"],
+    "string.isValidUtf8": ["s"],
+    "string.trim": ["s"],
+    "time.now": [],
+    "time.duration": ["s"],
+    "time.milliseconds": ["d"],
+    "time.sleep": ["d"],
+    "time.date.fromText": ["s"],
+    "time.date.toText": ["d"],
+    "time.date.year": ["d"],
+    "time.date.month": ["d"],
+    "time.date.day": ["d"],
+    "time.date.addDays": ["d", "n"],
+    "process.exit": ["code"],
+    "process.getArgs": [],
+    "process.stdout.write": ["s"],
+    "process.stdout.flush": [],
+    "process.stderr.write": ["s"],
+    "process.stderr.flush": [],
+    "process.stdin.read": [],
+    "process.stdin.readLine": [],
+    "process.stdin.readBytes": ["n"],
+    "process.child.run": ["cmd", "args", "options"],
+    "regexp.create": ["pattern", "flags"],
+    "regexp.find": ["s", "re"],
+    "regexp.match": ["s", "re"],
+    "crypto.base64Decode": ["s"],
+    "crypto.base64Encode": ["data"],
+    "crypto.chacha20Poly1305Open": ["key", "nonce", "ciphertext", "aad"],
+    "crypto.chacha20Poly1305Seal": ["key", "nonce", "plaintext", "aad"],
+    "crypto.hexDecode": ["s"],
+    "crypto.hexEncode": ["data"],
+    "crypto.hkdfExpandSha256": ["prk", "info", "length"],
+    "crypto.hkdfExpandSha384": ["prk", "info", "length"],
+    "crypto.hkdfExtractSha256": ["salt", "ikm"],
+    "crypto.hkdfExtractSha384": ["salt", "ikm"],
+    "crypto.hmacSha256": ["key", "data"],
+    "crypto.hmacSha384": ["key", "data"],
+    "crypto.randomBytes": ["n"],
+    "crypto.rsaVerifyPkcs1v15": ["modulus", "exponent", "hash", "digest", "signature"],
+    "crypto.rsaVerifyPss": ["modulus", "exponent", "hash", "digest", "signature"],
+    "crypto.ecdsaVerify": ["curve", "publicKey", "digest", "r", "s"],
+    "crypto.aes128GcmSeal": ["key", "nonce", "plaintext", "aad"],
+    "crypto.aes128GcmOpen": ["key", "nonce", "ciphertext", "aad"],
+    "crypto.sha256": ["data"],
+    "crypto.sha384": ["data"],
+    "crypto.x25519PublicKey": ["privateKey"],
+    "crypto.x25519SharedSecret": ["privateKey", "peerPublicKey"],
+    "net.tcp.listen": ["addr", "options"],
+    "net.tcp.connect": ["addr", "options"],
+    "net.udp.bind": ["addr"],
+    "net.unix.listen": ["path", "options"],
+    "net.unix.connect": ["path", "options"],
+    "net.accept": ["l", "options"],
+    "net.read": ["s", "n", "options"],
+    "net.readExactly": ["s", "n", "options"],
+    "net.write": ["s", "data", "options"],
+    "net.receive": ["s", "n", "options"],
+    "net.send": ["s", "addr", "data", "options"],
+    "net.peer": ["s"],
+};
+
+// The hover text for the members whose type is not a types.FuncType, written as
+// §6 writes it, with `T`, `K`, `V` and `any` where no type name applies. An
+// argument a call can omit has a `?` after its name (`int end?`). A `?` on the
+// type means that the argument can be null.
+// Every member of builtinMemberNames with no signature has a row here.
+export Map<String, String> const builtinShapes = {
+    "array.copy": "T[] array.copy(T[] a)",
+    "array.indexOf": "int array.indexOf(T[] a, T v)",
+    "array.pop": "T array.pop(T[] a)",
+    "array.push": "void array.push(T[] a, T v)",
+    "array.slice": "T[] array.slice(T[] a, int start, int end?)",
+    "array.sort": "void array.sort(T[] a, Function(T, T)<bool> cmp?)",
+    "array.map": "U[] array.map(T[] a, Function(T)<U> f)",
+    "array.filter": "T[] array.filter(T[] a, Function(T)<bool> keep)",
+    "array.reduce": "U array.reduce(T[] a, U start, Function(U, T)<U> f)",
+    "array.find": "T? array.find(T[] a, Function(T)<bool> test)",
+    "array.some": "bool array.some(T[] a, Function(T)<bool> test)",
+    "array.every": "bool array.every(T[] a, Function(T)<bool> test)",
+    "array.contains": "bool array.contains(T[] a, T v)",
+    "array.reverse": "void array.reverse(T[] a)",
+    "array.fill": "void array.fill(T[] a, T v)",
+    "array.concat": "T[] array.concat(T[] a, T[] b)",
+    "array.flatten": "T[] array.flatten(T[][] a)",
+    "math.PI": "float math.PI",
+    "math.E": "float math.E",
+    "math.abs": "T math.abs(T x)",
+    "math.min": "T math.min(T a, T b)",
+    "math.max": "T math.max(T a, T b)",
+    "math.clamp": "T math.clamp(T x, T lo, T hi)",
+    "math.toFloat": "float math.toFloat(T n)",
+    "random.pick": "T random.pick(T[] a)",
+    "random.shuffle": "void random.shuffle(T[] a)",
+    "map.copy": "Map<K, V> map.copy(Map<K, V> m)",
+    "map.has": "bool map.has(Map<K, V> m, K k)",
+    "map.keys": "K[] map.keys(Map<K, V> m)",
+    "map.remove": "bool map.remove(Map<K, V> m, K k)",
+    "map.values": "V[] map.values(Map<K, V> m)",
+    "json.asBool": "bool! json.asBool(Json v)",
+    "json.asFloat": "float! json.asFloat(Json v)",
+    "json.asInt": "int! json.asInt(Json v)",
+    "json.asText": "String! json.asText(Json v)",
+    "json.getType": "json.Type json.getType(Json v)",
+    "json.keys": "String[] json.keys(Json v)",
+    "json.length": "int json.length(Json v)",
+    "json.parse": "Json! json.parse(String s)\nT! json.parse(String s) as T",
+    "json.push": "void json.push(Json v, any x)",
+    "json.remove": "void json.remove(Json v, String k)",
+    "json.toText": "String json.toText(any v)",
+    "async.race": "Future<int> async.race(Future<any> first, ...Future<any> more)",
+    "async.run": "void async.run(Future<T> f, Function(T)<void> cb)",
+    "string.from": "String string.from(printable v)",
+
+    // Two rows each: no type describes "a Socket or a Listener".
+    "net.close": "void net.close(Socket s)\nvoid net.close(Listener l)",
+    "net.address": "String! net.address(Socket s)\nString! net.address(Listener l)",
+};
+
+// The constants a built-in module exports (§6.21), keyed "module.NAME". A
+// constant is a member with a written shape and no signature: the checker
+// types one as a float, and codegen writes its value in place.
+export Map<String, float> const builtinConsts = {
+    "math.PI": 3.141592653589793,
+    "math.E": 2.718281828459045,
+};
+
+export float? constValue(String module, String name) {
+    return builtinConsts[module + "." + name];
+}
+
+// The hover text for the four names always in scope: the `reserved` set of the
+// checker (§2.9, §6.1, §6.2). None is in builtinSigs. The checker checks each
+// at its call site. `Error` is also a type. A hover in type position shows the
+// record from checker.builtinTypes.
+export Map<String, String> const globalShapes = {
+    "print": "void print(printable v)",
+    "printInline": "void printInline(printable v)",
+    "getType": "String getType(any v)",
+    "Error": "Error Error(String message, int code?)",
+};
+
+export String globalShape(String name) {
+    String? s = globalShapes[name];
+    if (s == null) {
+        return "";
+    }
+    return s;
+}
+
+// What a program can write after `key.`, where key is a module or a namespace
+// in a module. Empty for any other key, so a caller can use it to test a name.
+export String[] members(String key) {
+    String[]? names = builtinMemberNames[key];
+    if (names == null) {
+        return [];
+    }
+    return names;
+}
+
+export bool isNamespace(String key, String name) {
+    return builtinMemberNames[key + "." + name] != null;
+}
+
+export types.FuncType? lookupSig(String module, String fn) {
+    return builtinSigs[module + "." + fn];
+}
+
+// Empty for a function with no recorded names. The caller then writes only the
+// types.
+export String[] paramNames(String module, String fn) {
+    String[]? names = builtinParamNames[module + "." + fn];
+    if (names == null) {
+        return [];
+    }
+    return names;
+}
+
+export String shape(String module, String fn) {
+    String? s = builtinShapes[module + "." + fn];
+    if (s == null) {
+        return "";
+    }
+    return s;
+}
+
+export bool hasSig(String module, String fn) {
+    return builtinSigs[module + "." + fn] != null;
+}
+
+export String available(String module) {
+    String? s = builtinAvailable[module];
+    if (s == null) {
+        return "";
+    }
+    return s;
+}
+
+export bool hasOptionalTail(String module, String fn) {
+    return builtinOptionalTail[module + "." + fn] != null;
+}

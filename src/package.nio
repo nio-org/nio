@@ -1,0 +1,894 @@
+// `nio package` wraps the binary that driver.buildFile produces as an
+// installable application. On macOS that is a signed .app bundle and, on
+// request, a drag-to-Applications DMG.
+// The macOS tools run through process.child.run (§6.12), so every step is
+// async.
+import './driver' as driver;
+import './codegen' as codegen;
+import './loader' as loader;
+import 'fs';
+import 'json';
+import 'os';
+import 'path';
+import 'process';
+import 'string';
+import 'array';
+import './lib/str' as str;
+
+void writeOut(String s) {
+    process.stdout.write(s);
+}
+
+void writeErr(String s) {
+    process.stderr.write(s);
+}
+
+String[] tail(String[] args, int from) {
+    String[] out = [];
+    for (int i = from; i < args.length; i++) {
+        array.push(out, args[i]);
+    }
+    return out;
+}
+
+// ---- the manifest ----
+
+// The macOS section of the manifest. sign is a codesign identity, or "auto"
+// for the only identity on the machine. notarize names a notarytool keychain
+// profile; the password stays in the Keychain. plistExtra holds plist XML for
+// the top-level dict of the generated Info.plist.
+type MacSection {
+    String? sign;
+    String? notarize;
+    String? entitlements;
+    String? provisioningProfile;
+    String? minimumOS;
+    String? plistExtra;
+}
+
+// The package description, read from JSON with `as T` (§6.3), which ignores an
+// unknown key. Every field has a default, so a program with no manifest
+// packages under the name of its file.
+type Manifest {
+    String? name;
+    String? identifier;
+    String? version;
+    String? icon;
+    String[]? resources;
+    bool? dmg;
+    MacSection? macos;
+}
+
+// The manifest after resolution: defaults filled in, paths absolute, signing
+// decided. Every step below takes one.
+type Spec {
+    String entry;      // the program's source file
+    String baseDir;    // what the manifest's relative paths resolve against
+    String name;
+    String identifier;
+    String version;
+    String? icon;          // absolute path to a 1024px PNG, or null
+    String[] resources;    // absolute paths, files or directories
+    bool dmg;
+    String minimumOS;
+    String? plistExtra;
+    String? sign;            // codesign identity; null means ad-hoc
+    String? notarize;        // notarytool keychain profile; needs sign and dmg
+    String? entitlements;    // absolute path, or null
+    String? profile;         // absolute path to a .provisionprofile, or null
+    String outDir;
+}
+
+// Per-user signing choice, written by `nio package --setup` under
+// path.userData("nio"). It applies when the manifest names no identity. A
+// manifest is shared, but an identity belongs to one user.
+type Signing {
+    String? identity;
+    String? notarize;
+}
+
+// ---- small helpers ----
+
+String or(String? v, String d) {
+    if (v != null) {
+        return v;
+    }
+    return d;
+}
+
+String resolve(String p, String base) {
+    if (loader.isAbs(p)) {
+        return p;
+    }
+    return path.join(base, p);
+}
+
+// Runs a command to completion. Returns null on success, and the tool's
+// diagnostics on failure.
+String? async runTool(String[] argv) {
+    process.ChildRunResult r = await process.child.run(argv[0], tail(argv, 1)) catch e {
+        return argv[0] + ": " + e.message;
+    };
+    if (r.code != 0) {
+        return argv[0] + " failed: exit status " + string.from(r.code) + "\n"
+            + string.fromByteArray(r.stdout) + string.fromByteArray(r.stderr);
+    }
+    return null;
+}
+
+String xmlEscape(String s) {
+    String out = string.replaceAll(s, "&", "&amp;");
+    out = string.replaceAll(out, "<", "&lt;");
+    return string.replaceAll(out, ">", "&gt;");
+}
+
+// ---- signing: discovery and per-user config ----
+
+// The "Developer ID Application" identities in the Keychain. The list is empty
+// when there are none and when `security` did not run.
+export String[] async identities() {
+    process.ChildRunResult r = await process.child.run("security",
+        ["find-identity", "-v", "-p", "codesigning"]) catch e {
+        return [];
+    };
+    if (r.code != 0) {
+        return [];
+    }
+    String[] out = [];
+    forEach(string.split(string.fromByteArray(r.stdout), "\n"), line) {
+        if (!string.contains(line, "Developer ID Application")) {
+            continue;
+        }
+        int q = string.find(line, "\"");
+        if (q < 0) {
+            continue;
+        }
+        String rest = string.substring(line, q + 1, string.length(line));
+        int q2 = string.find(rest, "\"");
+        if (q2 < 0) {
+            continue;
+        }
+        array.push(out, string.substring(rest, 0, q2));
+    }
+    return out;
+}
+
+// The file that holds the user's signing choice. null when the platform names
+// no user data directory. Packaging then uses the ad-hoc identity.
+String? configPath() {
+    String base = path.userData("nio") catch e {
+        return null;
+    };
+    return path.join(base, "signing.json");
+}
+
+Signing? loadSigning() {
+    String? p = configPath();
+    if (p == null) {
+        return null;
+    }
+    if (!fs.exists(p)) {
+        return null;
+    }
+    byte[] data = fs.readFile(p) catch e {
+        return null;
+    };
+    Signing s = json.parse(data) as Signing catch e {
+        return null;
+    };
+    return s;
+}
+
+// One numbered form for both the error message and the --setup menu.
+String numbered(String[] ids) {
+    String out = "";
+    for (int i = 0; i < ids.length; i++) {
+        out = out + "  " + string.from(i + 1) + ") " + ids[i] + "\n";
+    }
+    return out;
+}
+
+// Decides how to sign the bundle. The manifest wins, then the user
+// configuration, then the ad-hoc identity. An ambiguous choice raises instead
+// of guessing.
+Spec async resolveSigning(Spec s, MacSection? mac) {
+    String? wantSign = null;
+    String? wantNotarize = null;
+    if (mac != null) {
+        wantSign = mac.sign;
+        wantNotarize = mac.notarize;
+    }
+    // "-" is codesign's ad-hoc identity. It wins over a configuration or
+    // "auto", for a project that must not use a developer's Keychain.
+    if (wantSign != null && wantSign == "-") {
+        if (wantNotarize != null) {
+            return Error("notarization needs a real signing identity, and "
+                + "\"sign\": \"-\" asks for the ad-hoc one.");
+        }
+        if (s.profile != null) {
+            return Error("a provisioning profile authorizes entitlements for one "
+                + "signing identity, and \"sign\": \"-\" asks for the ad-hoc one.");
+        }
+        s.sign = null;
+        s.notarize = null;
+        return s;
+    }
+    Signing? cfg = loadSigning();
+    bool fromConfig = false;
+    if (wantSign == null && cfg != null) {
+        wantSign = cfg.identity;
+        fromConfig = wantSign != null;
+    }
+    if (wantSign != null && wantSign == "auto") {
+        String[] ids = await identities();
+        if (ids.length == 0) {
+            return Error("\"sign\": \"auto\", but this machine holds no Developer ID "
+                + "Application identity.\nCreate one in Xcode (Settings > Accounts > "
+                + "Manage Certificates) or at developer.apple.com, then run "
+                + "`nio package --setup`.");
+        }
+        if (ids.length > 1) {
+            return Error("\"sign\": \"auto\", but this machine holds several identities:\n"
+                + numbered(ids)
+                + "Name one in the manifest, or pick one with `nio package --setup`.");
+        }
+        wantSign = ids[0];
+    }
+    // Notarization needs an identity and a DMG. A profile from the manifest
+    // with neither is an error. A profile from the user configuration is
+    // ignored, because that configuration applies to every project.
+    if (wantNotarize == null && cfg != null && (mac == null || mac.notarize == null)) {
+        wantNotarize = cfg.notarize;
+        if (wantNotarize != null && (!s.dmg || wantSign == null)) {
+            wantNotarize = null;
+        }
+    }
+    if (wantNotarize != null) {
+        if (wantSign == null) {
+            return Error("notarization needs a signing identity: set \"sign\" in the "
+                + "manifest's macos section, or run `nio package --setup`.");
+        }
+        if (!s.dmg) {
+            return Error("notarization applies to the DMG: add \"dmg\": true to the "
+                + "manifest, or pass --dmg.");
+        }
+    }
+    // Never use a real identity that the user did not name. Only report that
+    // it exists.
+    if (wantSign == null && !fromConfig) {
+        String[] ids = await identities();
+        if (ids.length > 0) {
+            writeOut("note: signing ad-hoc; this machine holds a Developer ID identity.\n"
+                + "      `nio package --setup` would use it (and set up notarization).\n");
+        }
+    }
+    if (wantSign == null && s.profile != null) {
+        return Error("a provisioning profile authorizes entitlements for one "
+            + "signing identity: set \"sign\" in the manifest's macos section, "
+            + "or run `nio package --setup`.");
+    }
+    s.sign = wantSign;
+    s.notarize = wantNotarize;
+    return s;
+}
+
+// ---- the bundle ----
+
+// The bundle's Info.plist, generated from the manifest with no template.
+String infoPlist(Spec s) {
+    String out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        + "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+        + "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+        + "<plist version=\"1.0\">\n<dict>\n"
+        + "\t<key>CFBundleDevelopmentRegion</key><string>en</string>\n"
+        + "\t<key>CFBundleExecutable</key><string>" + xmlEscape(s.name) + "</string>\n"
+        + "\t<key>CFBundleIdentifier</key><string>" + xmlEscape(s.identifier) + "</string>\n"
+        + "\t<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>\n"
+        + "\t<key>CFBundleName</key><string>" + xmlEscape(s.name) + "</string>\n"
+        + "\t<key>CFBundlePackageType</key><string>APPL</string>\n"
+        + "\t<key>CFBundleShortVersionString</key><string>" + xmlEscape(s.version) + "</string>\n"
+        + "\t<key>CFBundleVersion</key><string>" + xmlEscape(s.version) + "</string>\n"
+        + "\t<key>LSMinimumSystemVersion</key><string>" + xmlEscape(s.minimumOS) + "</string>\n"
+        + "\t<key>NSHighResolutionCapable</key><true/>\n";
+    if (s.icon != null) {
+        out = out + "\t<key>CFBundleIconFile</key><string>app</string>\n";
+    }
+    String? extra = s.plistExtra;
+    if (extra != null) {
+        out = out + "\t" + extra + "\n";
+    }
+    return out + "</dict>\n</plist>\n";
+}
+
+// Turns the manifest's 1024px PNG into Resources/app.icns with sips and
+// iconutil. The source converts to sRGB first: sips copies a wide-gamut ICC
+// profile into every resized output, about 27 KB each.
+String? async makeIcns(String iconPng, String resDir, String tmp) {
+    String setDir = path.join(tmp, "app.iconset");
+    fs.createDir(setDir) catch e {
+        return e.message;
+    };
+    String srgb = path.join(tmp, "icon-srgb.png");
+    String? matched = await runTool([
+        "sips", "--matchTo",
+        "/System/Library/ColorSync/Profiles/sRGB Profile.icc",
+        iconPng, "--out", srgb,
+    ]);
+    if (matched != null) {
+        return matched;
+    }
+    iconPng = srgb;
+    int[] bases = [16, 32, 128, 256, 512];
+    forEach(bases, b) {
+        String side = `${b}x${b}`;
+        String? one = await runTool([
+            "sips", "-z", string.from(b), string.from(b),
+            iconPng, "--out", path.join(setDir, "icon_" + side + ".png"),
+        ]);
+        if (one != null) {
+            return one;
+        }
+        String? two = await runTool([
+            "sips", "-z", string.from(b * 2), string.from(b * 2),
+            iconPng, "--out", path.join(setDir, "icon_" + side + "@2x.png"),
+        ]);
+        if (two != null) {
+            return two;
+        }
+    }
+    return await runTool([
+        "iconutil", "-c", "icns", setDir,
+        "-o", path.join(resDir, "app.icns"),
+    ]);
+}
+
+// True when the file starts with a Mach-O magic number, thin or fat. §6.11
+// reads only whole files. That costs little on a file just copied.
+bool isMachO(String p) {
+    byte[] h = fs.readFile(p) catch [];
+    if (h.length < 8) {
+        return false;
+    }
+    if (h[0] == 207 && h[1] == 250 && h[2] == 237 && h[3] == 254) {
+        return true;    // MH_MAGIC_64 as written on disk (little-endian)
+    }
+    if (h[0] == 206 && h[1] == 250 && h[2] == 237 && h[3] == 254) {
+        return true;    // MH_MAGIC (32-bit)
+    }
+    if (h[0] == 254 && h[1] == 237 && h[2] == 250 && (h[3] == 206 || h[3] == 207)) {
+        return true;    // the big-endian spellings
+    }
+    if (h[0] == 202 && h[1] == 254 && h[2] == 186 && (h[3] == 190 || h[3] == 191)) {
+        // A Java class file has the same magic number. The next big-endian word
+        // is an architecture count here and a class version (45 or more) there.
+        return h[4] * 16777216 + h[5] * 65536 + h[6] * 256 + h[7] < 45;
+    }
+    return false;
+}
+
+// Collects every Mach-O file under p. A dylib or helper binary in a resource
+// tree needs a signature of its own.
+void collectMachO(String p, String[] out) {
+    fs.Stat st = fs.stat(p) catch e {
+        return;
+    };
+    if (st.isDirectory) {
+        String[] names = fs.readDir(p) catch [];
+        forEach(names, n) {
+            collectMachO(path.join(p, n), out);
+        }
+        return;
+    }
+    if (st.isFile && isMachO(p)) {
+        array.push(out, p);
+    }
+}
+
+// Builds the .app. The binary compiles directly into Contents/MacOS, so it
+// keeps the execute bit that clang set. The signature comes last, because
+// codesign seals everything before it.
+String? async assemble(Spec s, String app, String tmp) {
+    if (fs.exists(app)) {
+        fs.delete(app, { recursive: true }) catch e {
+            return e.message;
+        };
+    }
+    if (!fs.exists(s.outDir)) {
+        fs.createDir(s.outDir) catch e {
+            return e.message;
+        };
+    }
+    String contents = path.join(app, "Contents");
+    String macDir = path.join(contents, "MacOS");
+    String resDir = path.join(contents, "Resources");
+    String[] dirs = [app, contents, macDir, resDir];
+    forEach(dirs, d) {
+        fs.createDir(d) catch e {
+            return e.message;
+        };
+    }
+    byte[] entryData = fs.readFile(s.entry) catch e {
+        return e.message;
+    };
+    // An installable application always uses the optimized build.
+    codegen.Options opts = codegen.noOptions();
+    opts.release = true;
+    String? built = await driver.buildFile(string.fromByteArray(entryData), s.entry,
+        path.join(macDir, s.name), opts);
+    if (built != null) {
+        return built;
+    }
+    // Use cp -R. It keeps the modes and the symbolic links, which a copy
+    // through fs.readFile loses.
+    forEach(s.resources, r) {
+        if (!fs.exists(r)) {
+            return "resource not found: " + r;
+        }
+        String? copied = await runTool(["cp", "-R", r, resDir]);
+        if (copied != null) {
+            return copied;
+        }
+    }
+    String? icon = s.icon;
+    if (icon != null) {
+        if (!fs.exists(icon)) {
+            return "icon not found: " + icon;
+        }
+        String? made = await makeIcns(icon, resDir, tmp);
+        if (made != null) {
+            return made;
+        }
+    }
+    fs.writeFile(path.join(contents, "Info.plist"),
+        string.toByteArray(infoPlist(s))) catch e {
+        return e.message;
+    };
+    // A restricted entitlement applies only when a profile authorizes it, and
+    // the system reads the profile from this path. It goes in before the
+    // signature, which seals Contents/.
+    String? prof = s.profile;
+    if (prof != null) {
+        if (!fs.exists(prof)) {
+            return "provisioning profile not found: " + prof;
+        }
+        String? put = await runTool([
+            "cp", prof,
+            path.join(contents, "embedded.provisionprofile"),
+        ]);
+        if (put != null) {
+            return put;
+        }
+    }
+    String? id = s.sign;
+    // Sign the nested code first, as Apple requires. The outer signature seals
+    // Resources/ as data, so a dylib keeps the signature its build left.
+    // Notarization rejects a Mach-O without the Developer ID and the timestamp.
+    // Entitlements stay on the app executable, where they have a meaning.
+    String[] machos = [];
+    collectMachO(resDir, machos);
+    forEach(machos, mo) {
+        String[] ns = ["codesign", "--force"];
+        if (id != null) {
+            array.push(ns, "--options");
+            array.push(ns, "runtime");
+            array.push(ns, "--timestamp");
+        }
+        array.push(ns, "-s");
+        array.push(ns, or(id, "-"));
+        array.push(ns, mo);
+        String? nested = await runTool(ns);
+        if (nested != null) {
+            return nested;
+        }
+    }
+    if (id == null) {
+        return await runTool(["codesign", "--force", "-s", "-", app]);
+    }
+    // Notarization requires the hardened runtime and a secure timestamp.
+    String[] cs = ["codesign", "--force", "--options", "runtime", "--timestamp"];
+    String? ent = s.entitlements;
+    if (ent != null) {
+        array.push(cs, "--entitlements");
+        array.push(cs, ent);
+    }
+    array.push(cs, "-s");
+    array.push(cs, id);
+    array.push(cs, app);
+    return await runTool(cs);
+}
+
+// ---- the DMG ----
+
+// FinderInfo of a folder with the custom-icon bit set (0x04 in byte 8). Finder
+// then uses .VolumeIcon.icns at the volume root. xattr writes it; SetFile is
+// deprecated and needs the full developer tools.
+String const FINDER_CUSTOM_ICON =
+    "0000000000000000040000000000000000000000000000000000000000000000";
+
+// Stages the app beside a link to /Applications and folds the stage into a
+// compressed image. An icon needs a read-write image first, so the volume root
+// can take it. ULMO is lzma: about 40% smaller than the zlib default, and it
+// mounts on 10.15 and later.
+String? async makeDmg(Spec s, String app, String out, String tmp) {
+    String stage = path.join(tmp, "stage");
+    fs.createDir(stage) catch e {
+        return e.message;
+    };
+    String? copied = await runTool(["cp", "-R", app, stage]);
+    if (copied != null) {
+        return copied;
+    }
+    String? linked = await runTool([
+        "ln", "-s", "/Applications",
+        path.join(stage, "Applications"),
+    ]);
+    if (linked != null) {
+        return linked;
+    }
+    if (fs.exists(out)) {
+        fs.delete(out) catch e {
+            return e.message;
+        };
+    }
+    if (s.icon == null) {
+        return await runTool([
+            "hdiutil", "create", "-srcfolder", stage,
+            "-volname", s.name, "-fs", "HFS+", "-format", "ULMO", "-quiet", out,
+        ]);
+    }
+    String rw = path.join(tmp, "rw.dmg");
+    String? made = await runTool([
+        "hdiutil", "create", "-srcfolder", stage,
+        "-volname", s.name, "-fs", "HFS+", "-format", "UDRW", "-quiet", rw,
+    ]);
+    if (made != null) {
+        return made;
+    }
+    String mnt = path.join(tmp, "mnt");
+    String? attached = await runTool([
+        "hdiutil", "attach", rw, "-nobrowse",
+        "-quiet", "-mountpoint", mnt,
+    ]);
+    if (attached != null) {
+        return attached;
+    }
+    String? decorated = await decorateVolume(app, mnt);
+    // Detach before reporting, or a failure leaves the volume mounted.
+    String? detached = await runTool(["hdiutil", "detach", mnt, "-quiet"]);
+    if (decorated != null) {
+        return decorated;
+    }
+    if (detached != null) {
+        return detached;
+    }
+    return await runTool([
+        "hdiutil", "convert", rw, "-format", "ULMO",
+        "-quiet", "-o", out,
+    ]);
+}
+
+// Copies the bundle icon to the volume root and sets the Finder bit that shows
+// it.
+String? async decorateVolume(String app, String mnt) {
+    fs.copy(path.join(path.join(path.join(app, "Contents"), "Resources"), "app.icns"),
+        path.join(mnt, ".VolumeIcon.icns")) catch e {
+        return e.message;
+    };
+    return await runTool([
+        "xattr", "-wx", "com.apple.FinderInfo",
+        FINDER_CUSTOM_ICON, mnt,
+    ]);
+}
+
+// Sends the signed DMG to Apple and staples the result, so Gatekeeper accepts
+// it with no network. --wait makes a rejection fail this command.
+String? async notarize(Spec s, String dmgPath) {
+    String? id = s.sign;
+    String? prof = s.notarize;
+    if (id == null || prof == null) {
+        return null;
+    }
+    String? signed = await runTool([
+        "codesign", "--force", "--timestamp",
+        "-s", id, dmgPath,
+    ]);
+    if (signed != null) {
+        return signed;
+    }
+    writeOut("notarizing (this waits on Apple, typically a minute or two)...\n");
+    String? submitted = await runTool([
+        "xcrun", "notarytool", "submit", dmgPath,
+        "--keychain-profile", prof, "--wait",
+    ]);
+    if (submitted != null) {
+        return submitted;
+    }
+    return await runTool(["xcrun", "stapler", "staple", dmgPath]);
+}
+
+// ---- the command ----
+
+void usage() {
+    writeErr("usage: nio package [--manifest <m.pkg.json>] [--dmg] <file.nio> [-o dir]\n");
+    writeErr("       nio package --setup\n");
+    writeErr("  Builds <file.nio> and wraps it as an installable application --\n");
+    writeErr("  on macOS a signed .app bundle, and with --dmg (or \"dmg\": true in\n");
+    writeErr("  the manifest) a drag-to-Applications disk image beside it.\n");
+    writeErr("  The manifest defaults to <file>.pkg.json beside the source; every\n");
+    writeErr("  key is optional. --setup picks a Developer ID signing identity and\n");
+    writeErr("  notarization profile once, per user.\n");
+}
+
+// The whole `nio package` subcommand. args is everything after the name, and
+// the result is the exit status.
+export int async packageCmd(String[] args) {
+    if (args.length == 1 && args[0] == "--setup") {
+        return await setup();
+    }
+    String? manifestPath = null;
+    bool dmgFlag = false;
+    int i = 0;
+    while (i < args.length && str.hasPrefix(args[i], "--")) {
+        if (args[i] == "--help") {
+            usage();
+            return 0;
+        }
+        if (args[i] == "--manifest") {
+            if (i + 1 >= args.length) {
+                writeErr("--manifest needs a path\n");
+                return 2;
+            }
+            manifestPath = args[i + 1];
+            i = i + 2;
+            continue;
+        }
+        if (args[i] == "--dmg") {
+            dmgFlag = true;
+            i++;
+            continue;
+        }
+        writeErr("unknown flag " + args[i] + "\n");
+        usage();
+        return 2;
+    }
+    if (i >= args.length) {
+        usage();
+        return 2;
+    }
+    if (os.getPlatform() != "darwin") {
+        writeErr("nio package currently supports macOS only; Linux and Windows are "
+            + "planned.\n");
+        return 1;
+    }
+    String file = args[i];
+    String outDir = ".";
+    if (args.length >= i + 3 && args[i + 1] == "-o") {
+        outDir = args[i + 2];
+    }
+    if (!fs.exists(file)) {
+        writeErr("no such file: " + file + "\n");
+        return 1;
+    }
+
+    // The manifest named on the command line, or <stem>.pkg.json beside the
+    // entry file, or none: every key has a default.
+    String entryDir = loader.dirOf(file);
+    String stem = loader.stemOf(file);
+    Manifest m = {
+        name: null, identifier: null, version: null, icon: null,
+        resources: null, dmg: null, macos: null,
+    };
+    String mDir = entryDir;
+    String? chosen = manifestPath;
+    if (chosen == null) {
+        String candidate = path.join(entryDir, stem + ".pkg.json");
+        if (fs.exists(candidate)) {
+            chosen = candidate;
+        }
+    }
+    if (chosen != null) {
+        byte[] mData = fs.readFile(chosen) catch e {
+            writeErr(e.message + "\n");
+            return 1;
+        };
+        m = json.parse(mData) as Manifest catch e {
+            writeErr(chosen + ": " + e.message + "\n");
+            return 1;
+        };
+        mDir = loader.dirOf(chosen);
+    }
+
+    String name = or(m.name, stem);
+    String[] resources = [];
+    String[]? mres = m.resources;
+    if (mres != null) {
+        forEach(mres, r) {
+            array.push(resources, resolve(r, mDir));
+        }
+    }
+    bool wantDmg = dmgFlag;
+    bool? mdmg = m.dmg;
+    if (mdmg != null && mdmg) {
+        wantDmg = true;
+    }
+    String? icon = m.icon;
+    if (icon != null) {
+        icon = resolve(icon, mDir);
+    }
+    MacSection? mac = m.macos;
+    String minOS = "11.0";
+    String? entitlements = null;
+    String? profile = null;
+    String? plistExtra = null;
+    if (mac != null) {
+        minOS = or(mac.minimumOS, minOS);
+        plistExtra = mac.plistExtra;
+        entitlements = mac.entitlements;
+        if (entitlements != null) {
+            entitlements = resolve(entitlements, mDir);
+        }
+        profile = mac.provisioningProfile;
+        if (profile != null) {
+            profile = resolve(profile, mDir);
+        }
+    }
+    Spec s = {
+        entry: file,
+        baseDir: mDir,
+        name: name,
+        identifier: or(m.identifier, "com.nio." + name),
+        version: or(m.version, "0.1.0"),
+        icon: icon,
+        resources: resources,
+        dmg: wantDmg,
+        minimumOS: minOS,
+        plistExtra: plistExtra,
+        sign: null,
+        notarize: null,
+        entitlements: entitlements,
+        profile: profile,
+        outDir: outDir,
+    };
+    s = await resolveSigning(s, mac) catch e {
+        writeErr(e.message + "\n");
+        return 1;
+    };
+
+    String tmp = fs.createTempDir("nio-pkg-") catch e {
+        writeErr(e.message + "\n");
+        return 1;
+    };
+    int code = await packageInto(s, tmp);
+    fs.delete(tmp, { recursive: true }) catch e { };
+    return code;
+}
+
+// The body of packageCmd. It is a separate function so that one place removes
+// the temporary directory.
+int async packageInto(Spec s, String tmp) {
+    String app = path.join(s.outDir, s.name + ".app");
+    String? failure = await assemble(s, app, tmp);
+    if (failure != null) {
+        writeErr(failure + "\n");
+        return 1;
+    }
+    writeOut("wrote " + app + "\n");
+    if (!s.dmg) {
+        return 0;
+    }
+    String out = path.join(s.outDir, s.name + ".dmg");
+    failure = await makeDmg(s, app, out, tmp);
+    if (failure != null) {
+        writeErr(failure + "\n");
+        return 1;
+    }
+    failure = await notarize(s, out);
+    if (failure != null) {
+        writeErr(failure + "\n");
+        return 1;
+    }
+    writeOut("wrote " + out + "\n");
+    if (s.sign == null) {
+        writeOut("note: not notarized; a downloaded copy needs right-click > Open "
+            + "the first time.\n");
+    }
+    return 0;
+}
+
+// ---- the one-time signing setup ----
+
+// Writes a question and returns the trimmed reply. Returns "" at the end of
+// the input, so the Enter key selects the default below.
+String prompt(String q) {
+    writeOut(q);
+    String? line = process.stdin.readLine() catch null;
+    if (line == null) {
+        return "";
+    }
+    return string.trim(line);
+}
+
+// `nio package --setup`. Chooses an identity, prepares notarization on request,
+// and writes both names to the user configuration.
+int async setup() {
+    String[] ids = await identities();
+    if (ids.length == 0) {
+        writeErr("no Developer ID Application identity in the Keychain.\n"
+            + "Create one in Xcode (Settings > Accounts > Manage Certificates >\n"
+            + "Developer ID Application) or at developer.apple.com, then rerun\n"
+            + "`nio package --setup`. Without one, `nio package` signs ad-hoc,\n"
+            + "which is fine for local use.\n");
+        return 1;
+    }
+    String identity = ids[0];
+    if (ids.length == 1) {
+        writeOut("signing identity: " + identity + "\n");
+    } else {
+        writeOut("this machine holds several Developer ID identities:\n" + numbered(ids));
+        String reply = prompt(`use which? [1-${ids.length}] `);
+        int pick = string.toInt(reply) catch 0;
+        if (pick < 1 || pick > ids.length) {
+            writeErr("no such entry\n");
+            return 1;
+        }
+        identity = ids[pick - 1];
+    }
+
+    String? profile = null;
+    String want = prompt("set up notarization? Needs an app-specific password from "
+        + "appleid.apple.com. [y/N] ");
+    if (want == "y" || want == "Y" || want == "yes") {
+        String named = prompt("profile name [nio-notary]: ");
+        if (named == "") {
+            named = "nio-notary";
+        }
+        // notarytool asks for the Apple ID and the password itself, so the
+        // child gets this terminal. Only the profile name stays here.
+        process.ChildRunResult stored = await process.child.run("xcrun",
+            ["notarytool", "store-credentials", named], { inherit: true }) catch e {
+            writeErr("xcrun: " + e.message + "\n");
+            return 1;
+        };
+        if (stored.code != 0) {
+            writeErr("notarytool store-credentials failed\n");
+            return 1;
+        }
+        // Validate now. A wrong password must fail here, and not at the first
+        // release.
+        process.ChildRunResult check = await process.child.run("xcrun",
+            ["notarytool", "history", "--keychain-profile", named]) catch e {
+            writeErr("xcrun: " + e.message + "\n");
+            return 1;
+        };
+        if (check.code != 0) {
+            writeErr("the stored credentials did not validate:\n"
+                + string.fromByteArray(check.stderr));
+            return 1;
+        }
+        profile = named;
+    }
+
+    String? cfg = configPath();
+    if (cfg == null) {
+        writeErr("cannot find a place for per-user config on this platform\n");
+        return 1;
+    }
+    String cfgDir = loader.dirOf(cfg);
+    if (!fs.exists(cfgDir)) {
+        fs.createDir(cfgDir) catch e {
+            writeErr(e.message + "\n");
+            return 1;
+        };
+    }
+    Signing out = { identity: identity, notarize: profile };
+    fs.writeFile(cfg, string.toByteArray(json.toText(out))) catch e {
+        writeErr(e.message + "\n");
+        return 1;
+    };
+    writeOut("saved to " + cfg + "\n");
+    writeOut("`nio package` now signs as: " + identity + "\n");
+    if (profile != null) {
+        writeOut("and notarizes DMGs with profile: " + profile + "\n");
+    }
+    return 0;
+}

@@ -1,0 +1,758 @@
+// What is at a place in a program.
+//
+// No node carries an end position, so the search asks which name's token covers
+// the position. A position on punctuation or inside a literal finds nothing.
+//
+// No type switch here has a `default:`. A new node in src/ast.nio is then a
+// compile error here, so the search cannot skip it.
+import '../ast' as ast;
+import '../token' as token;
+import 'string';
+import 'array';
+
+// Hit is the name that a position landed on, with enough of the tree around it
+// to describe that name.
+export type Hit {
+    // Null when the name is not an expression: a type annotation, a declaration
+    // name or a parameter.
+    ast.Expression? expr;
+    ast.NamedType? named;
+    ast.Statement? decl;
+    // Always set.
+    String name;
+    // For a member expression, the expression before the dot.
+    ast.Expression? object;
+    // The written type of a parameter or a record field, the two bindings with
+    // no statement of their own.
+    ast.TypeNode? declType;
+    // The call whose callee holds this hit. A method resolves on the call node
+    // (checker.Info.methodCalls), not on the member expression.
+    ast.CallExpression? call;
+    // The keyword-written type at the position: Future, Map or Function. No
+    // checker table holds these, so the node itself is the answer.
+    ast.TypeNode? typeKeyword;
+    token.Token tok;
+}
+
+Hit newHit(token.Token tok, String name) {
+    Hit h = {
+        expr: null, named: null, decl: null, name: name, object: null,
+        declType: null, call: null, typeKeyword: null, tok: tok,
+    };
+    return h;
+}
+
+// The best hit is the last one. The walk visits a node before its children
+// and no two names overlap, so a later match is the inner one.
+type Finder {
+    int line;
+    int col;
+    Hit? best;
+
+    // Inclusive at the end: a caret directly after a name is still on it.
+    bool covers(token.Token tok, int width) {
+        if (tok.line != self.line) {
+            return false;
+        }
+        return self.col >= tok.col && self.col <= tok.col + width;
+    }
+
+    bool hitName(token.Token tok, String name) {
+        return self.hitWide(tok, name, string.length(name));
+    }
+
+    // For a name whose written extent is wider than its text, such as a
+    // quoted import path.
+    bool hitWide(token.Token tok, String name, int width) {
+        if (!self.covers(tok, width)) {
+            return false;
+        }
+        self.best = newHit(tok, name);
+        return true;
+    }
+
+    // ---- statements ----
+
+    void stmts(ast.Statement[] list) {
+        forEach(list, s) {
+            self.stmt(s);
+        }
+    }
+
+    void stmt(ast.Statement s) {
+        switch (s) {
+            case ast.ImportStatement imp:
+                // The path's extent is two bytes wider than its text, for the
+                // quotes.
+                if (self.hitWide(imp.pathTok, imp.alias, string.length(imp.path) + 2)) {
+                    Hit? h = self.best;
+                    if (h != null) {
+                        h.decl = imp;
+                    }
+                    return;
+                }
+                if (imp.aliasTok.line != 0 && self.hitName(imp.aliasTok, imp.alias)) {
+                    Hit? h = self.best;
+                    if (h != null) {
+                        h.decl = imp;
+                    }
+                }
+                return;
+            case ast.NativeStatement na:
+                // Two bytes wider for the quotes.
+                if (self.hitWide(na.valueTok, na.value, string.length(na.value) + 2)) {
+                    Hit? h = self.best;
+                    if (h != null) {
+                        h.decl = na;
+                    }
+                }
+                return;
+            case ast.ReExportStatement re:
+                // The alias names the module, and each name in a show or hide
+                // list names one of its declarations, so both are searchable.
+                if (self.hitName(re.aliasTok, re.alias)) {
+                    Hit? h = self.best;
+                    if (h != null) {
+                        h.decl = re;
+                    }
+                }
+                forEach(re.names, n, i) {
+                    if (self.hitName(re.nameToks[i], n)) {
+                        Hit? hn = self.best;
+                        if (hn != null) {
+                            hn.decl = re;
+                        }
+                    }
+                }
+                return;
+            case ast.VarDeclStatement v:
+                if (self.hitName(v.nameTok, v.name)) {
+                    Hit? h = self.best;
+                    if (h != null) {
+                        h.decl = v;
+                    }
+                    return;
+                }
+                self.typeNode(v.type);
+                ast.Expression? val = v.value;
+                if (val != null) {
+                    self.expr(val);
+                }
+            case ast.TypeDeclStatement td:
+                if (self.hitName(td.nameTok, td.name)) {
+                    Hit? h = self.best;
+                    if (h != null) {
+                        h.decl = td;
+                    }
+                    return;
+                }
+                ast.NamedType? base = td.extends;
+                if (base != null) {
+                    self.typeNode(base);
+                }
+                forEach(td.fields, f) {
+                    self.field(f);
+                }
+                // Not allMethods(): an inherited copy has base file tokens.
+                forEach(td.methods, m) {
+                    self.stmt(m);
+                }
+            case ast.EnumDeclStatement en:
+                if (self.hitName(en.nameTok, en.name)) {
+                    Hit? h = self.best;
+                    if (h != null) {
+                        h.decl = en;
+                    }
+                    return;
+                }
+                forEach(en.members, mem) {
+                    if (self.hitName(mem.tok, mem.name)) {
+                        Hit? h = self.best;
+                        if (h != null) {
+                            h.decl = en;
+                        }
+                        return;
+                    }
+                }
+            case ast.FunctionDeclStatement fn:
+                // A body copied from a base type has base file tokens (§2.4).
+                if (fn.from != null) {
+                    return;
+                }
+                if (self.hitName(fn.nameTok, fn.name)) {
+                    Hit? h = self.best;
+                    if (h != null) {
+                        h.decl = fn;
+                    }
+                    return;
+                }
+                ast.TypeNode? ret = fn.returnType;
+                if (ret != null) {
+                    self.typeNode(ret);
+                }
+                self.params(fn.params);
+                self.stmt(fn.body);
+            case ast.AssignStatement a:
+                self.expr(a.target);
+                self.expr(a.value);
+            case ast.ReturnStatement r:
+                ast.Expression? rv = r.value;
+                if (rv != null) {
+                    self.expr(rv);
+                }
+            case ast.IfStatement iff:
+                self.expr(iff.cond);
+                self.stmt(iff.then);
+                ast.BlockStatement? els = iff.else;
+                if (els != null) {
+                    self.stmt(els);
+                }
+            case ast.SwitchStatement sw:
+                self.expr(sw.subject);
+                forEach(sw.cases, cl) {
+                    forEach(cl.values, v2) {
+                        self.expr(v2);
+                    }
+                    ast.NamedType? tn = cl.typeName;
+                    if (tn != null) {
+                        self.typeNode(tn);
+                    }
+                    self.stmt(cl.body);
+                }
+            case ast.WhileStatement w:
+                self.expr(w.cond);
+                self.stmt(w.body);
+                self.stmts(w.tail);
+            case ast.ForStatement f2:
+                ast.Statement? init = f2.init;
+                if (init != null) {
+                    self.stmt(init);
+                }
+                self.expr(f2.cond);
+                ast.Statement? post = f2.post;
+                if (post != null) {
+                    self.stmt(post);
+                }
+                self.stmt(f2.body);
+            case ast.IncDecStatement inc:
+                self.expr(inc.target);
+            case ast.ForEachStatement fe:
+                self.expr(fe.array);
+                if (self.hitName(fe.elemTok, fe.elemName)) {
+                    return;
+                }
+                if (fe.indexName != "" && self.hitName(fe.indexTok, fe.indexName)) {
+                    return;
+                }
+                self.stmt(fe.body);
+            case ast.BreakStatement br:
+                return;
+            case ast.ContinueStatement co:
+                return;
+            case ast.BlockStatement b:
+                self.stmts(b.statements);
+            case ast.ExpressionStatement es:
+                self.expr(es.expression);
+        }
+    }
+
+    void params(ast.Param[] ps) {
+        forEach(ps, p) {
+            // A generated receiver's nameTok holds the method name. A search of
+            // it would answer "self" for a position on that name.
+            if (p.name == "self" && p.nameTok.literal != "self") {
+                continue;
+            }
+            if (self.hitName(p.nameTok, p.name)) {
+                Hit? h = self.best;
+                if (h != null) {
+                    h.declType = p.type;
+                }
+                return;
+            }
+            self.typeNode(p.type);
+        }
+    }
+
+    void field(ast.FieldDef f) {
+        // The payload field of a union member is generated (§2.11) and sits at
+        // the member's type. Claiming it would answer `$v` for the type.
+        if (f.name == ast.unionPayload) {
+            self.typeNode(f.type);
+            return;
+        }
+        if (self.hitName(f.nameTok, f.name)) {
+            Hit? h = self.best;
+            if (h != null) {
+                h.declType = f.type;
+            }
+            return;
+        }
+        self.typeNode(f.type);
+    }
+
+    // ---- type annotations ----
+
+    // `Future<T>`, `Map<K, V>` and `Function(...)<R>` carry the keyword as
+    // their token and hold no name.
+    bool hitKeyword(ast.TypeNode t) {
+        if (!self.hitName(t.tok, t.tok.literal)) {
+            return false;
+        }
+        Hit? h = self.best;
+        if (h != null) {
+            h.typeKeyword = t;
+        }
+        return true;
+    }
+
+    void typeNode(ast.TypeNode t) {
+        switch (t) {
+            case ast.NamedType n:
+                // A qualified name carries one token, at the alias. Each later
+                // segment starts one position past the dot before it (§2.11).
+                int col = n.tok.col;
+                if (n.module != "") {
+                    if (self.hitName(n.tok, n.module)) {
+                        return;
+                    }
+                    col = col + string.length(n.module) + 1;
+                }
+                token.Token here = {
+                    type: n.tok.type, literal: n.name, line: n.tok.line,
+                    col: col, note: "", quote: "", endLine: 0, endCol: 0,
+                };
+                if (self.hitName(here, n.name)) {
+                    Hit? h = self.best;
+                    if (h != null) {
+                        h.named = n;
+                    }
+                    return;
+                }
+                if (n.member != "") {
+                    token.Token mem = {
+                        type: n.tok.type, literal: n.member, line: n.tok.line,
+                        col: col + string.length(n.name) + 1, note: "", quote: "", endLine: 0, endCol: 0,
+                    };
+                    if (self.hitName(mem, n.member)) {
+                        Hit? h2 = self.best;
+                        if (h2 != null) {
+                            h2.named = n;
+                        }
+                    }
+                }
+            case ast.ArrayTypeNode a:
+                self.typeNode(a.elem);
+            case ast.OptionalTypeNode o:
+                self.typeNode(o.inner);
+            case ast.FuncTypeNode f:
+                if (self.hitKeyword(f)) {
+                    return;
+                }
+                forEach(f.params, p) {
+                    self.typeNode(p);
+                }
+                ast.TypeNode? ret = f.return;
+                if (ret != null) {
+                    self.typeNode(ret);
+                }
+            case ast.FutureTypeNode fu:
+                if (self.hitKeyword(fu)) {
+                    return;
+                }
+                ast.TypeNode? el = fu.elem;
+                if (el != null) {
+                    self.typeNode(el);
+                }
+            case ast.MapTypeNode m:
+                if (self.hitKeyword(m)) {
+                    return;
+                }
+                self.typeNode(m.key);
+                self.typeNode(m.value);
+            case ast.RecordTypeNode r:
+                forEach(r.fields, f2) {
+                    self.field(f2);
+                }
+        }
+    }
+
+    // ---- expressions ----
+
+    void expr(ast.Expression e) {
+        switch (e) {
+            case ast.Identifier id:
+                // The alias a template's `${}` calls through is not written
+                // anywhere, so its token, the backtick, names nothing.
+                if (id.name != ast.templateAlias && self.hitName(id.tok, id.name)) {
+                    Hit? h = self.best;
+                    if (h != null) {
+                        h.expr = id;
+                    }
+                }
+            // A literal holds no name to ask about.
+            case ast.IntLiteral il:
+                return;
+            case ast.FloatLiteral fl:
+                return;
+            case ast.StringLiteral sl:
+                return;
+            case ast.BoolLiteral bl:
+                return;
+            case ast.NullLiteral nl:
+                return;
+            case ast.ArrayLiteral al:
+                forEach(al.elements, el) {
+                    self.expr(el);
+                }
+            case ast.RecordLiteral rl:
+                // A field name has no token of its own.
+                forEach(rl.fields, f) {
+                    self.expr(f.value);
+                }
+            case ast.MapLiteral ml:
+                forEach(ml.entries, en) {
+                    self.expr(en.key);
+                    self.expr(en.value);
+                }
+            case ast.FuncLit fnl:
+                ast.TypeNode? ret = fnl.returnType;
+                if (ret != null) {
+                    self.typeNode(ret);
+                }
+                self.params(fnl.params);
+                ast.Expression? eb = fnl.exprBody;
+                if (eb != null) {
+                    self.expr(eb);
+                }
+                ast.BlockStatement? bb = fnl.blockBody;
+                if (bb != null) {
+                    self.stmt(bb);
+                }
+            case ast.AwaitExpr aw:
+                self.expr(aw.value);
+            case ast.CatchExpr ce:
+                self.expr(ce.value);
+                if (ce.name != "" && self.hitName(ce.nameTok, ce.name)) {
+                    return;
+                }
+                ast.BlockStatement? cb = ce.body;
+                if (cb != null) {
+                    self.stmt(cb);
+                }
+                ast.Expression? def = ce.default;
+                if (def != null) {
+                    self.expr(def);
+                }
+            case ast.PrefixExpression pe:
+                self.expr(pe.right);
+            case ast.InfixExpression ie:
+                self.expr(ie.left);
+                self.expr(ie.right);
+            case ast.IndexExpression ix:
+                self.expr(ix.left);
+                self.expr(ix.index);
+            case ast.AsExpression ax:
+                self.expr(ax.value);
+                self.typeNode(ax.type);
+            case ast.MemberExpression me:
+                self.expr(me.object);
+                // The `from` a template's hole calls has no dot in the file:
+                // its token is the string's, and nothing there names it.
+                ast.Identifier? viaTemplate = me.object as ast.Identifier;
+                if (viaTemplate != null && viaTemplate.name == ast.templateAlias) {
+                    return;
+                }
+                // The node's token is the dot, so the property starts
+                // directly after its literal (`?.` included).
+                token.Token prop = {
+                    type: me.tok.type, literal: me.property, line: me.tok.line,
+                    col: me.tok.col + string.length(me.tok.literal), note: "", quote: "", endLine: 0, endCol: 0,
+                };
+                if (self.hitName(prop, me.property)) {
+                    Hit? h = self.best;
+                    if (h != null) {
+                        h.expr = me;
+                        h.object = me.object;
+                    }
+                }
+            case ast.CallExpression call:
+                self.expr(call.callee);
+                // A resolved method is recorded against the call, so a hit in
+                // the callee gets the call too. Identity is the node id (§3.2).
+                Hit? inCallee = self.best;
+                if (inCallee != null) {
+                    ast.Expression? he = inCallee.expr;
+                    if (he != null && he.id == call.callee.id) {
+                        inCallee.call = call;
+                    }
+                }
+                forEach(call.args, a) {
+                    self.expr(a);
+                }
+        }
+    }
+}
+
+// What the tree holds at a line and byte column, both counted from 1. Null
+// when the position is not on a name.
+export Hit? at(ast.Program prog, int line, int col) {
+    Finder f = { line: line, col: col, best: null };
+    forEach(prog.imports, imp) {
+        f.stmt(imp);
+    }
+    f.stmts(prog.statements);
+    return f.best;
+}
+
+// ---- what is in scope ----
+
+// One name that a position can see, and where the source writes its type.
+export type Local {
+    String name;
+    // Node id for checker.Info.declTypes. It is 0 when the binding has no
+    // VarDeclStatement of its own.
+    int declID;
+    ast.TypeNode? type;
+    // Where a jump to the declaration lands.
+    token.Token tok;
+}
+
+Local local(String name, int declID, ast.TypeNode? t, token.Token tok) {
+    Local l = { name: name, declID: declID, type: t, tok: tok };
+    return l;
+}
+
+// Nothing records where a block ends. The first token of the next statement
+// marks the end, and the last statement runs to the end of its holder. This
+// can offer a name just out of scope, but it hides no name in scope.
+type Scoped {
+    int line;
+    int col;
+    Local[] found;
+
+    bool before(token.Token tok) {
+        if (tok.line != self.line) {
+            return tok.line < self.line;
+        }
+        return tok.col <= self.col;
+    }
+
+    // A next.line of 0 means nothing follows, so the statement runs to the end.
+    bool enters(token.Token start, token.Token next) {
+        if (!self.before(start)) {
+            return false;
+        }
+        if (next.line == 0) {
+            return true;
+        }
+        return !self.before(next);
+    }
+
+    void stmts(ast.Statement[] list) {
+        forEach(list, s, i) {
+            // A declaration before the position is in scope even when the
+            // position is not inside its statement.
+            self.declare(s);
+            token.Token next = { type: "", literal: "", line: 0, col: 0, note: "", quote: "", endLine: 0, endCol: 0 };
+            if (i + 1 < list.length) {
+                next = list[i + 1].tok;
+            }
+            if (self.enters(s.tok, next)) {
+                self.descend(s);
+            }
+        }
+    }
+
+    // Counts from the next line: `int sum = a + b;` must not offer `sum` in its
+    // own initializer. Two declarations on one line do not see each other.
+    void declare(ast.Statement s) {
+        ast.VarDeclStatement? v = s as ast.VarDeclStatement;
+        if (v != null && v.tok.line < self.line) {
+            array.push(self.found, local(v.name, v.id, v.type, v.nameTok));
+        }
+    }
+
+    void descend(ast.Statement s) {
+        ast.FunctionDeclStatement? fn = s as ast.FunctionDeclStatement;
+        if (fn != null) {
+            forEach(fn.params, p) {
+                array.push(self.found, local(p.name, 0, p.type, p.nameTok));
+            }
+            ast.Param? recv = fn.recv;
+            if (recv != null) {
+                array.push(self.found, local(recv.name, 0, recv.type, recv.nameTok));
+            }
+            self.stmts(fn.body.statements);
+            return;
+        }
+        ast.BlockStatement? b = s as ast.BlockStatement;
+        if (b != null) {
+            self.stmts(b.statements);
+            return;
+        }
+        ast.IfStatement? iff = s as ast.IfStatement;
+        if (iff != null) {
+            self.stmts(iff.then.statements);
+            ast.BlockStatement? els = iff.else;
+            if (els != null) {
+                self.stmts(els.statements);
+            }
+            return;
+        }
+        ast.WhileStatement? w = s as ast.WhileStatement;
+        if (w != null) {
+            self.stmts(w.body.statements);
+            return;
+        }
+        ast.ForStatement? f = s as ast.ForStatement;
+        if (f != null) {
+            ast.Statement? init = f.init;
+            if (init != null) {
+                self.declare(init);
+            }
+            self.stmts(f.body.statements);
+            return;
+        }
+        ast.ForEachStatement? fe = s as ast.ForEachStatement;
+        if (fe != null) {
+            array.push(self.found, local(fe.elemName, 0, null, fe.elemTok));
+            if (fe.indexName != "") {
+                array.push(self.found, local(fe.indexName, 0, null, fe.indexTok));
+            }
+            self.stmts(fe.body.statements);
+            return;
+        }
+        ast.SwitchStatement? sw = s as ast.SwitchStatement;
+        if (sw != null) {
+            forEach(sw.cases, cl) {
+                if (cl.bind != "") {
+                    // The type-case label is the binding's type (§4.9).
+                    ast.TypeNode? bound = null;
+                    ast.NamedType? label = cl.typeName;
+                    if (label != null) {
+                        bound = label;
+                    }
+                    array.push(self.found, local(cl.bind, 0, bound, cl.bindTok));
+                }
+                self.stmts(cl.body.statements);
+            }
+            return;
+        }
+        ast.TypeDeclStatement? td = s as ast.TypeDeclStatement;
+        if (td != null) {
+            forEach(td.methods, m) {
+                token.Token none = { type: "", literal: "", line: 0, col: 0, note: "", quote: "", endLine: 0, endCol: 0 };
+                if (self.enters(m.tok, none)) {
+                    self.descend(m);
+                }
+            }
+            return;
+        }
+    }
+}
+
+// Every local name a position can see, innermost last. Module-level names
+// are in checker.Info.top.
+export Local[] visible(ast.Program prog, int line, int col) {
+    Scoped sc = { line: line, col: col, found: [] };
+    sc.stmts(prog.statements);
+    return sc.found;
+}
+
+// ---- where a name was declared ----
+
+// One declaration as a place: the token a jump lands on, and the first line of
+// the declaration, which is the line a doc comment sits above.
+export type Site {
+    token.Token tok;
+    int startLine;
+}
+
+Site site(token.Token tok, int startLine) {
+    Site s = { tok: tok, startLine: startLine };
+    return s;
+}
+
+// The top-level declaration of a name in a module, or null. Imports are not
+// searched: an alias names something, it does not declare it.
+export ast.Statement? declOf(ast.Program prog, String name) {
+    ast.Statement? found = null;
+    forEach(prog.statements, s) {
+        if (found == null && declaredName(s) == name) {
+            found = s;
+        }
+    }
+    return found;
+}
+
+// The name that a top-level statement declares, or "". It uses `as` and no
+// type switch, because only some kinds declare a name, and §4.9 requires a
+// type switch without `default:` to be exhaustive.
+String declaredName(ast.Statement s) {
+    ast.VarDeclStatement? v = s as ast.VarDeclStatement;
+    if (v != null) {
+        return v.name;
+    }
+    ast.FunctionDeclStatement? fn = s as ast.FunctionDeclStatement;
+    if (fn != null) {
+        return fn.name;
+    }
+    ast.TypeDeclStatement? td = s as ast.TypeDeclStatement;
+    if (td != null) {
+        return td.name;
+    }
+    ast.EnumDeclStatement? en = s as ast.EnumDeclStatement;
+    if (en != null) {
+        return en.name;
+    }
+    return "";
+}
+
+export Site? siteOf(ast.Statement s) {
+    ast.VarDeclStatement? v = s as ast.VarDeclStatement;
+    if (v != null) {
+        return site(v.nameTok, v.tok.line);
+    }
+    ast.FunctionDeclStatement? fn = s as ast.FunctionDeclStatement;
+    if (fn != null) {
+        return site(fn.nameTok, fn.tok.line);
+    }
+    ast.TypeDeclStatement? td = s as ast.TypeDeclStatement;
+    if (td != null) {
+        return site(td.nameTok, td.tok.line);
+    }
+    ast.EnumDeclStatement? en = s as ast.EnumDeclStatement;
+    if (en != null) {
+        return site(en.nameTok, en.tok.line);
+    }
+    return null;
+}
+
+// Where a record declaration writes one of its fields or methods. It does not
+// use allMethods(), because an inherited copy has the base file's tokens.
+export Site? memberSite(ast.TypeDeclStatement td, String name) {
+    Site? found = null;
+    forEach(td.fields, f) {
+        if (found == null && f.name == name) {
+            // A field starts at its type's line, where a doc comment sits above.
+            found = site(f.nameTok, f.type.tok.line);
+        }
+    }
+    forEach(td.methods, m) {
+        if (found == null && m.name == name) {
+            found = site(m.nameTok, m.tok.line);
+        }
+    }
+    return found;
+}
+
+export Site? enumMemberSite(ast.EnumDeclStatement en, String name) {
+    Site? found = null;
+    forEach(en.members, m) {
+        if (found == null && m.name == name) {
+            found = site(m.tok, m.tok.line);
+        }
+    }
+    return found;
+}

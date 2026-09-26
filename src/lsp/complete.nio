@@ -1,0 +1,706 @@
+// What a program can write at a place.
+//
+// Completion must work on a document that does not compile: `string.` is not a
+// program. The text of the line says what is being completed, and the compiler's
+// tables say what the answers are. The line goes through the compiler's own
+// lexer, because a backward byte scan cannot tell the `)` in `f("a)b").` from
+// the end of a call.
+//
+// A parenthesized head, `(await f()).`, is not handled.
+import '../ast' as ast;
+import '../types' as types;
+import '../checker' as checker;
+import '../builtins' as builtins;
+import '../token' as token;
+import '../lexer' as lexer;
+import './find' as find;
+import './sig' as sig;
+import 'string';
+import 'array';
+import 'map';
+
+// The protocol's CompletionItemKind numbers. An editor picks an icon from them.
+int const KIND_METHOD = 2;
+int const KIND_FUNCTION = 3;
+int const KIND_FIELD = 5;
+int const KIND_VARIABLE = 6;
+int const KIND_MODULE = 9;
+int const KIND_ENUM = 13;
+int const KIND_KEYWORD = 14;
+int const KIND_ENUM_MEMBER = 20;
+int const KIND_CONSTANT = 21;
+int const KIND_STRUCT = 22;
+
+export type Item {
+    String label;
+    int kind;
+    // What an editor shows to the right of the label.
+    String detail;
+}
+
+Item item(String label, int kind, String detail) {
+    Item i = { label: label, kind: kind, detail: detail };
+    return i;
+}
+
+// ---- reading the line ----
+
+// Seg is one name of a dotted path, and what the source wrote after it.
+export type Seg {
+    String name;
+    // The suffixes on the name before the next dot, in the order the source
+    // wrote them: true for a call `(...)`, false for an index `[...]`. It is
+    // empty for a bare name. The type after the dot depends on each one.
+    bool[] applied;
+}
+
+// Context is what the text before the cursor says is being completed.
+export type Context {
+    // The dotted path before the part of the name, outermost segment first: one
+    // segment for `string.len`, two for `process.stdout.wr`, none for a bare
+    // name.
+    Seg[] path;
+    // The part of the name typed so far. It is empty directly after a dot.
+    String prefix;
+}
+
+Seg seg(String name, bool[] applied) {
+    Seg s = { name: name, applied: applied };
+    return s;
+}
+
+// A token that can start a path. A keyword counts: `fo` and `for` are different
+// tokens, and the list must not vanish at the keystroke that completes one.
+bool isWord(token.Token t) {
+    return t.type == token.IDENT || token.keywords[t.literal] != null;
+}
+
+// The line as tokens. It stops at the first token the lexer cannot read, such as
+// a string with no closing quote: nothing after that has a known structure.
+token.Token[] lexLine(String line) {
+    lexer.Lexer lx = lexer.newLexer(line);
+    token.Token[] out = [];
+    while (true) {
+        token.Token t = lx.nextToken();
+        if (t.type == token.EOF || t.type == token.ILLEGAL) {
+            return out;
+        }
+        array.push(out, t);
+    }
+    return out;
+}
+
+// The index of the opening bracket that matches the closing bracket at i, or -1.
+int matchBack(token.Token[] toks, int i) {
+    String close = toks[i].type;
+    String open = token.LPAREN;
+    if (close == token.RBRACKET) {
+        open = token.LBRACKET;
+    }
+    int depth = 0;
+    for (int j = i; j >= 0; j--) {
+        if (toks[j].type == close) {
+            depth++;
+        } else if (toks[j].type == open) {
+            depth--;
+            if (depth == 0) {
+                return j;
+            }
+        }
+    }
+    return -1;
+}
+
+// Reads the dotted path and the part of the name that end at a byte column,
+// counted from 1, which is the position of the caret.
+export Context contextAt(String line, int col) {
+    Context ctx = { path: [], prefix: "" };
+    token.Token[] toks = lexLine(line);
+
+    int end = 0;
+    while (end < toks.length && toks[end].col < col) {
+        end++;
+    }
+    // A name the caret is inside, or directly after, is the prefix and not a
+    // segment of the path.
+    if (end > 0) {
+        token.Token last = toks[end - 1];
+        if (isWord(last) && last.col + string.length(last.literal) >= col) {
+            ctx.prefix = string.substring(last.literal, 0, col - last.col);
+            end--;
+        }
+    }
+
+    // Scan backward: a dot, the suffixes before it, and the name they apply to.
+    // `x = 1.` never enters the loop, because the lexer reads `1.` as one FLOAT
+    // token, which is neither a dot nor a word.
+    Seg[] rev = [];
+    int k = end;
+    while (k > 0) {
+        String dot = toks[k - 1].type;
+        if (dot != token.DOT && dot != token.QDOT) {
+            break;
+        }
+        k--;
+        bool[] applied = [];
+        bool broken = false;
+        while (k > 0 && (toks[k - 1].type == token.RPAREN || toks[k - 1].type == token.RBRACKET)) {
+            int opener = matchBack(toks, k - 1);
+            if (opener < 0) {
+                broken = true;
+                break;
+            }
+            array.push(applied, toks[k - 1].type == token.RPAREN);
+            k = opener;
+        }
+        if (broken || k == 0 || !isWord(toks[k - 1])) {
+            break;
+        }
+        k--;
+        // The scan runs backward, so it collects the outermost segment first.
+        array.reverse(applied);
+        array.push(rev, seg(toks[k].literal, applied));
+    }
+    array.reverse(rev);
+    ctx.path = rev;
+    return ctx;
+}
+
+// Whether a position is inside a comment, where a name has no meaning. The
+// comments come from the last tree that parsed, one keystroke behind.
+export bool inComment(ast.Program prog, int line, int col) {
+    bool inside = false;
+    forEach(prog.comments, c) {
+        if (line < c.line || line > c.endLine) {
+            continue;
+        }
+        if (line == c.line && col <= c.col) {
+            continue;    // before the opening marker
+        }
+        if (line == c.endLine && col >= c.col + lastLineWidth(c)) {
+            continue;    // past the closing one, which `/* x */ y.` has
+        }
+        inside = true;
+    }
+    return inside;
+}
+
+// How far a comment reaches on its last line, as an offset from the column
+// where it started. Over several lines the measure starts at the start of the
+// line, which the +1 turns back into a column.
+int lastLineWidth(token.Comment c) {
+    if (c.line == c.endLine) {
+        return string.length(c.text);
+    }
+    String[] parts = string.split(c.text, "\n");
+    return string.length(parts[parts.length - 1]) + 1 - c.col;
+}
+
+// ---- what to offer ----
+
+// The items for a position. prog and info are the last check of this document,
+// line is the text of the line at the caret, and col is its byte column.
+export Item[] at(ast.Program prog, checker.Info info, String line, int lineNo, int col) {
+    if (inComment(prog, lineNo, col)) {
+        return [];
+    }
+    Context ctx = contextAt(line, col);
+    if (ctx.path.length == 0) {
+        return inScope(prog, info, lineNo, col);
+    }
+    return members(prog, info, ctx.path, lineNo, col);
+}
+
+Item[] members(ast.Program prog, checker.Info info, Seg[] path, int lineNo, int col) {
+    Seg head = path[0];
+
+    // A module named directly. A module is not a value, so `string(...)` names
+    // something else.
+    checker.ModuleRef? mod = info.moduleAliases[head.name];
+    if (mod != null && head.applied.length == 0) {
+        return moduleMembers(prog, mod, path);
+    }
+
+    // An enum named directly, so `Status.` offers its members.
+    if (path.length == 1 && head.applied.length == 0) {
+        types.Enum? en = info.enums[head.name];
+        if (en != null) {
+            return enumItems(en);
+        }
+        // A union works the same way (§2.11). This is the only way to reach a
+        // member, because its record name has a character §1.3 keeps out of
+        // names.
+        types.Record? u = info.records[head.name];
+        if (u != null) {
+            Item[] mems = unionItems(u);
+            if (mems.length > 0) {
+                return mems;
+            }
+        }
+    }
+
+    // In every other case the head is a value, and the path walks into its type.
+    types.Type? t = headType(prog, info, head.name, lineNo, col);
+    if (t == null) {
+        return [];
+    }
+    return walk(prog, apply(t, head.applied), path, 1);
+}
+
+// Follows the rest of a path from segment i and answers what can follow its
+// last dot.
+Item[] walk(ast.Program prog, types.Type? start, Seg[] path, int i) {
+    if (start == null) {
+        return [];
+    }
+    types.Type cur = start;
+    for (int k = i; k < path.length; k++) {
+        types.Type? next = memberType(cur, path[k].name);
+        if (next == null) {
+            return [];
+        }
+        types.Type? after = apply(next, path[k].applied);
+        if (after == null) {
+            return [];
+        }
+        cur = after;
+    }
+    return typeMembers(prog, cur);
+}
+
+// The type of a name after the calls and indexes that follow it. It answers
+// null where the language has no answer, such as an index into a value that is
+// not a collection.
+types.Type? apply(types.Type t, bool[] applied) {
+    types.Type cur = t;
+    forEach(applied, isCall) {
+        if (isCall) {
+            types.FuncType? fn = cur as types.FuncType;
+            if (fn == null) {
+                return null;
+            }
+            cur = fn.return;
+        } else {
+            types.Array? arr = cur as types.Array;
+            if (arr != null) {
+                cur = arr.elem;
+                continue;
+            }
+            types.MapType? m = cur as types.MapType;
+            if (m == null) {
+                return null;
+            }
+            // A map read gives V? (§6.7). The optional is dropped, because
+            // everything after it reaches through an optional.
+            cur = m.value;
+        }
+    }
+    return cur;
+}
+
+Item[] moduleMembers(ast.Program prog, checker.ModuleRef mod, Seg[] path) {
+    String builtin = mod.builtin;
+    if (builtin != "") {
+        // `process.stdout.` names a namespace and not a value, so the key takes
+        // one more segment for each namespace.
+        String key = builtin;
+        int i = 1;
+        while (i < path.length && path[i].applied.length == 0
+            && builtins.isNamespace(key, path[i].name)) {
+            key = key + "." + path[i].name;
+            i++;
+        }
+        if (i == path.length) {
+            return builtinMembers(key);
+        }
+        // After the namespaces the path names a function. The walk continues
+        // into its return type.
+        types.FuncType? found = builtins.lookupSig(key, path[i].name);
+        if (found == null) {
+            return [];
+        }
+        return walk(prog, apply(found, path[i].applied), path, i + 1);
+    }
+
+    checker.ModuleExports? found = mod.exports;
+    if (found == null) {
+        return [];
+    }
+    checker.ModuleExports ex = found;
+    if (path.length == 1) {
+        return exported(ex);
+    }
+    Seg next = path[1];
+    if (path.length == 2 && next.applied.length == 0) {
+        types.Enum? en = ex.enums[next.name];
+        if (en != null) {
+            return enumItems(en);
+        }
+        // `alias.Union.` has three segments (§2.11), and is the only way to
+        // reach a member of a union another module declared.
+        types.Record? u = ex.records[next.name];
+        if (u != null) {
+            Item[] mems = unionItems(u);
+            if (mems.length > 0) {
+                return mems;
+            }
+        }
+    }
+    types.Type? t = null;
+    types.FuncType? fn = ex.funcs[next.name];
+    if (fn != null) {
+        t = fn;
+    }
+    if (t == null) {
+        t = ex.vars[next.name];
+    }
+    if (t == null) {
+        return [];
+    }
+    return walk(prog, apply(t, next.applied), path, 2);
+}
+
+// The type of the first name in a path: a local, then a module-level name, then
+// a function of this module, which is in no scope because a call resolves a
+// function by name.
+types.Type? headType(ast.Program prog, checker.Info info, String name, int lineNo, int col) {
+    // The innermost scope comes last, so the last match is the one in scope.
+    find.Local[] locals = find.visible(prog, lineNo, col);
+    types.Type? found = null;
+    forEach(locals, l) {
+        if (l.name == name) {
+            if (l.declID != 0) {
+                types.Type? dt = info.declTypes[l.declID];
+                if (dt != null) {
+                    found = dt;
+                }
+            }
+        }
+    }
+    if (found != null) {
+        return found;
+    }
+    checker.Scope? top = info.top;
+    if (top != null) {
+        types.Type? global = top.lookup(name);
+        if (global != null) {
+            return global;
+        }
+    }
+    types.FuncType? own = info.funcs[name];
+    if (own != null) {
+        return own;
+    }
+    return null;
+}
+
+// The type of one field or method of t. It follows an optional to what it
+// holds: `car?.make` is written on a `Car?` and asks about Car. A method gives
+// its signature and not its result, which apply above takes from the call.
+types.Type? memberType(types.Type t, String name) {
+    types.Record? rec = recordOf(t);
+    if (rec == null) {
+        return null;
+    }
+    forEach(rec.fields, f) {
+        if (f.name == name) {
+            return f.type;
+        }
+    }
+    forEach(rec.methods, m) {
+        if (m.name == name) {
+            return m.sig;
+        }
+    }
+    return null;
+}
+
+// Writes one method of a record, with its parameter names when this module holds
+// the declaration. A record from another module gives the types alone.
+String methodDetail(ast.Program prog, types.Record r, types.Method m) {
+    ast.Statement? decl = find.declOf(prog, r.name);
+    if (decl != null) {
+        ast.TypeDeclStatement? td = decl as ast.TypeDeclStatement;
+        if (td != null) {
+            ast.FunctionDeclStatement? written = null;
+            forEach(td.methods, fn) {
+                if (written == null && fn.name == m.name) {
+                    written = fn;
+                }
+            }
+            if (written != null) {
+                return sig.fromDecl(written, m.name, m.sig.fallible);
+            }
+        }
+    }
+    return signatureOf(m.sig, m.name);
+}
+
+String firstLine(String written) {
+    String[] parts = string.split(written, "\n");
+    return parts[0];
+}
+
+// Removes the module from the name in a shape, so a list of bare labels has
+// details that match: `String toText(any v)` beside `int length(String s)`.
+String unqualify(String written, String key, String name) {
+    return string.replace(written, key + "." + name + "(", name + "(");
+}
+
+Item[] enumItems(types.Enum en) {
+    Item[] out = [];
+    forEach(en.members, m) {
+        array.push(out, item(m.name, KIND_ENUM_MEMBER,
+            en.name + " = " + string.from(m.value)));
+    }
+    return out;
+}
+
+// The tags of a union (§2.11), each with the type its member holds. It is empty
+// for a record that is not a union, which is how the caller tells the two apart.
+Item[] unionItems(types.Record u) {
+    Item[] out = [];
+    if (!u.sealed) {
+        return out;
+    }
+    forEach(u.extenders, e) {
+        types.Type? pay = checker.unionPayload(e);
+        String tag = checker.unionTag(e);
+        if (pay != null && tag != "") {
+            array.push(out, item(tag, KIND_ENUM_MEMBER, types.typeString(pay)));
+        }
+    }
+    return out;
+}
+
+// What a list shows beside the name of a type. A union shows the keyword that
+// declares it, because its source has no `type Text`.
+String typeDetail(types.Record r) {
+    if (checker.isUnion(r)) {
+        return "union " + r.name;
+    }
+    return "type " + r.name;
+}
+
+// Whether a name in a table is a generated member of a union. No program can
+// write such a name. unionItems offers it after the name of its union.
+bool isUnionMember(types.Record r) {
+    return checker.unionPayload(r) != null;
+}
+
+types.Record? recordOf(types.Type t) {
+    types.Optional? opt = t as types.Optional;
+    if (opt != null) {
+        return recordOf(opt.inner);
+    }
+    return t as types.Record;
+}
+
+Item[] typeMembers(ast.Program prog, types.Type t) {
+    Item[] out = [];
+    types.Record? rec = recordOf(t);
+    if (rec == null) {
+        // An array, a string and a map have a `length` and nothing else behind
+        // a dot.
+        types.Array? arr = t as types.Array;
+        if (arr != null) {
+            array.push(out, item("length", KIND_FIELD, "int"));
+        }
+        return out;
+    }
+    types.Record r = rec;
+    forEach(r.fields, f) {
+        array.push(out, item(f.name, KIND_FIELD, types.typeString(f.type)));
+    }
+    forEach(r.methods, m) {
+        array.push(out, item(m.name, KIND_METHOD, methodDetail(prog, r, m)));
+    }
+    return out;
+}
+
+// What a built-in module, or a namespace in one, holds. The names come from
+// builtins.builtinMemberNames. builtinAvailable is diagnostic prose and does
+// not split into names for `process`.
+Item[] builtinMembers(String key) {
+    Item[] out = [];
+    forEach(builtins.members(key), name) {
+        if (builtins.isNamespace(key, name)) {
+            array.push(out, item(name, KIND_MODULE, key + "." + name));
+            continue;
+        }
+        types.FuncType? found = builtins.lookupSig(key, name);
+        if (found != null) {
+            array.push(out, item(name, KIND_FUNCTION,
+                sig.fromType(found, name, builtins.paramNames(key, name),
+                    builtins.hasOptionalTail(key, name))));
+            continue;
+        }
+        // A constant, such as math.PI: its shape is its declaration.
+        if (builtins.constValue(key, name) != null) {
+            array.push(out, item(name, KIND_CONSTANT, unqualify(builtins.shape(key, name), key, name)));
+            continue;
+        }
+        // A function with no single signature, such as string.from or
+        // array.push. Its §6 sentence is the detail, and only the first line
+        // fits a column.
+        array.push(out, item(name, KIND_FUNCTION,
+            unqualify(firstLine(builtins.shape(key, name)), key, name)));
+    }
+    return out;
+}
+
+Item[] exported(checker.ModuleExports ex) {
+    Item[] out = [];
+    forEach(map.keys(ex.funcs), name) {
+        types.FuncType? fn = ex.funcs[name];
+        if (fn != null) {
+            array.push(out, item(name, KIND_FUNCTION, signatureOf(fn, name)));
+        }
+    }
+    forEach(map.keys(ex.vars), name) {
+        types.Type? t = ex.vars[name];
+        if (t != null) {
+            array.push(out, item(name, KIND_VARIABLE, types.typeString(t)));
+        }
+    }
+    forEach(map.keys(ex.records), name) {
+        types.Record? r = ex.records[name];
+        if (r != null && !isUnionMember(r)) {
+            array.push(out, item(name, KIND_STRUCT, typeDetail(r)));
+        }
+    }
+    forEach(map.keys(ex.enums), name) {
+        array.push(out, item(name, KIND_ENUM, "enum " + name));
+    }
+    return out;
+}
+
+// ---- a bare name ----
+
+Item[] inScope(ast.Program prog, checker.Info info, int lineNo, int col) {
+    Item[] out = [];
+    Map<String, bool> seen = {};
+
+    forEach(find.visible(prog, lineNo, col), l) {
+        String detail = "";
+        if (l.declID != 0) {
+            types.Type? t = info.declTypes[l.declID];
+            if (t != null) {
+                detail = types.typeString(t);
+            }
+        }
+        if (detail == "") {
+            ast.TypeNode? written = l.type;
+            if (written != null) {
+                detail = ast.typeNodeString(written);
+            }
+        }
+        if (seen[l.name] == null) {
+            seen[l.name] = true;
+            array.push(out, item(l.name, KIND_VARIABLE, detail));
+        }
+    }
+
+    checker.Scope? top = info.top;
+    if (top != null) {
+        forEach(map.keys(top.vars), name) {
+            if (seen[name] != null) {
+                continue;
+            }
+            seen[name] = true;
+            types.Type? t = top.lookup(name);
+            String detail = "";
+            int kind = KIND_VARIABLE;
+            if (t != null) {
+                detail = types.typeString(t);
+                types.FuncType? fn = t as types.FuncType;
+                if (fn != null) {
+                    kind = KIND_FUNCTION;
+                    detail = signatureOf(fn, name);
+                }
+            }
+            array.push(out, item(name, kind, detail));
+        }
+    }
+
+    // The functions of the module, which are in no scope: a call resolves a
+    // function by name, so the checker keys them in a table of their own.
+    forEach(map.keys(info.funcs), name) {
+        if (seen[name] != null) {
+            continue;
+        }
+        seen[name] = true;
+        types.FuncType? own = info.funcs[name];
+        String detail = "";
+        if (own != null) {
+            // The declaration when this module has one, for its parameter names.
+            ast.Statement? decl = find.declOf(prog, name);
+            ast.FunctionDeclStatement? written = null;
+            if (decl != null) {
+                written = decl as ast.FunctionDeclStatement;
+            }
+            if (written != null) {
+                detail = sig.fromDecl(written, name, own.fallible);
+            } else {
+                detail = signatureOf(own, name);
+            }
+        }
+        array.push(out, item(name, KIND_FUNCTION, detail));
+    }
+
+    forEach(map.keys(info.records), name) {
+        types.Record? r = info.records[name];
+        if (seen[name] == null && r != null && !isUnionMember(r)) {
+            seen[name] = true;
+            array.push(out, item(name, KIND_STRUCT, typeDetail(r)));
+        }
+    }
+    forEach(map.keys(info.enums), name) {
+        if (seen[name] == null) {
+            seen[name] = true;
+            array.push(out, item(name, KIND_ENUM, "enum " + name));
+        }
+    }
+    forEach(map.keys(info.moduleAliases), name) {
+        if (seen[name] != null || name == ast.templateAlias) {
+            continue;
+        }
+        seen[name] = true;
+        checker.ModuleRef? ref = info.moduleAliases[name];
+        String detail = "module";
+        if (ref != null && ref.builtin != "") {
+            detail = "built-in module";
+        }
+        array.push(out, item(name, KIND_MODULE, detail));
+    }
+
+    // The four names always in scope (checker.reserved), the built-in type names
+    // and the keywords, all from the compiler's own tables.
+    forEach(map.keys(checker.reserved), name) {
+        if (seen[name] == null) {
+            seen[name] = true;
+            // The written form a hover shows, and only its first line.
+            array.push(out, item(name, KIND_FUNCTION,
+                firstLine(builtins.globalShape(name))));
+        }
+    }
+    forEach(map.keys(checker.builtinTypes), name) {
+        if (seen[name] == null) {
+            seen[name] = true;
+            array.push(out, item(name, KIND_STRUCT, "built-in type"));
+        }
+    }
+    forEach(map.keys(token.keywords), word) {
+        if (seen[word] == null) {
+            seen[word] = true;
+            array.push(out, item(word, KIND_KEYWORD, "keyword"));
+        }
+    }
+    return out;
+}
+
+// Writes a function type with no parameter names, which is all a types.FuncType
+// carries.
+String signatureOf(types.FuncType f, String name) {
+    return sig.fromType(f, name, [], false);
+}

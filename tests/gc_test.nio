@@ -1,0 +1,360 @@
+// The collector, end to end.
+//
+// These tests compile real programs and check two things that only a run
+// shows: garbage is reclaimed, and codegen roots every pointer it keeps across
+// an allocation. NIO_GC_STRESS=1 collects at every allocation, so a value held
+// outside a root is always freed while it is still live. The C harness covers
+// the parts of the collector that no Nio program reaches.
+import 'test';
+import 'string';
+import './harness' as h;
+import 'process';
+
+// A program that allocates far more than it keeps alive, and what it prints.
+type Bounded {
+    String name;
+    String want;
+    String src;
+}
+
+Bounded prog(String name, String want, String src) {
+    Bounded b = { name: name, want: want, src: src };
+    return b;
+}
+
+Bounded[] bounded = [
+    // Records: the ring buffer keeps four alive, the rest is garbage.
+    prog("records", "599997\n",
+        `
+type Point { int x; int y }
+type Segment { Point a; Point b }
+Segment[] recent = [{a:{x:0,y:0},b:{x:0,y:0}}, {a:{x:0,y:0},b:{x:0,y:0}}];
+int i;
+while (i < 300000) {
+    recent[i % 2] = { a: { x: i, y: i }, b: { x: i, y: i } };
+    i = i + 1;
+}
+print(recent[0].a.x + recent[1].b.y);
+`),
+    // Strings: every + allocates, and rt_str_concat is the only allocation
+    // site. If the runtime disabled collection inside itself, this program
+    // would never collect.
+    prog("strings", "30000\n",
+        `
+int i;
+int hits;
+while (i < 30000) {
+    String s = "";
+    int j;
+    while (j < 16) {
+        s = s + "ab";
+        j = j + 1;
+    }
+    if (s == "abababababababababababababababab") { hits = hits + 1; }
+    i = i + 1;
+}
+print(hits);
+`),
+    // Arrays: a fresh array per iteration, none of it retained.
+    prog("arrays", "300000\n",
+        `
+int i;
+int total;
+while (i < 200000) {
+    int[] xs = [i, i + 1, i + 2];
+    total = (total + xs[2]) % 1000000;
+    i = i + 1;
+}
+print(total);
+`),
+    // Array library: growth abandons slot blocks, and each iteration drops the
+    // whole array. Under stress a collection lands inside every push that
+    // grows, with the array reachable only through the runtime's own roots.
+    prog("arraylib", "200000\n",
+        `
+import 'array';
+int total;
+int i;
+while (i < 30000) {
+    String[] tmp = [];
+    int j;
+    while (j < 20) {
+        array.push(tmp, "ab" + "cd");
+        j = j + 1;
+    }
+    String[] snap = array.copy(tmp);
+    total = (total + snap.length + tmp.length) % 1000000;
+    i = i + 1;
+}
+print(total);
+`),
+    // Cycles: two records pointing at each other, dropped every iteration.
+    // Reference counting cannot reclaim these.
+    prog("cycles", "150000\n",
+        `
+type Node { String label; Node? next }
+int i;
+while (i < 150000) {
+    Node a = { label: "a" };
+    Node b = { label: "b" };
+    a.next = b;
+    b.next = a;
+    i = i + 1;
+}
+print(i);
+`),
+];
+
+test.start("gc: bounded programs compute the right answer", void () -> {
+    forEach(bounded, b) {
+        h.Run r = h.runProgram(b.src);
+        if (r.out != b.want) {
+            return Error(b.name + ": output = \"" + r.out + "\", want \"" + b.want + "\"");
+        }
+    }
+});
+
+// The same programs must compute the same answers when every allocation
+// triggers a collection. Any value codegen holds outside a root is freed
+// underneath it here.
+test.start("gc: stress preserves results", void () -> {
+    forEach(bounded, b) {
+        // Stress collects on every allocation, so these run with far smaller
+        // bounds than the reclamation test above.
+        String small = string.replaceAll(b.src, "300000", "300");
+        small = string.replaceAll(small, "30000", "50");
+        small = string.replaceAll(small, "200000", "200");
+        small = string.replaceAll(small, "150000", "150");
+        h.StressRun r = h.runStressed(small);
+        if (r.plain.out != r.stressed.out) {
+            return Error(b.name + ": stress changed the result: \"" + r.stressed.out
+                + "\" vs \"" + r.plain.out + "\"");
+        }
+    }
+});
+
+// Exercises the constructs whose roots are easiest to get wrong: values held
+// across a call that allocates, nested literals, arguments evaluated before
+// later arguments allocate, and forEach over a live array.
+test.start("gc: stress over a complex program", void () -> {
+    h.StressRun r = h.runStressed(`
+import 'json';
+
+type Inner { String tag; int[] nums }
+type Outer { String name; Inner a; Inner b; String? note }
+
+Inner makeInner(String tag, int n) {
+    return { tag: tag + "!", nums: [n, n + 1, n + 2] };
+}
+
+String join(Outer o) {
+    return o.name + "/" + o.a.tag + "/" + o.b.tag;
+}
+
+int total;
+Outer[] kept = [];
+
+forEach([1, 2, 3, 4, 5], v, i) {
+    // Both arguments allocate, and the first is held while the second runs.
+    Outer o = {
+        name: "row-" + "x",
+        a: makeInner("a", v),
+        b: makeInner("b", v * 10)
+    };
+    o.note = json.toText(o.a);
+    total = total + o.a.nums[2] + o.b.nums[0] + i;
+    print(join(o));
+    print(o.note);
+}
+print(total);
+`);
+    test.expectString(r.stressed.out, r.plain.out);
+    test.assert(string.contains(r.plain.out, "{\"tag\":\"a!\",\"nums\":[1,2,3]}"),
+        "unexpected output: \"" + r.plain.out + "\"");
+});
+
+// break and continue jump out of a loop body without unwinding anything, so
+// the roots holding the loop's heap values (the forEach array slot, the named
+// locals) must still be intact on both paths.
+test.start("gc: stress over break and continue", void () -> {
+    h.StressRun r = h.runStressed(`
+import 'array';
+import 'json';
+
+type Box { String s }
+
+Box[] items = [];
+for (int i = 0; i < 60; i++) {
+    if (i % 3 == 0) { continue; }
+    Box b = { s: "item" + json.toText(i) };
+    if (i > 40) { break; }
+    array.push(items, b);
+}
+print(items.length);
+print(items[items.length - 1].s);
+
+String tally = "";
+forEach(items, it, k) {
+    if (k % 7 != 0) { continue; }
+    tally = tally + it.s + " ";
+    if (k > 20) { break; }
+}
+print(tally);
+`);
+    test.expectString(r.stressed.out, r.plain.out);
+    test.assert(string.contains(r.plain.out, "item40"),
+        "unexpected output: \"" + r.plain.out + "\"");
+});
+
+// Values reachable only from a global must survive collections triggered long
+// after the global was written.
+test.start("gc: globals are traced", void () -> {
+    h.StressRun r = h.runStressed(`
+type Holder { String name; int[] xs }
+Holder kept = { name: "survivor", xs: [7, 8, 9] };
+int i;
+while (i < 50000) {
+    int[] garbage = [i, i, i];
+    i = i + 1;
+}
+print(kept.name);
+print(kept.xs[1]);
+`);
+    test.expectString(r.stressed.out, "survivor\n8\n");
+});
+
+// String literals are static constants carrying a GC header, not heap blocks.
+// The collector must recognise them and leave them alone, however many
+// collections they are traced through.
+test.start("gc: string literals are left alone", void () -> {
+    h.StressRun r = h.runStressed(`
+type Box { String s }
+Box b = { s: "literal" };
+int i;
+while (i < 20000) {
+    Box tmp = { s: "another" };
+    i = i + 1;
+}
+print(b.s);
+print(b.s == "literal");
+`);
+    test.expectString(r.stressed.out, "literal\ntrue\n");
+});
+
+// The string library allocates inside C helpers (pieces, copies, the split
+// array) while its arguments live only in registers and its own GCFrames.
+// Stress collection at every allocation must not change any result.
+test.start("gc: stress over the string library", void () -> {
+    h.StressRun r = h.runStressed(`
+import 'string';
+
+String acc = "";
+String text = "alpha,beta,gamma,delta";
+int i = 0;
+while (i < 40) {
+    String[] parts = string.split(text, ",");
+    String up = string.toUpperCaseAscii(parts[0]);
+    String glued = "";
+    forEach(parts, p) {
+        glued = string.append(glued, string.trim("  " + p + "  "));
+    }
+    acc = string.replace(up, "ALPHA", string.replaceAll(glued, "a", "_"));
+    i++;
+}
+print(acc);
+print(string.length(acc));
+
+int sum;
+forEach(string.toByteArray("abc"), b) {
+    sum = sum + b;
+}
+print(sum);
+
+// join's array is an unnamed intermediate while the separator expression
+// runs and allocates. The call site must root it. The
+// runtime then holds both across its own allocation.
+String out = "";
+int k = 0;
+while (k < 40) {
+    out = string.join(string.split(text, ","), string.append("<", ">"));
+    k++;
+}
+print(out);
+`);
+    test.expectString(r.stressed.out, r.plain.out);
+    test.expectString(r.plain.out, "_lph_bet_g_mm_delt_\n19\n294\nalpha<>beta<>gamma<>delta\n");
+});
+
+// Map churn under stress: growth, rehashing, removal and boxing lookups all
+// allocate with live pointers in flight, so a missing root in any rt_map_*
+// helper fails here on the first collection that could expose it.
+test.start("gc: stress over maps", void () -> {
+    h.StressRun r = h.runStressed(`
+import 'map';
+import 'json';
+
+Map<String, String> acc;
+int i = 0;
+while (i < 30) {
+    Map<String, String> scratch;
+    scratch["a" + json.toText(i)] = "x" + json.toText(i);
+    scratch["b"] = "y";
+    map.remove(scratch, "b");
+    forEach(map.keys(scratch), k) {
+        String? v = scratch[k];
+        if (v != null) {
+            acc[k] = v;
+        }
+    }
+    i++;
+}
+print(acc.length);
+print(acc["a29"]);
+
+Map<String, int[]> lists = { "xs": [1, 2, 3] };
+int[]? xs = lists["xs"];
+if (xs != null) {
+    print(xs.length);
+}
+print(json.toText(map.copy(acc)["a0"]));
+`);
+    test.expectString(r.stressed.out, r.plain.out);
+    test.expectString(r.plain.out, "30\nx29\n3\n\"x0\"\n");
+});
+
+// The C harness drives the collector directly, with root sets built by hand.
+// It reaches parts of the collector that no Nio program reaches. It compiles
+// against the embedded runtime that the compiler links, and runs once plainly
+// and once under NIO_GC_STRESS=1.
+test.start("gc: the runtime harness", void () -> {
+    h.runCHarness("build/testdata/gc_harness.c", ["runtime.c", "gc.c"]);
+});
+
+// Allocating far more than is retained must not grow the heap without bound.
+//
+// The peak RSS comes from process.ChildUsage (§6.12), which is what the
+// operating system charged the child.
+//
+// The limit is generous: it only has to fail if nothing is ever reclaimed,
+// which would put these programs in the hundreds of MB.
+test.start("gc: garbage is actually reclaimed", void () -> {
+    int const LIMIT = 32 * 1024 * 1024;
+    forEach(bounded, b) {
+        String bin = h.buildSource(b.src);
+        h.Run r = h.runBinary(bin, []);
+        if (r.out != b.want) {
+            return Error(b.name + ": output = \"" + r.out + "\", want \"" + b.want + "\"");
+        }
+        process.ChildUsage? u = r.usage;
+        if (u == null) {
+            // Windows reports no usage, so the test does not check the bound
+            // there. A zero value must not make the test pass.
+            continue;
+        }
+        if (u.peakMemory > LIMIT) {
+            return Error(b.name + ": peak memory " + string.from(u.peakMemory / 1048576)
+                + " MB exceeds " + string.from(LIMIT / 1048576)
+                + " MB: garbage is not being reclaimed");
+        }
+    }
+});

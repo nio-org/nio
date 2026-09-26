@@ -1,0 +1,204 @@
+// Checks that the checked-in bootstrap obeys one equation:
+//
+//	bootstrap/nio.ll == the IR the compiler in src/ emits for src/nio.nio
+//
+// A stale artifact cannot compile the tree it ships with, and then no compiler
+// can regenerate it. This file checks that the text is current.
+// tests/fixpoint_test.nio checks that it works.
+import 'test';
+import 'string';
+import 'array';
+import 'map';
+import './repo' as repo;
+import '../src/loader' as loader;
+import '../src/codegen' as codegen;
+import '../src/lib/str' as str;
+
+// The command that fixes all failures in this file.
+String const REGENERATE = "nio run tools/bootstrap.nio";
+
+// The compile is expensive, and two tests use it. They run in order in the
+// same process, and neither changes the result.
+loader.CompileResult? emittedCache = null;
+
+// Compiles the compiler as tools/bootstrap.nio does: with no target attributes,
+// so the IR names no host, and with no coverage.
+//
+// These paths are absolute, and the tool's paths are relative. Module quals
+// come from base names, so the IR does not record the entry path. Thus the two
+// are identical byte for byte.
+loader.CompileResult emitted() {
+    loader.CompileResult? cached = emittedCache;
+    if (cached != null) {
+        return cached;
+    }
+    String entry = repo.at("src/nio.nio");
+    loader.CompileResult res = loader.compileEntry(repo.readText("src/nio.nio"),
+        loader.dirOf(entry), entry, codegen.noOptions());
+    emittedCache = res;
+    return res;
+}
+
+// Tells where two multi-megabyte texts first differ. The line shows if the
+// cause is a new language feature or a change in the generator output.
+String firstDiff(String got, String want) {
+    String[] g = string.split(got, "\n");
+    String[] w = string.split(want, "\n");
+    int n = g.length;
+    if (w.length < n) {
+        n = w.length;
+    }
+    for (int i = 0; i < n; i++) {
+        if (g[i] != w[i]) {
+            return "it is " + string.from(g.length) + " lines and the compiler now emits "
+                + string.from(w.length) + ", first differing at line " + string.from(i + 1)
+                + "\n  on disk:  " + g[i] + "\n  emitted:  " + w[i];
+        }
+    }
+    return "it is " + string.from(g.length) + " lines and the compiler now emits "
+        + string.from(w.length) + ", agreeing as far as the shorter one goes";
+}
+
+// Gets the runtime sources from the generated clang command line. Each is
+// written `"$rt/<name>"`. No other text in the script has this form.
+String[] listedCFiles(String script) {
+    String[] out = [];
+    String mark = "\"$rt/";
+    forEach(string.split(script, "\n"), line) {
+        int i = string.find(line, mark);
+        if (i < 0) {
+            continue;
+        }
+        String rest = string.substring(line, i + string.length(mark), string.length(line));
+        int end = string.find(rest, "\"");
+        if (end < 0) {
+            continue;
+        }
+        array.push(out, string.substring(rest, 0, end));
+    }
+    return out;
+}
+
+test.start("bootstrap: nio.ll is the compiler, compiled", void () -> {
+    loader.CompileResult res = emitted();
+    if (res.errs.length > 0) {
+        return Error("the compiler does not compile:\n  " + string.join(res.errs, "\n  "));
+    }
+    String onDisk = repo.readText("bootstrap/nio.ll");
+    if (onDisk != res.ir) {
+        return Error("bootstrap/nio.ll is stale: " + firstDiff(onDisk, res.ir)
+            + "\n\nregenerate with: " + REGENERATE);
+    }
+});
+
+test.start("bootstrap: nio.ll names no host", void () -> {
+    // The tool passes no attributes, so the IR has no
+    // "target-cpu"/"target-features" group, no triple and no datalayout. Clang
+    // lowers it for the host it runs on. All other compilations in the
+    // repository emit the group, so this test checks it.
+    String ir = repo.readText("bootstrap/nio.ll");
+    String[] pinned = ["\nattributes #", "\ntarget triple", "\ntarget datalayout"];
+    forEach(pinned, bad) {
+        if (string.contains(ir, bad)) {
+            return Error("bootstrap/nio.ll carries " + string.trim(bad) + ", which pins it to one host");
+        }
+    }
+    // Both names occur in string constants, because the compiler contains the
+    // scanner that looks for them in clang's output. A name outside a constant
+    // means that the attribute group is back.
+    forEach(string.split(ir, "\n"), line) {
+        if (!string.contains(line, "target-cpu") && !string.contains(line, "target-features")) {
+            continue;
+        }
+        if (!str.hasPrefix(line, "@str.")) {
+            return Error("bootstrap/nio.ll names a target outside a string constant: " + line);
+        }
+    }
+});
+
+test.start("bootstrap: build.sh links the runtime the compiler needs", void () -> {
+    // The compiler's imports decide this list. If the script misses a file,
+    // stage 0 links with undefined symbols.
+    //
+    // Only the files that clang compiles are operands. Headers are in the same
+    // list. The vendored fiat arithmetic that lib/crypto.c includes is
+    // generated `--static` and is not a translation unit. If clang gets a
+    // header as an operand, it tries to precompile it, and the link fails.
+    // The script's `-I` finds the headers.
+    loader.CompileResult res = emitted();
+    String script = repo.readText("bootstrap/build.sh");
+    String[] compiled = [];
+    forEach(res.cfiles, c) {
+        if (str.hasSuffix(c, ".c") || str.hasSuffix(c, ".m")) {
+            array.push(compiled, c);
+        }
+    }
+    String listed = string.join(listedCFiles(script), " ");
+    String want = string.join(compiled, " ");
+    if (listed != want) {
+        return Error("bootstrap/build.sh links the wrong runtime:\n  script:   " + listed
+            + "\n  compiler: " + want + "\n\nregenerate with: " + REGENERATE);
+    }
+    forEach(res.cfiles, c) {
+        if (str.hasSuffix(c, ".c") || str.hasSuffix(c, ".m")) {
+            continue;
+        }
+        if (array.indexOf(listedCFiles(script), c) >= 0) {
+            return Error("bootstrap/build.sh hands " + c + " to clang as an operand;"
+                + " a header is included, not compiled\n\nregenerate with: " + REGENERATE);
+        }
+    }
+    if (string.find(script, "bootstrap/nio.ll") < 0) {
+        return Error("bootstrap/build.sh does not compile bootstrap/nio.ll");
+    }
+});
+
+test.start("bootstrap: build.sh names a .exe under a Windows shell", void () -> {
+    // Git Bash and MSYS2 run the script on Windows, where a program runs by
+    // its extension. The script adds .exe only there.
+    String script = repo.readText("bootstrap/build.sh");
+    if (string.find(script, "MINGW*|MSYS*|CYGWIN*)") < 0 || string.find(script, "out=$out.exe") < 0) {
+        return Error("bootstrap/build.sh does not add .exe under a Windows shell\n\nregenerate with: " + REGENERATE);
+    }
+});
+
+test.start("bootstrap: build.sh names the libraries the compiler needs", void () -> {
+    // A module can need link flags in addition to its source. The script must
+    // include them, or stage 0 does not link on the platform that needs them.
+    //
+    // The script is written on one host and runs on others. Thus it names one
+    // set of flags for each host family, as it does for `.exe` and `-Brepro`.
+    // A script with only the flags of its own host would give a Windows
+    // bootstrap without -lws2_32.
+    loader.CompileResult res = emitted();
+    String script = repo.readText("bootstrap/build.sh");
+    String[] selected = array.copy(res.hostLibs.windows);
+    forEach(res.hostLibs.unix, u) {
+        array.push(selected, u);
+    }
+    forEach(selected, l) {
+        if (!string.contains(script, l)) {
+            return Error("bootstrap/build.sh does not name " + l
+                + ", which the compile selected for one of its hosts"
+                + "\n\nregenerate with: " + REGENERATE);
+        }
+    }
+    // The script must also name no flag that the compile did not select. A
+    // stale flag makes the link fail on the hosts where it does not apply.
+    forEach(map.keys(loader.builtinLinkFlags), name) {
+        loader.LinkFlags? flags = loader.builtinLinkFlags[name];
+        if (flags == null) {
+            continue;
+        }
+        String[] all = array.copy(flags.windows);
+        forEach(flags.unix, u) {
+            array.push(all, u);
+        }
+        forEach(all, l) {
+            if (string.contains(script, l) && array.indexOf(selected, l) < 0) {
+                return Error("bootstrap/build.sh names " + l
+                    + ", which the compile did not select\n\nregenerate with: " + REGENERATE);
+            }
+        }
+    }
+});

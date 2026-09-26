@@ -1,0 +1,23 @@
+// The unit suite: it reaches into the compiler's own modules and needs no
+// clang, so it runs in under a second.
+import './lexer_test' as lexer_test;
+import './types_test' as types_test;
+import './ast_test' as ast_test;
+import './parser_test' as parser_test;
+import './checker_test' as checker_test;
+import './checker_errors_test' as checker_errors_test;
+import './ffi_test' as ffi_test;
+import './initorder_test' as initorder_test;
+import './codegen_test' as codegen_test;
+import './repr_test' as repr_test;
+import './debug_test' as debug_test;
+import './nodeid_test' as nodeid_test;
+import './golden_test' as golden_test;
+import './grammar_test' as grammar_test;
+import './format_test' as format_test;
+import './render_test' as render_test;
+import './diag_test' as diag_test;
+import './lsp_test' as lsp_test;
+import './deps_test' as deps_test;
+import './inflate_test' as inflate_test;
+import './version_test' as version_test;

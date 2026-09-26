@@ -1,0 +1,269 @@
+// Regenerates editors/shared/nio.tmLanguage.json from the compiler's own
+// tables, so the highlighted language and the compiled language cannot drift.
+// Run it after any change to a keyword, built-in type, built-in module or
+// reserved name, then run editors/sync.sh.
+//
+//	nio run tools/grammar.nio              rewrite the grammar
+//	nio run tools/grammar.nio --check      fail if the checked-in file is stale
+//
+// The classification of each keyword is editorial and lives in `buckets` below.
+// An unclassified keyword is a hard error naming it.
+//
+// Everything structural stays in the template
+// (editors/shared/nio.tmLanguage.json.in), because it comes from the parser's
+// control flow rather than from a table.
+import 'fs';
+import 'string';
+import 'array';
+import 'map';
+import 'process';
+import '../src/token' as token;
+import '../src/checker' as checker;
+
+String const templatePath = "editors/shared/nio.tmLanguage.json.in";
+String const outPath = "editors/shared/nio.tmLanguage.json";
+String const REGENERATE = "nio run tools/grammar.nio";
+
+// --- classification ------------------------------------------------------
+
+// Every entry of token.keywords lands in one bucket, named for the marker it
+// fills in the template. STRUCTURAL emits nothing: hand-written rules match
+// those keywords, because they need their surroundings.
+String const CONTROL = "control";
+String const CONSTANT = "constant";
+String const MODIFIER = "modifier";
+String const TYPE = "type";
+String const OTHER = "other";
+String const STRUCTURAL = "structural";
+String const DEPRECATED = "deprecated";
+
+Map<String, String> const buckets = {
+    "await": CONTROL, "catch": CONTROL, "return": CONTROL, "if": CONTROL,
+    "else": CONTROL, "switch": CONTROL, "case": CONTROL, "default": CONTROL,
+    "while": CONTROL, "for": CONTROL, "forEach": CONTROL, "break": CONTROL,
+    "continue": CONTROL,
+    "true": CONSTANT, "false": CONSTANT, "null": CONSTANT,
+    "export": MODIFIER, "const": MODIFIER,
+
+    // Spelled with a capital, so they join the capitalized built-in types.
+    "Function": TYPE, "Future": TYPE, "Map": TYPE,
+    // Spelled lower case, so it joins the primitives.
+    "void": TYPE,
+    "as": OTHER,
+    "type": STRUCTURAL, "enum": STRUCTURAL, "import": STRUCTURAL,
+    "function": DEPRECATED,
+};
+
+// The contextual keywords. The lexer emits IDENT for these and src/parser.nio
+// matches the spelling, so there is no table to read them from.
+// tests/grammar_test.nio catches a rename in the parser.
+String[] const contextual = ["async", "override", "sealed", "extends", "noalloc", "extern"];
+
+// --- helpers -------------------------------------------------------------
+
+// Renders names as a regex alternation, sorted so the output is stable. The
+// template wraps every alternation in \b...\b, so order does not affect
+// matching and a shorter name cannot mask a longer one.
+String alternation(String[] names) {
+    String[] sorted = [];
+    forEach(names, n) {
+        array.push(sorted, n);
+    }
+    array.sort(sorted);
+    return string.join(sorted, "|");
+}
+
+bool startsUpper(String s) {
+    if (s == "") {
+        return false;
+    }
+    String head = string.substring(s, 0, 1);
+    return head == string.toUpperCaseAscii(head);
+}
+
+// --- extraction ----------------------------------------------------------
+
+// The language's vocabulary, classified, with no regexes or scope names yet.
+// An emitter for another editor starts here rather than from the tables.
+type Lexicon {
+    String[] control;
+    String[] constants;
+    String[] modifiers;
+    String[] other;
+    String[] deprecated;
+    String[] typesPrimitive;
+    String[] typesCapitalized;
+    String[] functions;
+    String[] modules;
+    String[] problems;
+}
+
+Lexicon extract() {
+    Lexicon lx = {
+        control: [], constants: [], modifiers: [], other: [], deprecated: [],
+        typesPrimitive: [], typesCapitalized: [], functions: [], modules: [],
+        problems: [],
+    };
+
+    forEach(map.keys(token.keywords), kw) {
+        String? b = buckets[kw];
+        if (b == null) {
+            array.push(lx.problems,
+                "src/token.nio's keywords has " + kw
+                + ", which tools/grammar.nio does not classify: add it to `buckets`");
+            continue;
+        }
+        String bucket = b;
+        if (bucket == CONTROL) {
+            array.push(lx.control, kw);
+        } else if (bucket == CONSTANT) {
+            array.push(lx.constants, kw);
+        } else if (bucket == MODIFIER) {
+            array.push(lx.modifiers, kw);
+        } else if (bucket == OTHER) {
+            array.push(lx.other, kw);
+        } else if (bucket == DEPRECATED) {
+            array.push(lx.deprecated, kw);
+        } else if (bucket == TYPE) {
+            if (startsUpper(kw)) {
+                array.push(lx.typesCapitalized, kw);
+            } else {
+                array.push(lx.typesPrimitive, kw);
+            }
+        }
+        // STRUCTURAL emits nothing.
+    }
+
+    // A bucket entry that is no longer a keyword is also a problem.
+    forEach(map.keys(buckets), name) {
+        if (token.keywords[name] == null) {
+            array.push(lx.problems,
+                "tools/grammar.nio classifies " + name
+                + ", which is no longer in src/token.nio's keywords: remove it from `buckets`");
+        }
+    }
+
+    forEach(contextual, kw) {
+        array.push(lx.modifiers, kw);
+    }
+
+    // The capitalized built-in types are the ones whose modules are spelled
+    // lower case, so a type and a library never contend for a name.
+    forEach(map.keys(checker.builtinTypes), name) {
+        if (startsUpper(name)) {
+            array.push(lx.typesCapitalized, name);
+        } else {
+            array.push(lx.typesPrimitive, name);
+        }
+    }
+
+    // The reserved names that are not types are the functions always in scope.
+    forEach(map.keys(checker.reserved), name) {
+        if (checker.builtinTypes[name] == null) {
+            array.push(lx.functions, name);
+        }
+    }
+
+    forEach(map.keys(checker.builtinModules), name) {
+        array.push(lx.modules, name);
+    }
+    forEach(map.keys(checker.builtinNioModules), name) {
+        array.push(lx.modules, name);
+    }
+
+    return lx;
+}
+
+// --- emission ------------------------------------------------------------
+
+// Substitutes one marker, and reports a marker the template does not have. A
+// renamed marker drops a rule's keywords and still leaves valid JSON.
+String fill(String text, String marker, String value, String[] problems) {
+    String tag = "@@" + marker + "@@";
+    if (!string.contains(text, tag)) {
+        array.push(problems, "the template has no " + tag + " to fill");
+        return text;
+    }
+    return string.replaceAll(text, tag, value);
+}
+
+String render(String template, Lexicon lx, String[] problems) {
+    String out = template;
+    out = fill(out, "KEYWORDS_CONTROL", alternation(lx.control), problems);
+    out = fill(out, "KEYWORDS_OTHER", alternation(lx.other), problems);
+    out = fill(out, "CONSTANTS", alternation(lx.constants), problems);
+    out = fill(out, "MODIFIERS", alternation(lx.modifiers), problems);
+    out = fill(out, "REMOVED", alternation(lx.deprecated), problems);
+    out = fill(out, "TYPES_PRIMITIVE", alternation(lx.typesPrimitive), problems);
+    out = fill(out, "TYPES_CAPITALIZED", alternation(lx.typesCapitalized), problems);
+    out = fill(out, "BUILTIN_FUNCTIONS", alternation(lx.functions), problems);
+    out = fill(out, "BUILTIN_MODULES", alternation(lx.modules), problems);
+    return out;
+}
+
+// --- driver --------------------------------------------------------------
+
+// The work is in a function so a failure can `return`: §4.9 requires a catch
+// block to end in one. Answers false when the caller must exit non-zero.
+bool run(bool check) {
+    Lexicon lx = extract();
+
+    String template = string.fromByteArray(fs.readFile(templatePath)) catch e {
+        print("grammar: cannot read " + templatePath + ": " + e.message);
+        return false;
+    };
+
+    String text = render(template, lx, lx.problems);
+
+    if (lx.problems.length > 0) {
+        forEach(lx.problems, p) {
+            print("grammar: " + p);
+        }
+        return false;
+    }
+
+    // A leftover marker means the template grew one this tool does not fill.
+    if (string.contains(text, "@@")) {
+        print("grammar: the template still has an unfilled @@MARKER@@ after rendering;");
+        print("grammar: either fill it in render() or remove it from " + templatePath);
+        return false;
+    }
+
+    if (check) {
+        String have = string.fromByteArray(fs.readFile(outPath)) catch e {
+            print("grammar: cannot read " + outPath + ": " + e.message);
+            print("grammar: run `" + REGENERATE + "`");
+            return false;
+        };
+        if (have != text) {
+            print("grammar: " + outPath + " is stale");
+            print("grammar: run `" + REGENERATE + "`");
+            return false;
+        }
+        print("grammar: " + outPath + " is current");
+        return true;
+    }
+
+    fs.writeFile(outPath, string.toByteArray(text)) catch e {
+        print("grammar: cannot write " + outPath + ": " + e.message);
+        return false;
+    };
+    print("grammar: wrote " + outPath);
+    print("grammar: " + string.from(lx.control.length) + " control, "
+        + string.from(lx.modifiers.length) + " modifier, "
+        + string.from(lx.typesPrimitive.length + lx.typesCapitalized.length) + " type, "
+        + string.from(lx.modules.length) + " module name(s)");
+    print("grammar: run editors/sync.sh to copy it into each editor");
+    return true;
+}
+
+bool checkOnly = false;
+forEach(process.getArgs(), a) {
+    if (a == "--check") {
+        checkOnly = true;
+    }
+}
+
+if (!run(checkOnly)) {
+    process.exit(1);
+}

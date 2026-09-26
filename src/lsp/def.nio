@@ -1,0 +1,412 @@
+// Finds where the name under the caret was declared, often in another file.
+// `world` holds every module the check produced, keyed by file.
+//
+// Nothing resolves by name across a module boundary. A record is found by its
+// types.Record.ID and an enum by its types.Enum.ID, because two modules can
+// each declare a different `Config`. A name is used only inside one module.
+//
+// Hover uses the same answer, so it shows the prose at the place where a jump
+// lands.
+import '../ast' as ast;
+import '../types' as types;
+import '../token' as token;
+import '../checker' as checker;
+import '../loader' as loader;
+import './find' as find;
+import 'array';
+import 'map';
+
+// Target is the place of a declaration: the module and the position in it.
+export type Target {
+    // The file as loader.Checked names it, or "" for the entry module.
+    String file;
+    find.Site site;
+}
+
+Target target(String file, find.Site s) {
+    Target t = { file: file, site: s };
+    return t;
+}
+
+// Where the name at a position was declared. Null when there is nothing to jump
+// to: punctuation, a built-in name, or a name the check never resolved.
+export Target? at(loader.Checked mod, Map<String, loader.Checked> world, int line, int col) {
+    find.Hit? found = find.at(mod.prog, line, col);
+    if (found == null) {
+        return null;
+    }
+    find.Hit hit = found;
+
+    ast.NamedType? named = hit.named;
+    if (named != null) {
+        // `Union.Tag` reads the same as `alias.Type` (§2.11), so try a union
+        // first. The name is an alias when there is no such member.
+        Target? arm = unionTarget(mod, world, named, hit.name);
+        if (arm != null) {
+            return arm;
+        }
+        if (named.module != "") {
+            loader.Checked? other = moduleFor(mod, world, named.module);
+            if (other == null) {
+                return null;
+            }
+            return declIn(other, named.name);
+        }
+        return declIn(mod, named.name);
+    }
+
+    // `Future<T>`, `Map<K, V>` and `Function(...)<R>` have no declaration, so
+    // this returns null. The last case below jumps to the name itself, and
+    // hover would then show the prose above that statement.
+    if (hit.typeKeyword != null) {
+        return null;
+    }
+
+    // The position is on the name of a declaration, where a jump ends. An
+    // import names a file, so the jump goes to that file.
+    ast.Statement? decl = hit.decl;
+    if (decl != null) {
+        if (decl as ast.ImportStatement != null) {
+            return moduleTarget(mod, world, hit.name);
+        }
+        return declared(mod, decl, hit.name);
+    }
+
+    // A parameter or a field, at the place the source writes it.
+    if (hit.declType != null) {
+        return self(mod, hit);
+    }
+
+    ast.Expression? expr = hit.expr;
+    if (expr == null) {
+        // The alias of a qualified type name, such as `geo.Point`, which the
+        // finder records as a bare name.
+        Target? asModule = moduleTarget(mod, world, hit.name);
+        if (asModule != null) {
+            return asModule;
+        }
+        // The union half of `Union.Tag`, recorded as a bare name for the same
+        // reason: the two forms are the same (§2.11).
+        types.Record? u = mod.info.records[hit.name];
+        if (u != null && u.sealed) {
+            Target? decl = declIn(mod, hit.name);
+            if (decl != null) {
+                return decl;
+            }
+        }
+        // A binding that a construct names, such as a forEach element or a
+        // catch error, at the place where it binds.
+        return self(mod, hit);
+    }
+
+    ast.MemberExpression? mem = expr as ast.MemberExpression;
+    if (mem != null) {
+        return member(mod, world, mem, hit);
+    }
+    return plain(mod, world, hit, line, col);
+}
+
+// Where a name that reaches a member of a union was declared (§2.11): the line
+// of the member, or the name of the union when the caret is on that half. Null
+// for a name that reaches no member.
+//
+// A member is declared by its generated extender, whose nameTok the parser set
+// to the tag, so the jump lands on the tag as the source writes it.
+Target? unionTarget(loader.Checked mod, Map<String, loader.Checked> world,
+    ast.NamedType n, String hitName) {
+    if (n.module == "") {
+        return null;
+    }
+    loader.Checked home = mod;
+    String union = n.module;
+    String tag = n.name;
+    if (n.member != "") {
+        // Three segments: the first is an alias, so the union belongs to that
+        // module. A union of this module has two segments.
+        loader.Checked? other = moduleFor(mod, world, n.module);
+        if (other == null) {
+            return null;
+        }
+        home = other;
+        union = n.name;
+        tag = n.member;
+    }
+    String armName = ast.unionArmName(union, tag);
+    if (home.info.records[armName] == null) {
+        return null;
+    }
+    if (hitName == tag) {
+        return declIn(home, armName);
+    }
+    if (hitName == union) {
+        return declIn(home, union);
+    }
+    return null;
+}
+
+// A jump that lands where it started.
+Target self(loader.Checked mod, find.Hit hit) {
+    find.Site s = { tok: hit.tok, startLine: hit.tok.line };
+    return target(mod.file, s);
+}
+
+// Answers for a position on the name of a declaration. A member of an enum is
+// reached through the statement of the enum, so the answer depends on whether
+// the name is that of the enum.
+Target? declared(loader.Checked mod, ast.Statement decl, String name) {
+    ast.EnumDeclStatement? en = decl as ast.EnumDeclStatement;
+    if (en != null && en.name != name) {
+        find.Site? one = find.enumMemberSite(en, name);
+        if (one == null) {
+            return null;
+        }
+        return target(mod.file, one);
+    }
+    find.Site? site = find.siteOf(decl);
+    if (site == null) {
+        return null;
+    }
+    return target(mod.file, site);
+}
+
+// Answers for a bare name. It tries a local, then the top level of this module,
+// and then an import alias. An alias resolves to the file of the module and not
+// to a place in it, because a module is declared nowhere inside itself.
+Target? plain(loader.Checked mod, Map<String, loader.Checked> world, find.Hit hit,
+    int line, int col) {
+    // The innermost scope comes last, so the last match is the binding in
+    // scope.
+    find.Local? binding = null;
+    forEach(find.visible(mod.prog, line, col), l) {
+        if (l.name == hit.name) {
+            binding = l;
+        }
+    }
+    if (binding != null) {
+        find.Site s = { tok: binding.tok, startLine: binding.tok.line };
+        return target(mod.file, s);
+    }
+    Target? own = declIn(mod, hit.name);
+    if (own != null) {
+        return own;
+    }
+    return moduleTarget(mod, world, hit.name);
+}
+
+// moduleTarget returns the start of the file that an import alias names. A
+// module is declared nowhere inside itself, so the start of the file is the
+// answer. It returns null for a built-in module, which has no source to open,
+// and for a name that is not an alias.
+//
+// The token is generated and does not come from the tree, because an empty
+// module has no statement to take one from. An editor wants an empty range at
+// 1:1 in both cases.
+Target? moduleTarget(loader.Checked mod, Map<String, loader.Checked> world, String alias) {
+    loader.Checked? other = moduleFor(mod, world, alias);
+    if (other == null) {
+        return null;
+    }
+    token.Token start = { type: "", literal: "", line: 1, col: 1, note: "", quote: "", endLine: 0, endCol: 0 };
+    find.Site top = { tok: start, startLine: 1 };
+    return target(other.file, top);
+}
+
+// Answers for `object.property`, which is one of four things, and the object
+// decides which.
+Target? member(loader.Checked mod, Map<String, loader.Checked> world,
+    ast.MemberExpression mem, find.Hit hit) {
+    // `alias.name`, where the alias is an import. A built-in module has no
+    // source, so there is no place to jump to.
+    ast.Identifier? obj = mem.object as ast.Identifier;
+    if (obj != null) {
+        checker.ModuleRef? ref = mod.info.moduleAliases[obj.name];
+        if (ref != null) {
+            if (ref.builtin != "") {
+                return null;
+            }
+            loader.Checked? other = moduleFor(mod, world, obj.name);
+            if (other == null) {
+                return null;
+            }
+            return declIn(other, hit.name);
+        }
+    }
+
+    // A member of an enum, whose enum belongs to the module that declared
+    // it.
+    int? constant = mod.info.enumMembers[mem.id];
+    if (constant != null) {
+        types.Type? t = mod.info.types[mem.id];
+        if (t == null) {
+            return null;
+        }
+        types.Enum? en = t as types.Enum;
+        if (en == null) {
+            return null;
+        }
+        return enumMember(mod, world, en, hit.name);
+    }
+
+    // A method, which a record owns. checker.Info.methodCalls records it
+    // against the call and not against the member expression that names it.
+    // The constructor of a union is recorded in the same way (§2.11).
+    ast.CallExpression? call = hit.call;
+    if (call != null) {
+        types.Record? ctor = mod.info.unionCtors[call.id];
+        if (ctor != null) {
+            loader.Checked? owner = ownerOfRecord(mod, world, ctor.id);
+            if (owner != null) {
+                return declIn(owner, ctor.name);
+            }
+        }
+        checker.MethodRef? method = mod.info.methodCalls[call.id];
+        if (method != null) {
+            return recordMember(mod, world, method.owner, hit.name);
+        }
+    }
+
+    // A field, or a method named and not called. The type of the object says
+    // which record holds it.
+    types.Type? ot = mod.info.types[mem.object.id];
+    if (ot == null) {
+        return null;
+    }
+    types.Record? rec = recordOf(ot);
+    if (rec == null) {
+        return null;
+    }
+    return recordMember(mod, world, rec, hit.name);
+}
+
+types.Record? recordOf(types.Type t) {
+    types.Optional? opt = t as types.Optional;
+    if (opt != null) {
+        return recordOf(opt.inner);
+    }
+    return t as types.Record;
+}
+
+Target? recordMember(loader.Checked mod, Map<String, loader.Checked> world,
+    types.Record rec, String name) {
+    loader.Checked? found = ownerOfRecord(mod, world, rec.id);
+    if (found == null) {
+        return null;
+    }
+    loader.Checked owner = found;
+    ast.Statement? decl = find.declOf(owner.prog, rec.name);
+    if (decl == null) {
+        return null;
+    }
+    ast.TypeDeclStatement? td = decl as ast.TypeDeclStatement;
+    if (td == null) {
+        return null;
+    }
+    find.Site? site = find.memberSite(td, name);
+    if (site != null) {
+        return target(owner.file, site);
+    }
+    // The source does not declare it here, so it comes from the type that this
+    // one extends (§2.4). The jump goes to that declaration.
+    types.Record? base = rec.base;
+    if (base != null) {
+        return recordMember(mod, world, base, name);
+    }
+    return null;
+}
+
+Target? enumMember(loader.Checked mod, Map<String, loader.Checked> world,
+    types.Enum en, String name) {
+    loader.Checked? found = ownerOfEnum(mod, world, en.id);
+    if (found == null) {
+        return null;
+    }
+    loader.Checked owner = found;
+    ast.Statement? decl = find.declOf(owner.prog, en.name);
+    if (decl == null) {
+        return null;
+    }
+    ast.EnumDeclStatement? ed = decl as ast.EnumDeclStatement;
+    if (ed == null) {
+        return null;
+    }
+    find.Site? site = find.enumMemberSite(ed, name);
+    if (site == null) {
+        return null;
+    }
+    return target(owner.file, site);
+}
+
+Target? declIn(loader.Checked mod, String name) {
+    ast.Statement? decl = find.declOf(mod.prog, name);
+    if (decl == null) {
+        return null;
+    }
+    find.Site? site = find.siteOf(decl);
+    if (site == null) {
+        return null;
+    }
+    return target(mod.file, site);
+}
+
+export loader.Checked? moduleFor(loader.Checked mod, Map<String, loader.Checked> world,
+    String alias) {
+    checker.ModuleRef? ref = mod.info.moduleAliases[alias];
+    if (ref == null || ref.builtin != "") {
+        return null;
+    }
+    checker.ModuleExports? exports = ref.exports;
+    if (exports == null) {
+        return null;
+    }
+    return world[exports.source];
+}
+
+export loader.Checked? ownerOfRecord(loader.Checked mod, Map<String, loader.Checked> world, int id) {
+    if (declaresRecord(mod, id)) {
+        return mod;
+    }
+    loader.Checked? found = null;
+    forEach(map.keys(world), file) {
+        loader.Checked? m = world[file];
+        if (found == null && m != null && declaresRecord(m, id)) {
+            found = m;
+        }
+    }
+    return found;
+}
+
+bool declaresRecord(loader.Checked mod, int id) {
+    bool has = false;
+    forEach(map.keys(mod.info.records), name) {
+        types.Record? r = mod.info.records[name];
+        if (r != null && r.id == id && find.declOf(mod.prog, name) != null) {
+            has = true;
+        }
+    }
+    return has;
+}
+
+loader.Checked? ownerOfEnum(loader.Checked mod, Map<String, loader.Checked> world, int id) {
+    if (declaresEnum(mod, id)) {
+        return mod;
+    }
+    loader.Checked? found = null;
+    forEach(map.keys(world), file) {
+        loader.Checked? m = world[file];
+        if (found == null && m != null && declaresEnum(m, id)) {
+            found = m;
+        }
+    }
+    return found;
+}
+
+bool declaresEnum(loader.Checked mod, int id) {
+    bool has = false;
+    forEach(map.keys(mod.info.enums), name) {
+        types.Enum? e = mod.info.enums[name];
+        if (e != null && e.id == id && find.declOf(mod.prog, name) != null) {
+            has = true;
+        }
+    }
+    return has;
+}

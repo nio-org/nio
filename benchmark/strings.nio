@@ -1,0 +1,22 @@
+// Builds a 32-character string 100,000 times. Measures string allocation,
+// copying and equality. Each "+" allocates a new string. The only allocation
+// site is in the runtime.
+int n = 100000;
+String target = "abababababababababababababababab";
+int hits = 0;
+int i = 0;
+
+while (i < n) {
+    String s = "";
+    int j = 0;
+    while (j < 16) {
+        s = s + "ab";
+        j = j + 1;
+    }
+    if (s == target) {
+        hits = hits + 1;
+    }
+    i = i + 1;
+}
+
+print(hits);

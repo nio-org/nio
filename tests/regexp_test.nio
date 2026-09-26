@@ -1,0 +1,277 @@
+// The regexp engine, against reference answers frozen into a file.
+//
+// tests/golden/regexp_cases.txt holds 3,707 cases with the offset and verdict
+// a reference engine gave for each. The corpus is frozen and cannot be
+// regenerated. The rejection table below has no oracle: several of its patterns
+// are ones the reference accepts and this module refuses.
+import 'test';
+import 'regexp';
+import 'string';
+import 'array';
+import './repo' as repo;
+import './bytes' as bytes;
+
+// ---- the corpus ----
+
+type Case {
+    String pattern;
+    String flags;
+    String subject;
+    int find;
+    bool match;
+}
+
+Case[] loadCases() {
+    Case[] cases = [];
+    forEach(string.split(repo.readText("tests/golden/regexp_cases.txt"), "\n"), line) {
+        if (string.length(line) == 0 || line[0] == 35) {    // '#'
+            continue;
+        }
+        String[] f = string.split(line, " ");
+        if (f.length != 5) {
+            return Error("malformed golden line: " + line);
+        }
+        // "-" is a call that passed no flags, which §6.14 makes the same as "".
+        String flags = "";
+        if (f[1] != "-") {
+            flags = bytes.unhex(f[1]);
+        }
+        Case c = {
+            pattern: bytes.unhex(f[0]),
+            flags: flags,
+            subject: bytes.unhex(f[2]),
+            find: string.toInt(f[3]),
+            match: f[4] == "1",
+        };
+        array.push(cases, c);
+    }
+    return cases;
+}
+
+// Makes control bytes visible in a failure message: a pattern or subject in
+// this corpus routinely holds a newline.
+String show(String s) {
+    String r = string.replaceAll(s, "\\", "\\\\");
+    return string.replaceAll(r, "\n", "\\n");
+}
+
+test.start("regexp engine agrees with the golden corpus", void () -> {
+    Case[] cases = loadCases();
+    test.assert(cases.length > 3000,
+        "the corpus has shrunk to " + string.from(cases.length) + " cases");
+    forEach(cases, c) {
+        // The corpus holds only syntax both engines share, so a pattern this
+        // one refuses is a real disagreement.
+        RegExp re = regexp.create(c.pattern, c.flags) catch e {
+            return Error("regexp.create(\"" + show(c.pattern) + "\", \"" + c.flags
+                + "\") failed but the reference compiled it: " + e.message);
+        };
+        int find = regexp.find(c.subject, re);
+        bool match = regexp.match(c.subject, re);
+        if (find != c.find || match != c.match) {
+            return Error("pattern \"" + show(c.pattern) + "\" flags \"" + c.flags
+                + "\" subject \"" + show(c.subject) + "\": find=" + string.from(find)
+                + " match=" + string.from(match) + ", the reference says find=" + string.from(c.find)
+                + " match=" + string.from(c.match));
+        }
+    }
+});
+
+// ---- long subjects ----
+//
+// The golden corpus uses subjects under eight bytes, which have nowhere to skip
+// to. The start-byte filter and the literal prefix behind it (rx_first_bytes in
+// lib/regexp.c) run only on a long subject. A filter that skips one position
+// too many gives a wrong answer that no short case detects.
+//
+// Each case below places one needle at a computed offset in filler that shares
+// no byte with the start of any pattern, since the start is what the filter
+// reads.
+
+// 200 lines of "field_<k> = value_<k>", holding none of c, z, q, t, h, s, n or
+// o: the bytes the needles below begin with.
+String filler() {
+    String[] lines = [];
+    for (int k = 0; k < 200; k++) {
+        array.push(lines, "field_" + string.from(k) + " = value_" + string.from(k));
+    }
+    return string.join(lines, "\n") + "\n";
+}
+
+type Search {
+    String pattern;
+    String flags;
+    String subject;
+    int find;
+}
+
+test.start("regexp finds the leftmost match in a long subject", void () -> {
+    String pad = filler();
+    int n = string.length(pad);
+    String needle = "counter = 0042 the cat sat\n";
+    String mid = pad + needle + pad;
+    String tail = pad + needle;
+    String head = needle + pad;
+    String twice = pad + needle + pad + needle;
+    // A 'c' at the end with nothing behind it: the prefix cannot fit, which is
+    // its own exit from the scan.
+    String cut = pad + "counter";
+
+    // An expected offset is written as string.find, the other search in the
+    // library (lib/string.c), rather than as a number worked out here.
+    Search[] cases = [
+        // A first byte the filler does not hold: one scan reaches the needle.
+        { pattern: "counter = [0-9]{4}", flags: "", subject: mid, find: n },
+        { pattern: "counter = [0-9]{4}", flags: "", subject: tail, find: n },
+        { pattern: "counter = [0-9]{4}", flags: "", subject: head, find: 0 },
+        { pattern: "counter = [0-9]{4}", flags: "", subject: twice, find: n },
+        { pattern: "counter = [0-9]{4}", flags: "", subject: cut, find: -1 },
+        { pattern: "counter = [0-9]{4}", flags: "", subject: pad, find: -1 },
+        { pattern: "counter = [0-9]{4}", flags: "", subject: "", find: -1 },
+        // A first byte on every line of the filler, so the prefix behind it
+        // does the rejecting.
+        {
+            pattern: "field_137 = value_137", flags: "", subject: mid,
+            find: string.find(mid, "field_137 = value_137"),
+        },
+        { pattern: "field_137 = wrong", flags: "", subject: mid, find: -1 },
+        // A prefix past the bytes the engine keeps (RX_MAX_PREFIX). The rest is
+        // left to the simulation.
+        {
+            pattern: "field_137 = value_137\nfield_138", flags: "", subject: mid,
+            find: string.find(mid, "field_137 = value_137\nfield_138"),
+        },
+        // Assertions consume nothing, so the literal behind one is still the
+        // text a match begins with.
+        { pattern: "\\bcat\\b", flags: "", subject: mid, find: string.find(mid, "cat") },
+        { pattern: "\\bcounter\\b", flags: "", subject: mid, find: n },
+        { pattern: "\\Bounter", flags: "", subject: mid, find: n + 1 },
+        { pattern: "\\bounter", flags: "", subject: mid, find: -1 },
+        { pattern: "cat\\b", flags: "", subject: mid, find: string.find(mid, "cat") },
+        // An anchor holds at every line under `m` and only at the start without
+        // it, which is a search that scans everything and answers nothing.
+        { pattern: "^counter", flags: "m", subject: mid, find: n },
+        { pattern: "^counter", flags: "", subject: mid, find: -1 },
+        { pattern: "^counter", flags: "", subject: head, find: 0 },
+        { pattern: "sat$", flags: "m", subject: tail, find: string.find(tail, "sat") },
+        { pattern: "sat$", flags: "", subject: mid, find: -1 },
+        // Alternation: several first bytes rather than one.
+        { pattern: "counter|marker|holder", flags: "", subject: mid, find: n },
+        {
+            pattern: "the (cat|dog)", flags: "", subject: mid,
+            find: string.find(mid, "the cat"),
+        },
+        { pattern: "zebra|quagga", flags: "", subject: mid, find: -1 },
+        // A class first, which is as many first bytes as it holds.
+        { pattern: "[0-9]{4} the", flags: "", subject: mid, find: string.find(mid, "0042") },
+        {
+            pattern: "[ct]a[nt] sat", flags: "", subject: mid,
+            find: string.find(mid, "cat sat"),
+        },
+        // Case folding turns each letter into a class, so a case-insensitive
+        // pattern has no literal prefix.
+        { pattern: "COUNTER = [0-9]{4}", flags: "i", subject: mid, find: n },
+        { pattern: "[C-T]OUNTER", flags: "i", subject: mid, find: n },
+        // `.` admits nearly every byte, so nothing here may be skipped.
+        { pattern: ".*zebra", flags: "", subject: mid, find: -1 },
+        { pattern: "the .*cat", flags: "", subject: mid, find: string.find(mid, "the cat") },
+        // A pattern that can match nothing matches at 0, so no position may be
+        // passed over.
+        { pattern: "x*", flags: "", subject: mid, find: 0 },
+        { pattern: "", flags: "", subject: mid, find: 0 },
+        { pattern: "\\b", flags: "", subject: mid, find: 0 },
+        { pattern: "(a?)*b", flags: "", subject: pad, find: -1 },
+        // A pattern no byte can begin, which is a search with nothing to try.
+        { pattern: "[^\\x00-\\xff]x", flags: "", subject: mid, find: -1 },
+    ];
+
+    forEach(cases, c) {
+        RegExp re = regexp.create(c.pattern, c.flags);
+        int find = regexp.find(c.subject, re);
+        bool match = regexp.match(c.subject, re);
+        if (find != c.find) {
+            return Error("pattern \"" + show(c.pattern) + "\" flags \"" + c.flags
+                + "\" over " + string.from(string.length(c.subject)) + " bytes: find="
+                + string.from(find) + ", want " + string.from(c.find));
+        }
+        if (match != (c.find >= 0)) {
+            return Error("pattern \"" + show(c.pattern) + "\": match="
+                + string.from(match) + " but find=" + string.from(find));
+        }
+    }
+});
+
+// ---- the patterns create must refuse ----
+
+// A pattern that must not compile. `reason` must appear in the message.
+type Reject {
+    String pattern;
+    String flags;
+    String reason;
+}
+
+Reject[] rejects = [
+    { pattern: "(ab", flags: "", reason: "unmatched (" },
+    { pattern: "ab)", flags: "", reason: "unmatched )" },
+    { pattern: "a(b(c)", flags: "", reason: "unmatched (" },
+    { pattern: "[abc", flags: "", reason: "unterminated [" },
+    { pattern: "[]", flags: "", reason: "unterminated [" },
+    { pattern: "[z-a]", flags: "", reason: "invalid character range" },
+    { pattern: "[a-\\d]", flags: "", reason: "invalid character range" },
+    { pattern: "*a", flags: "", reason: "nothing to repeat" },
+    { pattern: "+", flags: "", reason: "nothing to repeat" },
+    { pattern: "?x", flags: "", reason: "nothing to repeat" },
+    { pattern: "a**", flags: "", reason: "nothing to repeat" },
+    { pattern: "a*+", flags: "", reason: "nothing to repeat" },
+    { pattern: "a{2}{3}", flags: "", reason: "nothing to repeat" },
+    { pattern: "a{4,2}", flags: "", reason: "invalid repeat count" },
+    { pattern: "a{5000}", flags: "", reason: "repeat count too large" },
+    { pattern: "a{1,5000}", flags: "", reason: "repeat count too large" },
+    { pattern: "a\\", flags: "", reason: "trailing backslash" },
+    { pattern: "[a\\", flags: "", reason: "trailing backslash" },
+    { pattern: "\\q", flags: "", reason: "invalid escape \\q" },
+    { pattern: "\\y", flags: "", reason: "invalid escape \\y" },
+    { pattern: "[\\q]", flags: "", reason: "invalid escape \\q" },
+    { pattern: "\\x2", flags: "", reason: "invalid escape \\x" },
+    { pattern: "\\xzz", flags: "", reason: "invalid escape \\x" },
+    { pattern: "(?=a)", flags: "", reason: "unsupported group" },
+    { pattern: "(?P<n>a)", flags: "", reason: "unsupported group" },
+    { pattern: "a{20}{20}x", flags: "", reason: "nothing to repeat" },
+    { pattern: "((((a{100}){100}){100}){100})", flags: "", reason: "pattern too large" },
+    { pattern: "a", flags: "x", reason: "unknown flag 'x'" },
+    { pattern: "a", flags: "ig", reason: "unknown flag 'g'" },
+];
+
+test.start("regexp.create refuses what it must", void () -> {
+    forEach(rejects, c) {
+        bool refused = false;
+        String message = "";
+        regexp.create(c.pattern, c.flags) catch e {
+            refused = true;
+            message = e.message;
+            // Every failure carries the code that all raising modules share.
+            if (e.code != regexp.ErrorCode.INVALID) {
+                return Error("regexp.create(\"" + c.pattern + "\") reported code "
+                    + string.from(e.code) + ", want INVALID");
+            }
+        };
+        if (!refused) {
+            return Error("regexp.create(\"" + c.pattern + "\", \"" + c.flags
+                + "\") was accepted; it must fail with \"" + c.reason + "\"");
+        }
+        if (!string.contains(message, c.reason)) {
+            return Error("regexp.create(\"" + c.pattern + "\", \"" + c.flags + "\"): "
+                + message + "\nwant a message containing \"" + c.reason + "\"");
+        }
+    }
+});
+
+// The message names the function and quotes the pattern, as every raising
+// module's does (§2.9).
+test.start("a refused pattern is quoted in its message", void () -> {
+    regexp.create("a(b") catch e {
+        test.expectString(e.message, "regexp.create \"a(b\": unmatched (");
+        return;
+    };
+    return Error("a(b compiled");
+});

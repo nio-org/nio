@@ -1,0 +1,67 @@
+// A function written in declaration form, `int add(int a, int b)`, for a hover
+// and for a completion detail. types.typeString writes the value-type form
+// instead. A types.FuncType carries no parameter names, so they come from the
+// declaration or from builtins.paramNames.
+import '../ast' as ast;
+import '../types' as types;
+import 'string';
+import 'array';
+
+// Writes a signature from a checked type. A `names` shorter than the parameter
+// list leaves the other parameters as types alone. `optionalTail` marks the last
+// parameter as one a call can omit, with a `?` after the name, as in `int code?`.
+// A `?` on the type is the other claim, that the argument can be null.
+export String fromType(types.FuncType f, String name, String[] names, bool optionalTail) {
+    String[] parts = [];
+    forEach(f.params, p, i) {
+        String written = types.typeString(p);
+        bool last = i == f.params.length - 1;
+        if (f.variadic && last) {
+            // §2.3 writes the last parameter as `...String more`. It shows
+            // the element type. The body sees an array.
+            types.Array? arr = p as types.Array;
+            if (arr != null) {
+                written = "..." + types.typeString(arr.elem);
+            }
+        }
+        if (i < names.length && names[i] != "") {
+            written = written + " " + names[i];
+        }
+        if (optionalTail && last) {
+            written = written + "?";
+        }
+        array.push(parts, written);
+    }
+    String ret = types.typeString(f.return);
+    if (f.fallible) {
+        // §2.9: the caller must handle the failure, so `!` is part of the
+        // signature.
+        ret = ret + "!";
+    }
+    return ret + " " + name + "(" + string.join(parts, ", ") + ")";
+}
+
+// Writes the same signature from the declaration, which holds the parameter
+// names. The caller passes `name`, because a method reads as `Car.faster` and
+// the node holds only `faster`. The caller also passes `fallible`, because §2.9
+// infers it from the body. The source has no `!`, but a caller must handle the
+// failure.
+export String fromDecl(ast.FunctionDeclStatement fn, String name, bool fallible) {
+    String[] parts = [];
+    forEach(fn.params, p) {
+        array.push(parts, ast.paramString(p));
+    }
+    String ret = "void";
+    ast.TypeNode? rt = fn.returnType;
+    if (rt != null) {
+        ret = ast.typeNodeString(rt);
+    }
+    if (fallible) {
+        ret = ret + "!";
+    }
+    String head = ret;
+    if (fn.async) {
+        head = head + " async";
+    }
+    return head + " " + name + "(" + string.join(parts, ", ") + ")";
+}

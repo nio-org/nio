@@ -1,0 +1,347 @@
+// The driver turns generated IR into a native binary. It gives clang the IR
+// and the runtime C files the program needs.
+// All functions here are async, because process.child.run (§6.12) is the only
+// way to start clang.
+// The runtime C sources come from src/embed/runtime.nio, which tools/bake.nio
+// writes.
+import './loader' as loader;
+import './codegen' as codegen;
+import './cache' as cache;
+import './render' as render;
+import 'embed/runtime' as rtsrc;
+import 'fs';
+import 'string';
+import 'lib/str' as str;
+import 'array';
+import 'path';
+import 'process';
+
+// ---- asking clang about the host ----
+
+// Reads the "target-cpu" and "target-features" attributes from clang's IR.
+// It reads only these two, because the other attributes would change how
+// generated code is built.
+String[] findAttrs(String ir) {
+    String[] out = [];
+    String[] keys = ["\"target-cpu\"=", "\"target-features\"="];
+    forEach(keys, key) {
+        int i = string.find(ir, key);
+        if (i < 0) {
+            continue;
+        }
+        String rest = string.substring(ir, i + string.length(key), string.length(ir));
+        if (string.length(rest) == 0 || string.substring(rest, 0, 1) != "\"") {
+            continue;
+        }
+        int end = string.find(string.substring(rest, 1, string.length(rest)), "\"");
+        if (end < 0) {
+            continue;
+        }
+        array.push(out, key + string.substring(rest, 0, end + 2));
+    }
+    return out;
+}
+
+// Reads the clang version from the !llvm.ident metadata that clang writes into
+// each module. The probe below already runs, so this costs nothing. The object
+// cache key includes the version, so a toolchain upgrade does not reuse old
+// objects.
+String findIdent(String ir) {
+    int i = string.find(ir, "!llvm.ident");
+    if (i < 0) {
+        return "";
+    }
+    String rest = string.substring(ir, i, string.length(ir));
+    int open = string.find(rest, "!{!\"");
+    if (open < 0) {
+        return "";
+    }
+    String from = string.substring(rest, open + 4, string.length(rest));
+    int end = string.find(from, "\"");
+    if (end < 0) {
+        return "";
+    }
+    return string.substring(from, 0, end);
+}
+
+// What one probe of clang answers about this host.
+type Host {
+    String attrs;
+    String ident;
+}
+
+// Cached, because the test suite compiles hundreds of programs. It is an
+// optional, because a failed probe gives two empty strings and must not run
+// again.
+Host? hostCache = null;
+
+// Asks clang to compile an empty function and reads two values from the IR:
+// the "target-cpu"/"target-features" attributes it puts on a C function on
+// this host, and the clang version.
+//
+// Codegen copies the attributes onto each function it generates, and they
+// must match. LLVM's inliner refuses a callee whose target features are not a
+// subset of the caller's. A mismatch stops all runtime helpers from being
+// inlined, with no error. An empty answer gives IR with no attribute group,
+// which still compiles, so `nio emit` works without clang.
+Host async hostInfo() {
+    Host? cached = hostCache;
+    if (cached != null) {
+        return cached;
+    }
+    process.ChildRunResult? r = await process.child.run("clang",
+        ["-O2", "-S", "-emit-llvm", "-x", "c", "-", "-o", "-"],
+        { stdin: string.toByteArray("void probe(void) {}\n") }) catch null;
+    Host answer = { attrs: "", ident: "" };
+    if (r != null && r.code == 0) {
+        String ir = string.fromByteArray(r.stdout);
+        answer = { attrs: string.join(findAttrs(ir), " "), ident: findIdent(ir) };
+    }
+    hostCache = answer;
+    return answer;
+}
+
+String async hostTargetAttrs() {
+    Host h = await hostInfo();
+    return h.attrs;
+}
+
+// ---- linking ----
+
+// Set when a link failed with -flto and then succeeded without it. This shows
+// that the linker cannot read bitcode. Later links do not try -flto.
+bool ltoUnsupported = false;
+
+// Runs clang, with -flto when a release build asks for it. Returns null on
+// success and the reason on failure. -flto lets clang inline the runtime into
+// generated code. This is up to 3.5x faster on array-heavy loops, but takes
+// most of the build time. It is the difference between the two modes (§1.2).
+// A linker that cannot read bitcode fails, and a retry without the flag
+// detects this. If clang cannot start, the future raises (§6.12), which means
+// the toolchain is missing.
+String? async link(String[] args, bool lto) {
+    bool tryLTO = lto && !ltoUnsupported;
+    if (tryLTO) {
+        String[] lto = ["-flto"];
+        forEach(args, a) {
+            array.push(lto, a);
+        }
+        process.ChildRunResult? first = await process.child.run("clang", lto) catch null;
+        if (first != null && first.code == 0) {
+            return null;
+        }
+    }
+    process.ChildRunResult r = await process.child.run("clang", args) catch e {
+        return "clang not found in PATH (install the Xcode command line tools or LLVM): "
+            + e.message;
+    };
+    if (r.code != 0) {
+        // Both calls failed, so -flto was not the cause. Report the plain
+        // call's diagnostics, which clang writes to stderr.
+        return "clang failed: exit status " + string.from(r.code) + "\n"
+            + string.fromByteArray(r.stdout) + string.fromByteArray(r.stderr);
+    }
+    if (tryLTO) {
+        ltoUnsupported = true;
+    }
+    return null;
+}
+
+// ---- compiling ----
+
+// Windows runs a program by its extension, so a binary there ends in .exe.
+// On Windows, adds the suffix when the name does not have it. On other hosts,
+// returns the name unchanged.
+export String exeName(String p) {
+    if (loader.hostOS() != "windows" || str.hasSuffix(p, ".exe")) {
+        return p;
+    }
+    return p + ".exe";
+}
+
+// Returns the text a failed compile prints: each diagnostic with the source it
+// names. The structured diagnostics are the primary form. The strings are the
+// positional form, for a caller with no source to show. This function uses
+// the strings when there are no structured diagnostics.
+export String compileErrors(String p, String src, loader.CompileResult res) {
+    if (res.diags.length == 0) {
+        return p + ":\n  " + string.join(res.errs, "\n  ");
+    }
+    render.Sources s = render.sources(p, src);
+    return render.all(s, res.diags);
+}
+
+// Turns the entry source into LLVM IR. Imports resolve against the entry file's
+// directory. The caller passes the text. This function reads no file.
+export loader.CompileResult async compile(String src, String p, codegen.Options opts) {
+    // Make a copy, so the caller's record does not change. This function adds
+    // the host attributes.
+    codegen.Options full = {
+        coverage: opts.coverage,
+        debug: opts.debug,
+        release: opts.release,
+        targetAttrs: await hostTargetAttrs(),
+    };
+    return loader.compileEntry(src, loader.dirOf(p), p, full);
+}
+
+// Compiles the entry source to a native executable at outPath. Returns null on
+// success and the reason on failure.
+export String? async buildFile(String src, String srcPath, String outPath, codegen.Options opts) {
+    loader.CompileResult res = await compile(src, srcPath, opts);
+    if (res.errs.length > 0) {
+        return compileErrors(srcPath, src, res);
+    }
+    String dir = fs.createTempDir("nio-") catch e {
+        return e.message;
+    };
+    String? failure = await linkInto(dir, res, exeName(outPath), opts);
+    // Remove the directory in both cases. Ignore a failed delete.
+    fs.delete(dir, { recursive: true }) catch e { };
+    return failure;
+}
+
+// Writes the IR and the runtime sources into dir and links them. It is
+// separate from buildFile, so only one place removes the directory.
+String? async linkInto(String dir, loader.CompileResult res, String outPath, codegen.Options opts) {
+    String llPath = path.join(dir, "program.ll");
+    fs.writeFile(llPath, string.toByteArray(res.ir)) catch e {
+        return e.message;
+    };
+    // A build without --release uses -O0. For this compiler, that takes 4
+    // seconds, against 34 seconds at -O2 with LTO.
+    String level = "-O0";
+    if (opts.release) {
+        level = "-O2";
+    }
+    String[] args = [level, "-o", outPath, llPath];
+    if (loader.hostOS() == "windows") {
+        // The Windows linker writes the time into the executable header, so
+        // two links of one program give different files. Brepro writes a hash
+        // of the content there instead, so the compiler builds itself to the
+        // same bytes. The option starts with a dash, which the linker also
+        // accepts. The shell that runs the bootstrap script reads a leading
+        // slash as a path.
+        array.push(args, "-Wl,-Brepro");
+    }
+    if (opts.debug) {
+        // clang keeps the debug information in the IR. On macOS, the debug
+        // information goes in a bundle beside the binary, and clang writes it
+        // before it removes its temporary objects.
+        array.push(args, "-g");
+    }
+    // The runtime is cached objects when there is a cache. Otherwise, the
+    // sources are written beside the IR. A release build always writes the
+    // sources, because -flto must see the C (see cache.nio). The include
+    // directory is different in the two cases. The program's native sources
+    // compile against the directory that holds runtime.h.
+    String includeDir = dir;
+    cache.Runtime? cached = null;
+    if (!opts.release) {
+        Host host = await hostInfo();
+        cached = await cache.runtime(res.cfiles, level, opts.debug, host.ident);
+    }
+    cache.Runtime? hit = cached;
+    if (hit != null) {
+        includeDir = hit.dir;
+        forEach(hit.objs, o) {
+            array.push(args, o);
+        }
+    } else {
+        String[] names = ["runtime.h"];
+        forEach(res.cfiles, c) {
+            array.push(names, c);
+        }
+        forEach(names, name) {
+            String? text = rtsrc.file(name);
+            if (text == null) {
+                return "missing embedded runtime file " + name;
+            }
+            String p = path.join(dir, path.localize(name));
+            // The bake tree has two levels, so lib/ is the only directory that
+            // can be missing. createDir (§6.11) makes one level.
+            String parent = loader.dirOf(p);
+            if (!fs.exists(parent)) {
+                fs.createDir(parent) catch e {
+                    return e.message;
+                };
+            }
+            fs.writeFile(p, string.toByteArray(text)) catch e {
+                return e.message;
+            };
+            if (str.hasSuffix(name, ".c")) {
+                array.push(args, p);
+            }
+        }
+    }
+    // -I lets the lib/ files and the program's native code find "runtime.h".
+    // It is at the root of the build directory when the sources are written
+    // there. Otherwise it is at the root of the cache entry.
+    array.push(args, "-I");
+    array.push(args, includeDir);
+    // The program's native sources (§5.8). Each is written under the qual of
+    // the module that ships it, so two packages can both ship a `util.c`. The
+    // sources of one module are in one directory, so one can `#include`
+    // another by name. The `-I` above finds `runtime.h`. The entry module's
+    // qual is empty, so its sources go beside the IR. A .h file is written but
+    // not compiled.
+    forEach(res.natives, n) {
+        byte[] nativeText = fs.readFile(n.path) catch e {
+            return "cannot read native source " + n.path + ": " + e.message;
+        };
+        String nd = path.join(dir, n.qual);
+        if (!fs.exists(nd)) {
+            fs.createDir(nd) catch e {
+                return e.message;
+            };
+        }
+        String np = path.join(nd, loader.baseOf(n.path));
+        fs.writeFile(np, nativeText) catch e {
+            return e.message;
+        };
+        if (str.hasSuffix(np, ".c") || str.hasSuffix(np, ".m")) {
+            array.push(args, np);
+        }
+    }
+    // Libraries come after the sources. A left-to-right linker ignores a
+    // library named before the object that needs it.
+    forEach(res.libs, l) {
+        array.push(args, l);
+    }
+    return await link(args, opts.release);
+}
+
+// ---- running ----
+
+// code is the exit status. err is set only when the program did not run.
+export type RunResult {
+    int code;
+    String? err;
+}
+
+// Builds the entry source into a temporary binary and runs it with args as its
+// command line. The child inherits the standard streams, so its output appears
+// while it runs. A coverage report goes into this process's directory.
+export RunResult async runFile(String src, String srcPath, String[] args, codegen.Options opts) {
+    String dir = fs.createTempDir("nio-run-") catch e {
+        RunResult bad = { code: 1, err: e.message };
+        return bad;
+    };
+    RunResult out = await runIn(exeName(path.join(dir, "program")), src, srcPath, args, opts);
+    fs.delete(dir, { recursive: true }) catch e { };
+    return out;
+}
+
+RunResult async runIn(String bin, String src, String srcPath, String[] args, codegen.Options opts) {
+    String? failure = await buildFile(src, srcPath, bin, opts);
+    if (failure != null) {
+        RunResult bad = { code: 1, err: failure };
+        return bad;
+    }
+    process.ChildRunResult r = await process.child.run(bin, args, { inherit: true }) catch e {
+        RunResult bad = { code: 1, err: e.message };
+        return bad;
+    };
+    RunResult ok = { code: r.code, err: null };
+    return ok;
+}

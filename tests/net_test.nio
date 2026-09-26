@@ -1,0 +1,644 @@
+// The `net` module (§6.15), end to end.
+//
+// Every test binds port 0 and asks the operating system which port it got
+// (net.address), so the suite needs no network, collides with nothing on the
+// machine, and two copies of it can run side by side.
+import 'test';
+import 'string';
+import './harness' as h;
+import '../src/loader' as loader;
+
+// ---- streams ----
+
+test.start("net: tcp round trip", void () -> {
+    h.expectOutput(`
+import 'net';
+import 'async';
+import 'string';
+
+void async serve(Listener l) {
+    Socket c = await net.accept(l) catch e { print("accept: " + e.message); return; };
+    byte[] req = await net.read(c, 1024) catch e { print("read: " + e.message); return; };
+    await net.write(c, string.toByteArray("re: " + string.fromByteArray(req))) catch e {
+        print("write: " + e.message);
+        return;
+    };
+    net.close(c);
+}
+
+void async main() {
+    Listener l = net.tcp.listen("127.0.0.1:0") catch e { print("listen: " + e.message); return; };
+    String addr = net.address(l) catch e { print("address: " + e.message); return; };
+    Future<void> server = serve(l);
+    Socket s = await net.tcp.connect(addr, { timeout: 5000 }) catch e {
+        print("connect: " + e.message);
+        return;
+    };
+    await net.write(s, string.toByteArray("hello")) catch e { print(e.message); return; };
+    byte[] reply = await net.read(s, 1024, { timeout: 5000 }) catch e {
+        print(e.message);
+        return;
+    };
+    print(string.fromByteArray(reply));
+    // The peer of a connected socket is the listener's address.
+    print((net.peer(s) catch "?") == addr);
+    net.close(s);
+    await server;
+    net.close(l);
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["re: hello", "true", "done"]);
+});
+
+test.start("net: a read of a closed connection ends the stream", void () -> {
+    // The end of a stream is an empty byte[]. It is not an error.
+    // process.stdin.read does the same.
+    h.expectOutput(`
+import 'net';
+import 'async';
+import 'string';
+
+void async main() {
+    Listener l = net.tcp.listen("127.0.0.1:0") catch e { return; };
+    String addr = net.address(l) catch e { return; };
+    Future<Socket!> acc = net.accept(l);
+    Socket c = await net.tcp.connect(addr) catch e { print(e.message); return; };
+    Socket srv = await acc catch e { print(e.message); return; };
+    net.close(c);
+    byte[] b = await net.read(srv, 64, { timeout: 5000 }) catch e {
+        print("read: " + e.message);
+        return;
+    };
+    print(b.length);
+    net.close(srv);
+    net.close(l);
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["0", "done"]);
+});
+
+test.start("net: a write larger than one buffer arrives whole", void () -> {
+    // 400 KB is past any socket buffer, so this drives the partial-write path.
+    h.expectOutput(`
+import 'net';
+import 'async';
+import 'string';
+import 'array';
+
+void async drain(Socket s, int want) {
+    int got = 0;
+    while (got < want) {
+        byte[] b = await net.read(s, 65536, { timeout: 10000 }) catch e {
+            print("read: " + e.message);
+            return;
+        };
+        if (b.length == 0) {
+            break;
+        }
+        got = got + b.length;
+    }
+    print(got);
+}
+
+void async main() {
+    Listener l = net.tcp.listen("127.0.0.1:0") catch e { return; };
+    String addr = net.address(l) catch e { return; };
+    Future<Socket!> acc = net.accept(l);
+    Socket c = await net.tcp.connect(addr) catch e { print(e.message); return; };
+    Socket srv = await acc catch e { print(e.message); return; };
+
+    byte[] payload = [];
+    for (int i = 0; i < 400000; i = i + 1) {
+        array.push(payload, 65);
+    }
+    Future<void> reader = drain(srv, payload.length);
+    await net.write(c, payload, { timeout: 10000 }) catch e { print("write: " + e.message); };
+    net.close(c);
+    await reader;
+    net.close(srv);
+    net.close(l);
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["400000", "done"]);
+});
+
+test.start("net: readExactly assembles a staggered answer", void () -> {
+    // The writer sleeps between pieces, so the bytes arrive apart and the read
+    // parks and resumes in place (lib/net.c's try_read_exact).
+    h.expectOutput(`
+import 'net';
+import 'async';
+import 'string';
+import 'time';
+
+void async feed(Socket c) {
+    await net.write(c, string.toByteArray("north")) catch e { return; };
+    await time.sleep(25);
+    await net.write(c, string.toByteArray(" and ")) catch e { return; };
+    await time.sleep(25);
+    await net.write(c, string.toByteArray("south")) catch e { return; };
+}
+
+void async main() {
+    Listener l = net.tcp.listen("127.0.0.1:0") catch e { return; };
+    String addr = net.address(l) catch e { return; };
+    Future<Socket!> acc = net.accept(l);
+    Socket c = await net.tcp.connect(addr) catch e { print(e.message); return; };
+    Socket srv = await acc catch e { print(e.message); return; };
+
+    Future<void> writer = feed(c);
+    byte[] all = await net.readExactly(srv, 15, { timeout: 5000 }) catch e {
+        print("readExactly: " + e.message);
+        return;
+    };
+    print(string.fromByteArray(all));
+    await writer;
+    net.close(c);
+    net.close(srv);
+    net.close(l);
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["north and south", "done"]);
+});
+
+test.start("net: readExactly fails when the stream ends first", void () -> {
+    // A peer that closes early raises END_OF_FILE. readExactly never hands out
+    // a short answer.
+    h.expectOutput(`
+import 'net';
+import 'async';
+import 'string';
+
+void async main() {
+    Listener l = net.tcp.listen("127.0.0.1:0") catch e { return; };
+    String addr = net.address(l) catch e { return; };
+    Future<Socket!> acc = net.accept(l);
+    Socket c = await net.tcp.connect(addr) catch e { print(e.message); return; };
+    Socket srv = await acc catch e { print(e.message); return; };
+
+    await net.write(c, string.toByteArray("shy")) catch e { return; };
+    net.close(c);
+    byte[] all = await net.readExactly(srv, 10, { timeout: 5000 }) catch e {
+        print(e.code == net.ErrorCode.END_OF_FILE);
+        net.close(srv);
+        net.close(l);
+        return;
+    };
+    print("got " + string.from(all.length));
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["true", "done"]);
+});
+
+test.start("net: readExactly spans socket buffers", void () -> {
+    // 400 KB is past any socket buffer, so the read parks and resumes several
+    // times into the same block.
+    h.expectOutput(`
+import 'net';
+import 'async';
+import 'string';
+import 'array';
+
+void async main() {
+    Listener l = net.tcp.listen("127.0.0.1:0") catch e { return; };
+    String addr = net.address(l) catch e { return; };
+    Future<Socket!> acc = net.accept(l);
+    Socket c = await net.tcp.connect(addr) catch e { print(e.message); return; };
+    Socket srv = await acc catch e { print(e.message); return; };
+
+    byte[] payload = [];
+    for (int i = 0; i < 400000; i = i + 1) {
+        array.push(payload, ((i * 7) % 200 + 32) as byte);
+    }
+    Future<byte[]!> whole = net.readExactly(srv, payload.length, { timeout: 10000 });
+    await net.write(c, payload, { timeout: 10000 }) catch e { print("write: " + e.message); };
+    byte[] all = await whole catch e { print("readExactly: " + e.message); return; };
+    bool same = all.length == payload.length;
+    if (same) {
+        forEach(all, b, i) {
+            if (b != payload[i]) { same = false; }
+        }
+    }
+    print(same);
+    net.close(c);
+    net.close(srv);
+    net.close(l);
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["true", "done"]);
+});
+
+// ---- datagrams ----
+
+test.start("net: udp carries a message and says where it came from", void () -> {
+    h.expectOutput(`
+import 'net';
+import 'async';
+import 'string';
+
+void async main() {
+    Socket a = net.udp.bind("127.0.0.1:0") catch e { print(e.message); return; };
+    Socket b = net.udp.bind("127.0.0.1:0") catch e { print(e.message); return; };
+    String aAddr = net.address(a) catch e { return; };
+    String bAddr = net.address(b) catch e { return; };
+    Future<net.Datagram!> waiting = net.receive(a, 512, { timeout: 5000 });
+    await net.send(b, aAddr, string.toByteArray("ping")) catch e {
+        print("send: " + e.message);
+        return;
+    };
+    net.Datagram d = await waiting catch e { print("receive: " + e.message); return; };
+    print(string.fromByteArray(d.data));
+    print(d.address == bAddr);
+    net.close(a);
+    net.close(b);
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["ping", "true", "done"]);
+});
+
+test.start("net: the stream and datagram calls refuse each other's sockets", void () -> {
+    // A Socket is one type whichever protocol opened it, so the runtime makes
+    // this distinction and the checker cannot.
+    h.expectOutput(`
+import 'net';
+import 'async';
+
+void async main() {
+    Socket u = net.udp.bind("127.0.0.1:0") catch e { return; };
+    await net.read(u, 16) catch e { print(e.code == net.ErrorCode.INVALID); };
+    net.close(u);
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["true", "done"]);
+});
+
+// ---- unix domain ----
+
+test.start("net: unix sockets, and close removes the path", void () -> {
+    if (loader.hostOS() == "windows") {
+        // lib/net.c refuses Unix domain sockets on Windows. This test checks
+        // the refusal.
+        h.expectOutput(`
+import 'net';
+
+net.unix.listen("s.sock") catch e { print(e.message); }
+`, [
+            "net.listen: Unix domain sockets are not available here",
+        ]);
+        return;
+    }
+    h.expectOutput(`
+import 'net';
+import 'async';
+import 'string';
+import 'fs';
+import 'path';
+
+void async main() {
+    String dir = fs.createTempDir("nio-net-") catch e { print(e.message); return; };
+    String p = path.join(dir, "s.sock");
+    Listener l = net.unix.listen(p) catch e { print("listen: " + e.message); return; };
+    print(fs.exists(p));
+    Future<Socket!> acc = net.accept(l);
+    Socket c = await net.unix.connect(p) catch e { print("connect: " + e.message); return; };
+    Socket srv = await acc catch e { print("accept: " + e.message); return; };
+    await net.write(c, string.toByteArray("over unix")) catch e { return; };
+    byte[] b = await net.read(srv, 64, { timeout: 5000 }) catch e { print(e.message); return; };
+    print(string.fromByteArray(b));
+    net.close(c);
+    net.close(srv);
+    net.close(l);
+    // A listener owns the name it bound; leaving it behind is what stops the
+    // next run of a server from starting.
+    print(fs.exists(p));
+    fs.delete(dir, { recursive: true }) catch e { }
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["true", "over unix", "false", "done"]);
+});
+
+// ---- timeouts and close ----
+
+test.start("net: an operation given a timeout raises TIMED_OUT", void () -> {
+    h.expectOutput(`
+import 'net';
+import 'async';
+import 'time';
+
+void async main() {
+    Listener l = net.tcp.listen("127.0.0.1:0") catch e { return; };
+    DateTime t0 = time.now();
+    int code = 0;
+    await net.accept(l, { timeout: 120 }) catch e { code = e.code; };
+    print(code == net.ErrorCode.TIMED_OUT);
+    print(time.now() - t0 >= 100);
+    net.close(l);
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["true", "true", "done"]);
+});
+
+// ---- edge-triggered readiness ----
+//
+// kqueue and epoll keep a socket's read side registered until it closes, and
+// report an edge once (lib/net.c). These hold the two rules that make that
+// correct: an operation tries before it parks, and an edge with no waiter is
+// dropped without loss.
+
+test.start("net: bytes that arrive while no read waits are not lost", void () -> {
+    h.expectOutput(`
+import 'net';
+import 'async';
+import 'string';
+import 'time';
+
+void async main() {
+    Listener l = net.tcp.listen("127.0.0.1:0") catch e { return; };
+    String addr = net.address(l) catch e { return; };
+    Future<Socket!> acc = net.accept(l);
+    Socket c = await net.tcp.connect(addr) catch e { print(e.message); return; };
+    Socket srv = await acc catch e { print(e.message); return; };
+
+    // The first read parks, which registers the socket.
+    Future<byte[]!> first = net.read(c, 64, { timeout: 5000 });
+    await net.write(srv, string.toByteArray("one")) catch e { return; };
+    print(string.fromByteArray(await first catch []));
+
+    // "two" arrives while nothing reads: its edge has no waiter.
+    await net.write(srv, string.toByteArray("two")) catch e { return; };
+    await time.sleep(50);
+    print(string.fromByteArray(await net.read(c, 64, { timeout: 5000 }) catch []));
+
+    // A read that parks after that still wakes for the next bytes.
+    Future<byte[]!> third = net.read(c, 64, { timeout: 5000 });
+    await time.sleep(50);
+    await net.write(srv, string.toByteArray("three")) catch e { return; };
+    print(string.fromByteArray(await third catch []));
+
+    net.close(c);
+    net.close(srv);
+    net.close(l);
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["one", "two", "three", "done"]);
+});
+
+test.start("net: a read parked again after a timeout still wakes", void () -> {
+    h.expectOutput(`
+import 'net';
+import 'async';
+import 'string';
+import 'time';
+
+void async main() {
+    Listener l = net.tcp.listen("127.0.0.1:0") catch e { return; };
+    String addr = net.address(l) catch e { return; };
+    Future<Socket!> acc = net.accept(l);
+    Socket c = await net.tcp.connect(addr) catch e { print(e.message); return; };
+    Socket srv = await acc catch e { print(e.message); return; };
+
+    int code = 0;
+    await net.read(c, 64, { timeout: 50 }) catch e { code = e.code; };
+    print(code == net.ErrorCode.TIMED_OUT);
+
+    Future<byte[]!> again = net.read(c, 64, { timeout: 5000 });
+    await time.sleep(50);
+    await net.write(srv, string.toByteArray("late")) catch e { return; };
+    print(string.fromByteArray(await again catch []));
+
+    net.close(c);
+    net.close(srv);
+    net.close(l);
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["true", "late", "done"]);
+});
+
+test.start("net: connections queued before any accept are all accepted", void () -> {
+    // One edge can stand for several waiting connections, so each accept after
+    // the first finds its connection by trying before it parks.
+    h.expectOutput(`
+import 'net';
+import 'async';
+import 'array';
+
+void async main() {
+    Listener l = net.tcp.listen("127.0.0.1:0") catch e { return; };
+    String addr = net.address(l) catch e { return; };
+
+    // One accept parks first, so the listener is registered.
+    Future<Socket!> first = net.accept(l, { timeout: 5000 });
+    Socket[] clients = [];
+    for (int i = 0; i < 5; i++) {
+        Socket c = await net.tcp.connect(addr) catch e { print(e.message); return; };
+        array.push(clients, c);
+    }
+    Socket a = await first catch e { print(e.message); return; };
+    net.close(a);
+    int accepted = 1;
+    for (int i = 0; i < 4; i++) {
+        Socket s = await net.accept(l, { timeout: 5000 }) catch e { print(e.message); return; };
+        net.close(s);
+        accepted = accepted + 1;
+    }
+    print(accepted);
+    forEach(clients, c) { net.close(c); }
+    net.close(l);
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["5", "done"]);
+});
+
+test.start("net: closing a socket fails what was waiting on it", void () -> {
+    // A future left pending forever makes the scheduler report a deadlock.
+    h.expectOutput(`
+import 'net';
+import 'async';
+
+void async main() {
+    Listener l = net.tcp.listen("127.0.0.1:0") catch e { return; };
+    Future<Socket!> acc = net.accept(l);
+    net.close(l);
+    await acc catch e { print(e.code == net.ErrorCode.NOT_CONNECTED); };
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["true", "done"]);
+});
+
+test.start("net: a closed handle raises rather than reaching another socket", void () -> {
+    // A Socket holds its descriptor in a block, because the operating system
+    // reuses descriptor numbers and a stale handle must reach no connection.
+    h.expectOutput(`
+import 'net';
+import 'async';
+
+void async main() {
+    Listener l = net.tcp.listen("127.0.0.1:0") catch e { return; };
+    net.close(l);
+    net.close(l);
+    await net.accept(l) catch e { print(e.code == net.ErrorCode.NOT_CONNECTED); };
+    net.address(l) catch e { print(e.code == net.ErrorCode.NOT_CONNECTED); };
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["true", "true", "done"]);
+});
+
+test.start("net: two reads outstanding on one socket is refused", void () -> {
+    // Two readers of one stream have no meaning: the bytes go to whichever the
+    // scheduler wakes first.
+    h.expectOutput(`
+import 'net';
+import 'async';
+
+void async main() {
+    Listener l = net.tcp.listen("127.0.0.1:0") catch e { return; };
+    Future<Socket!> first = net.accept(l);
+    Future<Socket!> second = net.accept(l);
+    await second catch e { print(e.code == net.ErrorCode.INVALID); };
+    net.close(l);
+    await first catch e { }
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["true", "done"]);
+});
+
+// ---- the collector ----
+
+test.start("net: a socket the program drops is closed by the collector", void () -> {
+    // Nothing here closes a listener, so only gc.c's weak hook keeps the
+    // program under the descriptor limit. Without it this hits TOO_MANY_FILES.
+    h.expectOutput(`
+import 'net';
+import 'string';
+
+void open() {
+    for (int i = 0; i < 4000; i = i + 1) {
+        net.tcp.listen("127.0.0.1:0") catch e {
+            print("ran out after " + string.from(i));
+            return;
+        };
+    }
+    print("opened and dropped 4000");
+}
+
+open();
+`, ["opened and dropped 4000"]);
+});
+
+// ---- the scheduler ----
+
+test.start("net: a child and a socket outstanding together both finish", void () -> {
+    // lib/process.c and lib/net.c each wait only for their own work, so the
+    // scheduler holds both waiters. A single global waiter leaves one of the
+    // two pending forever (runtime.h).
+    h.expectOutput(`
+import 'net';
+import 'async';
+import 'process';
+import 'string';
+import 'time';
+
+void async main() {
+    Listener l = net.tcp.listen("127.0.0.1:0") catch e { return; };
+    String addr = net.address(l) catch e { return; };
+    Future<Socket!> acc = net.accept(l);
+    // A child that takes long enough that the socket work must not be made
+    // to wait for it.
+    Future<process.ChildRunResult!> child = process.child.run("sh", ["-c", "sleep 0.4; echo child"]);
+    Socket c = await net.tcp.connect(addr, { timeout: 5000 }) catch e {
+        print("connect: " + e.message);
+        return;
+    };
+    Socket srv = await acc catch e { print("accept: " + e.message); return; };
+    print("socket done");
+    process.ChildRunResult r = await child catch e { print("child: " + e.message); return; };
+    print(string.trim(string.fromByteArray(r.stdout)));
+    net.close(c);
+    net.close(srv);
+    net.close(l);
+}
+
+async.run(main(), void () -> { print("done"); });
+`, ["socket done", "child", "done"]);
+});
+
+// ---- diagnostics ----
+
+test.start("net: must be imported before use", void () -> {
+    h.expectCompileError("Listener l = net.tcp.listen(\"127.0.0.1:0\");",
+        "net is a built-in library; import it first: import 'net';");
+});
+
+test.start("net: a protocol group is not a function", void () -> {
+    h.expectCompileError("import 'net';\nnet.tcp(\"127.0.0.1:0\");",
+        "net.tcp is a group of functions, not a function; call one of them: net.tcp.listen(...)");
+});
+
+test.start("net: no such function", void () -> {
+    h.expectCompileError("import 'net';\nnet.slurp(1);",
+        "net has no function \"slurp\"");
+});
+
+test.start("net: a Socket is not a Listener", void () -> {
+    h.expectCompileError(`
+import 'net';
+Socket s = net.udp.bind("127.0.0.1:0");
+net.accept(s);
+`, "argument 1 of net.accept: cannot use Socket as Listener");
+});
+
+test.start("net: a Listener is not a Socket", void () -> {
+    h.expectCompileError(`
+import 'net';
+Listener l = net.tcp.listen("127.0.0.1:0");
+net.read(l, 16);
+`, "argument 1 of net.read: cannot use Listener as Socket");
+});
+
+test.start("net: close and address take either handle", void () -> {
+    h.expectCompileError(`
+import 'net';
+net.close("nope");
+`, "argument 1 of net.close must be a Socket or a Listener, got String");
+});
+
+test.start("net: a socket has no printed form and no equality", void () -> {
+    // A Socket is opaque like a RegExp. It stands for a descriptor that the
+    // operating system owns.
+    h.expectCompileError(`
+import 'net';
+Listener l = net.tcp.listen("127.0.0.1:0");
+print(l);
+`, "cannot print Listener");
+    h.expectCompileError(`
+import 'net';
+Listener a = net.tcp.listen("127.0.0.1:0");
+Listener b = net.tcp.listen("127.0.0.1:0");
+print(a == b);
+`, "Listener");
+});
+
+test.start("net: a socket has no JSON form", void () -> {
+    h.expectCompileError(`
+import 'net';
+import 'json';
+Listener l = net.tcp.listen("127.0.0.1:0");
+print(json.toText(l));
+`, "Listener");
+});

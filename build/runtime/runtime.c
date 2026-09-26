@@ -1329,6 +1329,13 @@ int rt_date_parse_iso(const char *buf, int64_t len, int64_t *out) {
 // lib/json.c writes its numbers with this too, so a float in JSON and a float
 // that print writes agree digit for digit.
 void rt_fmt_double(char *b, size_t n, double v, int f32) {
+    // A NaN is "nan" whatever its sign bit. The C libraries differ: glibc
+    // writes "-nan" and the Windows CRT writes "-nan(ind)", and 0.0 / 0.0 on
+    // x86 has the sign bit set.
+    if (v != v) {
+        snprintf(b, n, "nan");
+        return;
+    }
     int lo = f32 ? 6 : 15, hi = f32 ? 9 : 17;
     for (int prec = lo; prec <= hi; prec++) {
         snprintf(b, n, "%.*g", prec, v);

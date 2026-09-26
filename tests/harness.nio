@@ -221,6 +221,68 @@ export Run runProgramArgs(String src, String[] args) {
     return runBinary(buildSource(src), args);
 }
 
+// ---- measuring memory ----
+
+// On Linux, the kernel charges to a child the memory that its parent held when
+// it started the child. This occurs with fork and with posix_spawn. The test
+// process holds tens of MB, so a peak taken here is the test process's own.
+// The meter is a small program that runs its argument and writes the peak on
+// its first line ("none" when the host reports no usage), then the child's
+// output.
+String? meterBin = null;
+
+String meter() {
+    String? built = meterBin;
+    if (built != null) {
+        return built;
+    }
+    String bin = buildSource(`
+import 'process';
+import 'string';
+
+String[] argv = process.getArgs();
+process.ChildRunResult r = await process.child.run(argv[0], []);
+process.ChildUsage? u = r.usage;
+if (u == null) {
+    print("none");
+} else {
+    print(u.peakMemory);
+}
+process.stdout.write(string.fromByteArray(r.stdout));
+process.exit(r.code);
+`);
+    meterBin = bin;
+    return bin;
+}
+
+// What a program printed, and the most memory it held at once, in bytes. The
+// peak is null where the host reports no usage.
+export type Measured {
+    String out;
+    int code;
+    int? peakMemory;
+}
+
+// Runs bin with no arguments under the meter.
+export Measured runMeasured(String bin) {
+    Run r = runBinary(meter(), [bin]);
+    int nl = string.find(r.out, "\n");
+    if (nl < 0) {
+        return Error(`meter wrote no peak: "${r.out}"`);
+    }
+    String first = string.substring(r.out, 0, nl);
+    int? peak = null;
+    if (first != "none") {
+        peak = string.toInt(first);
+    }
+    Measured m = {
+        out: string.substring(r.out, nl + 1, string.length(r.out)),
+        code: r.code,
+        peakMemory: peak,
+    };
+    return m;
+}
+
 // ---- asserting ----
 
 // Splits output into lines and drops the trailing newline a print leaves. An

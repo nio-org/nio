@@ -1,7 +1,6 @@
 // Async functions, futures and the scheduler, end to end.
 import 'test';
 import 'string';
-import 'process';
 import './harness' as h;
 
 test.start("async: async await", void () -> {
@@ -710,21 +709,22 @@ print(i);
 
 // Every await allocates a frame, a future and a callback closure, then drops
 // all three. A scheduler structure that kept them would grow these programs
-// to hundreds of megabytes. The peak comes from §6.12's usage.
+// to hundreds of megabytes. The peak comes from §6.12's usage, through
+// h.runMeasured.
 test.start("async: async memory bounded", void () -> {
     int const LIMIT = 32 * 1024 * 1024;
     forEach(asyncBounded, b) {
-        h.Run r = h.runBinary(h.buildSource(b.src), []);
+        h.Measured r = h.runMeasured(h.buildSource(b.src));
         if (r.out != b.want) {
             return Error(b.name + ": output = \"" + r.out + "\", want \"" + b.want + "\"");
         }
-        process.ChildUsage? u = r.usage;
-        if (u == null) {
+        int? peak = r.peakMemory;
+        if (peak == null) {
             // Windows reports no usage, so the bound is not checked there.
             continue;
         }
-        if (u.peakMemory > LIMIT) {
-            return Error(b.name + ": peak memory " + string.from(u.peakMemory / 1048576)
+        if (peak > LIMIT) {
+            return Error(b.name + ": peak memory " + string.from(peak / 1048576)
                 + " MB exceeds " + string.from(LIMIT / 1048576)
                 + " MB: async garbage is not being reclaimed");
         }

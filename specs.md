@@ -4458,6 +4458,12 @@ truncated, so a child that used half a millisecond reports one. A child that
 ran for less than that reports none, which is the resolution the language's
 whole time model works at.
 
+On Linux, `peakMemory` is never less than the memory the parent held when
+it started the child. The kernel charges that memory to the child, with
+`fork` and with `posix_spawn` alike, and the child's own peak cannot be
+separated from it afterwards. To measure a small program, start it from a
+small parent.
+
 Average memory is not reported. POSIX defines three "integral" sizes for it
 (`ru_ixrss`, `ru_idrss`, `ru_isrss`), and neither Linux nor macOS has
 maintained any of them for decades: both always report zero. A field that is

@@ -8,7 +8,6 @@
 import 'test';
 import 'string';
 import './harness' as h;
-import 'process';
 
 // A program that allocates far more than it keeps alive, and what it prints.
 type Bounded {
@@ -333,26 +332,26 @@ test.start("gc: the runtime harness", void () -> {
 // Allocating far more than is retained must not grow the heap without bound.
 //
 // The peak RSS comes from process.ChildUsage (§6.12), which is what the
-// operating system charged the child.
+// operating system charged the child. h.runMeasured takes it from a small
+// parent, because on Linux the peak includes the parent's memory.
 //
 // The limit is generous: it only has to fail if nothing is ever reclaimed,
 // which would put these programs in the hundreds of MB.
 test.start("gc: garbage is actually reclaimed", void () -> {
     int const LIMIT = 32 * 1024 * 1024;
     forEach(bounded, b) {
-        String bin = h.buildSource(b.src);
-        h.Run r = h.runBinary(bin, []);
+        h.Measured r = h.runMeasured(h.buildSource(b.src));
         if (r.out != b.want) {
             return Error(b.name + ": output = \"" + r.out + "\", want \"" + b.want + "\"");
         }
-        process.ChildUsage? u = r.usage;
-        if (u == null) {
+        int? peak = r.peakMemory;
+        if (peak == null) {
             // Windows reports no usage, so the test does not check the bound
             // there. A zero value must not make the test pass.
             continue;
         }
-        if (u.peakMemory > LIMIT) {
-            return Error(b.name + ": peak memory " + string.from(u.peakMemory / 1048576)
+        if (peak > LIMIT) {
+            return Error(b.name + ": peak memory " + string.from(peak / 1048576)
                 + " MB exceeds " + string.from(LIMIT / 1048576)
                 + " MB: garbage is not being reclaimed");
         }

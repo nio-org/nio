@@ -21,3 +21,4 @@ import './lsp_test' as lsp_test;
 import './deps_test' as deps_test;
 import './inflate_test' as inflate_test;
 import './version_test' as version_test;
+import './testcmd_test' as testcmd_test;

@@ -217,7 +217,8 @@ export byte[] finishedVerifyData(byte[] trafficSecret, byte[] transcriptHash) {
 // ---------------------------------------------------------------------------
 
 // The 5-byte header: type, the frozen legacy version 0x0303, and a two-byte
-// length. §5.1 makes a receiver ignore the version field.
+// length. §5.1 makes a receiver ignore the version field. The first
+// ClientHello is the one record that carries 0x0301 (handshakeClient).
 byte[] recordHeader(int contentType, int length) {
     return [
         contentType as byte,
@@ -1780,6 +1781,11 @@ void checkPeer(byte[][] chain, String serverName, CertificateVerify cv,
 // clear. After it, the peer reads an unprotected record as a MAC failure.
 type AlertLevel {
     RecordProtection? rp;
+    // The compatibility change_cipher_spec (§D.4), until this end writes its
+    // first protected record. It goes out in the same write as that record.
+    // Written alone, a small record can wait for an ACK, and a close in that
+    // time discards it.
+    byte[] ccs;
 }
 
 // Writes a fatal alert at the protection level that the handshake has reached.
@@ -1792,8 +1798,8 @@ void async sendAlert(Transport io, AlertLevel al, int description) {
             [ALERT_FATAL as byte, description as byte]));
         return;
     }
-    await io.write(p.seal(ContentType.ALERT,
-        [ALERT_FATAL as byte, description as byte]));
+    await io.write(cat(al.ccs, p.seal(ContentType.ALERT,
+        [ALERT_FATAL as byte, description as byte])));
 }
 
 // Runs a full 1-RTT client handshake over `io` and returns the connection. Any
@@ -1805,7 +1811,7 @@ export Conn async handshakeClient(Transport io, String serverName, Options? o) {
     // This check comes before any byte is sent. An option that this end cannot
     // apply is not a fault of the peer, so it gets no alert.
     checkOptions(o);
-    AlertLevel al = { rp: null };
+    AlertLevel al = { rp: null, ccs: EMPTY };
     Conn c = await handshakeClientInner(io, serverName, o, al) catch e {
         await sendAlert(io, al, alertFor(e.code)) catch e2 { };
         return e;
@@ -1826,9 +1832,14 @@ Conn async handshakeClientInner(Transport io, String serverName, Options? o,
 
     byte[] hello = buildClientHello(random, sessionId, pub, serverName, alpn);
     t.push(hello);
-    await io.write(plaintextRecord(ContentType.HANDSHAKE, hello));
-    // The compatibility record that §D.4 requests.
-    await io.write(plaintextRecord(ContentType.CHANGE_CIPHER_SPEC, [1]));
+    // §5.1 lets the first ClientHello carry the record version 0x0301, and
+    // some servers refuse any other value in it.
+    byte[] helloRecord = plaintextRecord(ContentType.HANDSHAKE, hello);
+    helloRecord[2] = 1;
+    // This is the only write before the first read. A server that refuses the
+    // ClientHello closes the connection, and a second write here can fail
+    // before this end reads the alert that tells why.
+    await io.write(helloRecord);
 
     byte[] shMsg = await f.expect(HandshakeType.SERVER_HELLO);
     ServerHello sh = parseServerHello(messageBody(shMsg));
@@ -1872,6 +1883,9 @@ Conn async handshakeClientInner(Transport io, String serverName, Options? o,
     // the single sequence that the peer expects.
     RecordProtection hsOut = protectionKeys(clientHs, suite);
     al.rp = hsOut;
+    // It must precede every protected record that this end sends, an alert
+    // included.
+    al.ccs = plaintextRecord(ContentType.CHANGE_CIPHER_SPEC, [1]);
 
     byte[] eeMsg = await f.expect(HandshakeType.ENCRYPTED_EXTENSIONS);
     t.push(eeMsg);
@@ -1966,17 +1980,20 @@ Conn async handshakeClientInner(Transport io, String serverName, Options? o,
     // into the transcript before the Finished, so the verify_data below covers
     // it. The application secrets above come from the transcript up to the
     // Finished of the server (§7.1), so they are computed before this.
+    byte[] flight = al.ccs;
     if (certRequested) {
         byte[] decline = handshakeMessage(HandshakeType.CERTIFICATE,
             emptyCertificateBody(certRequestContext));
         t.push(decline);
-        await io.write(hsOut.seal(ContentType.HANDSHAKE, decline));
+        flight = cat(flight, hsOut.seal(ContentType.HANDSHAKE, decline));
     }
 
     // The Finished of the client is the last message under the handshake keys.
     byte[] verify = finishedVerifyData(clientHs, t.hash());
-    await io.write(hsOut.seal(ContentType.HANDSHAKE,
+    flight = cat(flight, hsOut.seal(ContentType.HANDSHAKE,
         handshakeMessage(HandshakeType.FINISHED, verify)));
+    al.ccs = EMPTY;
+    await io.write(flight);
 
     f.rp = protectionKeys(serverAp, suite);
     f.handshaking = false;

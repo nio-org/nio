@@ -642,6 +642,34 @@ void async okWrite() {
     if (false) { return Error("unreachable", tls.ErrorCode.DECODE_ERROR); }
 }
 
+void async keptWrite(byte[][] writes, byte[] b) {
+    array.push(writes, b);
+    if (false) { return Error("unreachable", tls.ErrorCode.DECODE_ERROR); }
+}
+
+// The client writes one record before its first read: the ClientHello, with
+// the record version 0x0301 (§5.1). A server that refuses the ClientHello
+// closes the connection, and a second write could then fail before this end
+// reads the alert. The change_cipher_spec is not written alone at any point.
+test.start("tls: the first flight of the client is one ClientHello record", void () -> {
+    byte[][] writes = [];
+    tls.Transport io = {
+        read: Future<byte[]!> (int n) -> failedRead(),
+        write: Future<void!> (byte[] b) -> keptWrite(writes, b),
+        close: void () -> { },
+    };
+    await tls.handshakeClient(io, "example.com", { insecureSkipVerify: true }) catch e { };
+    test.assert(writes.length >= 1, "the client wrote nothing");
+    byte[] hello = writes[0];
+    test.expectString(crypto.hexEncode(array.slice(hello, 0, 3)), "160301");
+    test.expectInt(hello[3] * 256 + hello[4], hello.length - 5);
+    forEach(writes, w) {
+        int t = w[0];
+        test.assert(t != tls.ContentType.CHANGE_CIPHER_SPEC,
+            "a change_cipher_spec was written before the server answered");
+    }
+});
+
 // Protects an inner plaintext that this file builds, with padding, which `seal`
 // refuses to do. The nonce construction of RFC 8446 §5.3 is written again here,
 // so that an error in the module is not copied into the test.

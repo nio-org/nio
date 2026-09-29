@@ -628,7 +628,7 @@ myCar.rename("honda");
 ```
 
 A method is written exactly like a function declaration (§5.2): return type
-first (omitted when it returns nothing), `async` before the name for an
+first (`void` when it returns nothing), `async` before the name for an
 async one, and a variadic last parameter allowed. No terminator is needed
 after its body.
 
@@ -5989,12 +5989,12 @@ Explicitly out of scope for v0.1, planned for later:
   around it and `continue` to the innermost loop (§4.8). So leaving a loop
   from inside a switch clause, or leaving two loops at once, takes a flag
   the outer one tests
-- async function values (a function value cannot be declared `async`)
-- more array functions (`map`, `filter`, `reverse`, …) and more string
-  functions (`startsWith`, a character-aware counterpart to the byte-counting
-  `substring` of §6.6, …). The array ones must be implemented by the
-  compiler, as `push` and `sort` already are, since §7.1 rules out the
-  other route
+- async function values: only a named `async` function suspends at an
+  `await` (§5.2). A function value can return a future, but an `await` in
+  its body follows the rule for an await outside an async function (§3.5)
+  and holds up its caller until the future completes
+- more string functions (`startsWith`, a character-aware counterpart to the
+  byte-counting `substring` of §6.6, …)
 - a live child (§6.12). `process.child.run` gives a child its whole input
   in advance and collects its whole output at the end. `inherit` covers the
   case where the output is not the program's business and belongs on the

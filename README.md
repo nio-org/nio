@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://nio-lang.org/docs/versions"><img alt="Version" src="https://img.shields.io/badge/version-0.1.0-22c55e"></a>
+  <a href="https://nio-lang.org/docs/versions"><img alt="Version" src="https://img.shields.io/badge/version-0.1.1-22c55e"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0%20with%20LLVM%20exceptions-16a34a"></a>
   <img alt="Platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-4ade80">
 </p>
@@ -30,7 +30,7 @@ native program**, finds mistakes **before it runs**, and comes with an **HTTP
 server, TLS and cryptography** in the box.
 
 > [!NOTE]
-> The current version is **0.1.0**. Nio is ready to try, but it can still
+> The current version is **0.1.1**. Nio is ready to try, but it can still
 > change in ways that break existing code before 1.0.
 
 ## A complete web service

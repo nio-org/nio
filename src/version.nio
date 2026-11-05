@@ -2,4 +2,4 @@
 //
 // While the major version is 0, a release may change the language.
 // CHANGELOG.md records what each release changed.
-export String const VERSION = "0.1.0";
+export String const VERSION = "0.1.1";

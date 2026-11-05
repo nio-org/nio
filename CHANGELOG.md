@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1
+
+- webview: add background mode (setBackground)
+- specs: correct the method return type rule and the §7 list
+
 ## 0.1.0
 
 The first release of Nio, a statically typed language that compiles to native

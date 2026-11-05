@@ -46964,24 +46964,26 @@ declare void @rt_error_abort(ptr)
 @cstr.2987 = private unnamed_addr constant [23 x i8] c"<top level of inflate>\00"
 @str.20251.obj = private constant { i64, i64, [11 x i8] } { i64 2, i64 11, [11 x i8] c"github.com/" }, align 8
 @str.20251 = private alias i64, getelementptr inbounds ({ i64, i64, [11 x i8] }, ptr @str.20251.obj, i32 0, i32 1)
-@str.20252.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"2" }, align 8
-@str.20252 = private alias i64, getelementptr inbounds ({ i64, i64, [1 x i8] }, ptr @str.20252.obj, i32 0, i32 1)
-@str.20253.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"3" }, align 8
+@str.20252.obj = private constant { i64, i64, [5 x i8] } { i64 2, i64 5, [5 x i8] c"0.1.1" }, align 8
+@str.20252 = private alias i64, getelementptr inbounds ({ i64, i64, [5 x i8] }, ptr @str.20252.obj, i32 0, i32 1)
+@str.20253.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"2" }, align 8
 @str.20253 = private alias i64, getelementptr inbounds ({ i64, i64, [1 x i8] }, ptr @str.20253.obj, i32 0, i32 1)
-@str.20254.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"4" }, align 8
+@str.20254.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"3" }, align 8
 @str.20254 = private alias i64, getelementptr inbounds ({ i64, i64, [1 x i8] }, ptr @str.20254.obj, i32 0, i32 1)
-@str.20255.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"5" }, align 8
+@str.20255.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"4" }, align 8
 @str.20255 = private alias i64, getelementptr inbounds ({ i64, i64, [1 x i8] }, ptr @str.20255.obj, i32 0, i32 1)
-@str.20256.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"6" }, align 8
+@str.20256.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"5" }, align 8
 @str.20256 = private alias i64, getelementptr inbounds ({ i64, i64, [1 x i8] }, ptr @str.20256.obj, i32 0, i32 1)
-@str.20257.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"7" }, align 8
+@str.20257.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"6" }, align 8
 @str.20257 = private alias i64, getelementptr inbounds ({ i64, i64, [1 x i8] }, ptr @str.20257.obj, i32 0, i32 1)
-@str.20258.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"8" }, align 8
+@str.20258.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"7" }, align 8
 @str.20258 = private alias i64, getelementptr inbounds ({ i64, i64, [1 x i8] }, ptr @str.20258.obj, i32 0, i32 1)
-@str.20259.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"B" }, align 8
+@str.20259.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"8" }, align 8
 @str.20259 = private alias i64, getelementptr inbounds ({ i64, i64, [1 x i8] }, ptr @str.20259.obj, i32 0, i32 1)
-@str.20260.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"D" }, align 8
+@str.20260.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"B" }, align 8
 @str.20260 = private alias i64, getelementptr inbounds ({ i64, i64, [1 x i8] }, ptr @str.20260.obj, i32 0, i32 1)
+@str.20261.obj = private constant { i64, i64, [1 x i8] } { i64 2, i64 1, [1 x i8] c"D" }, align 8
+@str.20261 = private alias i64, getelementptr inbounds ({ i64, i64, [1 x i8] }, ptr @str.20261.obj, i32 0, i32 1)
 @gctd.1404 = private constant [1 x ptr] [ptr @td.35]
 @cstr.2988 = private unnamed_addr constant [19 x i8] c"<top level of uri>\00"
 @td.958 = private constant %TD { i64 8, ptr null, i64 0, ptr null, ptr null, i64 0, ptr null, i64 8, ptr null }
@@ -378985,7 +378987,7 @@ define internal void @mod.init.version() {
 entry:
   br label %start
 start:
-  store ptr @str.1672, ptr @gv.version.VERSION
+  store ptr @str.20252, ptr @gv.version.VERSION
   ret void
 }
 
@@ -379023,29 +379025,29 @@ start:
   %t3 = call ptr @rt_arr_slot(ptr %t1, i64 1)
   store ptr @str.887, ptr %t3
   %t4 = call ptr @rt_arr_slot(ptr %t1, i64 2)
-  store ptr @str.20252, ptr %t4
+  store ptr @str.20253, ptr %t4
   %t5 = call ptr @rt_arr_slot(ptr %t1, i64 3)
-  store ptr @str.20253, ptr %t5
+  store ptr @str.20254, ptr %t5
   %t6 = call ptr @rt_arr_slot(ptr %t1, i64 4)
-  store ptr @str.20254, ptr %t6
+  store ptr @str.20255, ptr %t6
   %t7 = call ptr @rt_arr_slot(ptr %t1, i64 5)
-  store ptr @str.20255, ptr %t7
+  store ptr @str.20256, ptr %t7
   %t8 = call ptr @rt_arr_slot(ptr %t1, i64 6)
-  store ptr @str.20256, ptr %t8
+  store ptr @str.20257, ptr %t8
   %t9 = call ptr @rt_arr_slot(ptr %t1, i64 7)
-  store ptr @str.20257, ptr %t9
+  store ptr @str.20258, ptr %t9
   %t10 = call ptr @rt_arr_slot(ptr %t1, i64 8)
-  store ptr @str.20258, ptr %t10
+  store ptr @str.20259, ptr %t10
   %t11 = call ptr @rt_arr_slot(ptr %t1, i64 9)
   store ptr @str.1333, ptr %t11
   %t12 = call ptr @rt_arr_slot(ptr %t1, i64 10)
   store ptr @str.187, ptr %t12
   %t13 = call ptr @rt_arr_slot(ptr %t1, i64 11)
-  store ptr @str.20259, ptr %t13
+  store ptr @str.20260, ptr %t13
   %t14 = call ptr @rt_arr_slot(ptr %t1, i64 12)
   store ptr @str.1760, ptr %t14
   %t15 = call ptr @rt_arr_slot(ptr %t1, i64 13)
-  store ptr @str.20260, ptr %t15
+  store ptr @str.20261, ptr %t15
   %t16 = call ptr @rt_arr_slot(ptr %t1, i64 14)
   store ptr @str.2683, ptr %t16
   %t17 = call ptr @rt_arr_slot(ptr %t1, i64 15)

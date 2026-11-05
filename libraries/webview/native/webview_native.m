@@ -324,6 +324,34 @@ enum {
 - (void)_setBackspaceKeyNavigationEnabled:(BOOL)enabled;
 @end
 
+// WebKit throttles timers and stops painting in a covered window. A
+// background window sits behind other apps, so its views turn that off.
+@interface WKWebView (NioOcclusion)
+- (void)_setWindowOcclusionDetectionEnabled:(BOOL)enabled;
+@end
+
+// Set by nw_set_background. The app then never activates and its windows
+// open behind other apps without key focus.
+static int nw_background;
+
+static void nw_apply_background_view(WKWebView *wv) {
+    if (!nw_background || !wv) return;
+    if (![wv respondsToSelector:@selector(_setWindowOcclusionDetectionEnabled:)]) return;
+    [wv _setWindowOcclusionDetectionEnabled:NO];
+}
+
+// Makes a window key and main inside the app. In background mode it stays
+// behind other apps; otherwise it comes to the front.
+static void nw_present_window(NSWindow *win) {
+    if (nw_background) {
+        [win orderBack:nil];
+        [win makeMainWindow];
+        [win makeKeyWindow];
+    } else {
+        [win makeKeyAndOrderFront:nil];
+    }
+}
+
 static void nw_apply_backspace_nav(WKWebView *wv, int on) {
     if (!wv) return;
     WKPreferences *p = wv.configuration.preferences;
@@ -1737,6 +1765,7 @@ static void nw_apply_devtools(WKWebView *wv, int on) {
 static WKWebView *nw_new_content_view(NwWin *w, WKWebViewConfiguration *cfg, NSRect frame) {
     NioContentView *cv = [[NioContentView alloc] initWithFrame:frame configuration:cfg];
     cv.nwin = w;
+    nw_apply_background_view(cv);
     return cv;
 }
 
@@ -1987,7 +2016,7 @@ API_AVAILABLE(macos(15.4))
 - (void)focusForWebExtensionContext:(WKWebExtensionContext *)context
     completionHandler:(void (^)(NSError * _Nullable))completionHandler {
     (void)context;
-    if (self.win->window) [self.win->window makeKeyAndOrderFront:nil];
+    if (self.win->window) nw_present_window(self.win->window);
     completionHandler(nil);
 }
 @end
@@ -2318,9 +2347,27 @@ static void nw_app_init(void) {
     [NSApplication sharedApplication];
     nw_app_delegate = [[NioAppDelegate alloc] init];
     [NSApp setDelegate:nw_app_delegate];
-    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [NSApp setActivationPolicy:(nw_background ? NSApplicationActivationPolicyAccessory
+                                              : NSApplicationActivationPolicyRegular)];
     [NSApp finishLaunching];
-    [NSApp activateIgnoringOtherApps:YES];
+    if (!nw_background) {
+        [NSApp activateIgnoringOtherApps:YES];
+        return;
+    }
+    // The system activates a new process that shows a window before its
+    // launch check-in completes. One turn of the event loop completes it.
+    NSEvent *e;
+    while ((e = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:[NSDate distantPast]
+                                      inMode:NSDefaultRunLoopMode dequeue:YES])) {
+        [NSApp sendEvent:e];
+    }
+}
+
+// Only before the first window: the activation policy is set once, there.
+int64_t nw_set_background(int64_t on) {
+    if (nw_app_delegate) return NW_ERR_INVALID;
+    nw_background = on ? 1 : 0;
+    return 0;
 }
 
 // One entry of the Dock icon's right-click menu. Re-adding an id replaces the
@@ -2396,8 +2443,8 @@ int64_t nw_focus_window(int64_t h) {
         NwWin *w = nw_get(h);
         if (!w || w->closed || !w->window) return NW_ERR_INVALID;
         if (w->window.miniaturized) [w->window deminiaturize:nil];
-        [w->window makeKeyAndOrderFront:nil];
-        [NSApp activateIgnoringOtherApps:YES];
+        nw_present_window(w->window);
+        if (!nw_background) [NSApp activateIgnoringOtherApps:YES];
         return 0;
     }
 }
@@ -2482,6 +2529,7 @@ static WKWebView *nw_make_view(NwWin *w, NioWebHelper *helper, NSRect frame) {
     if (helper.isUi) {
         NioUiView *ui = [[NioUiView alloc] initWithFrame:frame configuration:cfg];
         ui.nwin = w;
+        nw_apply_background_view(ui);
         wv = ui;
     } else {
         wv = nw_new_content_view(w, cfg, frame);
@@ -2540,7 +2588,7 @@ int64_t nw_create(Str *title, int64_t width, int64_t height) {
         w->webview = wv;
         w->active = 0;
         [win center];
-        [win makeKeyAndOrderFront:nil];
+        nw_present_window(win);
 #ifdef NW_HAS_WEBEXT
         if (@available(macOS 15.4, *)) {
             if (w->extc) [w->extc didActivateTab:nw_ext_tab(w, 0) previousActiveTab:nil];
@@ -4410,6 +4458,7 @@ int64_t nw_dock_menu_separator(Str *id) { (void)id; return NW_ERR_INVALID; }
 int64_t nw_dock_menu_remove(Str *id) { (void)id; return NW_ERR_INVALID; }
 int64_t nw_last_active(void) { return 0; }
 int64_t nw_focus_window(int64_t h) { (void)h; return NW_ERR_INVALID; }
+int64_t nw_set_background(int64_t on) { (void)on; return NW_ERR_INVALID; }
 int64_t nw_app_step(int64_t timeout_ms) { (void)timeout_ms; return NW_ERR_INVALID; }
 int64_t nw_app_has_event(void) { return 0; }
 Str *nw_app_take_event(void) { return rt_str_alloc(0); }

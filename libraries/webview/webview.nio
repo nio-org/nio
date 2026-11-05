@@ -38,6 +38,7 @@ extern int nw_app_menu_separator(int handle, String menu, String id);
 extern int nw_dock_menu_remove(String id);
 extern int nw_last_active();
 extern int nw_focus_window(int handle);
+extern int nw_set_background(int on);
 extern int nw_app_step(int timeoutMs);
 extern bool nw_app_has_event();
 extern String nw_app_take_event();
@@ -283,6 +284,18 @@ export int lastActiveWindow() {
 // with the application activated. Use it to answer "reopen".
 export void focusWindow(Window w) {
     raiseCode(nw_focus_window(w.handle), "cannot focus the window");
+}
+
+// Background mode: the application never activates and shows no Dock icon,
+// and its windows open behind other applications without taking the user's
+// focus. Their pages keep running at full speed while covered. Call it before
+// the first window or Dock menu call; after that it raises INVALID.
+export void setBackground(bool on) {
+    int flag = 0;
+    if (on) {
+        flag = 1;
+    }
+    raiseCode(nw_set_background(flag), "background mode must be set before the first window");
 }
 
 // Runs the shared event loop for at most timeoutMs, tied to no window. A loop

@@ -162,6 +162,22 @@ What any of this means is the program's policy; the library only carries the
 request. The wake rule is the loop's usual one: a queued message or app event
 ends a blocked pump at once.
 
+**A program can run without taking the user's focus.** `setBackground(true)`,
+called before the first window (or Dock menu call), selects background mode:
+
+- The application never activates and has no Dock icon or menu bar of its own.
+- Each window opens behind other applications. It is still key and main inside
+  the program, so focus-dependent behavior in its pages stays the same.
+  `focusWindow(w)` makes it key without bringing it forward.
+- WebKit's occlusion detection is off in its views, so a covered page keeps its
+  timers and painting at full rate. This uses a private WebKit switch behind a
+  `respondsToSelector:` guard. Where that switch is missing, covered pages are
+  throttled as usual.
+
+A test harness uses it to drive a real window while the user keeps working. A
+call after the first window raises `INVALID`, because the platform sets the
+activation policy once, at launch.
+
 **A URL from another application arrives on the same queue**, as
 `"open:<url>"`. This covers a link the user clicks outside the program when the
 platform sends that scheme here (the default browser's case), and a document
